@@ -1,0 +1,13 @@
+experiment:
+  id: EXP_001
+  name: adaptive_gated_fusion
+  model: gated_fusion
+  status: VALIDATED
+  implementation_files:
+    - failure_prob/models/gated_fusion.py
+    - failure_prob/models/registry.py
+    - scripts/train.py
+  tests:
+    - python -m pytest -q
+  training_command: python scripts/train.py --model gated_fusion --dataset libero10 --layers 8 16 24 32 --seed 42 --synthetic
+  note: Synthetic validation only; not trained or evaluated on real data.

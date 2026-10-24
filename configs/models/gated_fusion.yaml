@@ -1,0 +1,3 @@
+model: gated_fusion
+hidden_dim: 64
+dropout: 0.0

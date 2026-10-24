@@ -40,6 +40,40 @@ cp setup_envs.bash.template setup_envs.bash
 
 ## Train and evaluate SAFE and baseline failure detectors
 
+## Research framework
+
+The original SAFE implementation remains available through `failure_prob/train.py` and the Hydra configurations under `failure_prob/conf`. The additive research framework provides a normalized frozen-feature contract, explicit detector registry, cached feature metadata validation, CPU-testable synthetic fixtures, run checkpoints, and `experiments/index.csv` tracking. `AGENTS.md` is an instruction file for coding agents; it is not read by training at runtime.
+
+### Installation
+
+Use the original environment below, then install the package with `pip install -e .`. The framework tests require PyTorch and pytest. Tests never download OpenVLA weights or datasets.
+
+```bash
+python -m pytest -q
+python scripts/list_models.py
+```
+
+### Frozen features and training
+
+Feature extraction is performed in the adapted external OpenVLA repository. Store `[N,T,K,D]` cached features with `FeatureStore` metadata, including the exact checkpoint, layer IDs, pooling, dtype, and split version. Detector training consumes the cache and does not load OpenVLA.
+
+The synthetic end-to-end command validates the first experiment without real data:
+
+```bash
+python scripts/train.py --model gated_fusion --dataset libero10 --layers 8 16 24 32 --seed 42 --synthetic
+python scripts/evaluate.py --checkpoint outputs/runs/<run_id>/best.pt --split seen_val --synthetic
+```
+
+For real cached features, replace `--synthetic` with `--feature-root /path/to/feature-store`. Development selection defaults to seen-task validation; unseen-task evaluation must be an explicit finalized run.
+
+Layer probing uses the same detector and records seen-validation selection:
+
+```bash
+python scripts/probe_layers.py --model single_layer_mlp --layers 4 8 12 16 20 24 28 32 --synthetic
+```
+
+See [docs/safe_repository_audit.md](docs/safe_repository_audit.md), [docs/experiment_protocol.md](docs/experiment_protocol.md), and [docs/adding_experiments.md](docs/adding_experiments.md) for compatibility and contribution rules.
+
 ### Setup
 
 ```bash

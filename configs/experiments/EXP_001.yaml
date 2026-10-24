@@ -1,0 +1,7 @@
+experiment_id: EXP_001
+name: adaptive_gated_fusion
+model: gated_fusion
+layers: [8, 16, 24, 32]
+dataset: libero10
+split_version: v1
+selection_split: seen_val
