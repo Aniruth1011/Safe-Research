@@ -292,7 +292,7 @@ def main():
 
         # ---------- manifest + checksums ----------
         files = sorted(p for p in out.rglob("*") if p.is_file())
-        checksums = {} if args.skip_checksums else {str(p.relative_to(out)): sha256(p) for p in files}
+        checksums = {} if args.skip_checksums else {p.relative_to(out).as_posix(): sha256(p) for p in files}  # POSIX keys on every OS
         manifest = {
             "cache_version": args.version,
             "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),

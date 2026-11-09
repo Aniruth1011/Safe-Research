@@ -54,7 +54,7 @@ def verify(cache: Path, quick: bool) -> int:
         if p.suffix == ".npy":
             np.load(p, mmap_mode="r")  # header/shape sanity
         ok += 1
-    withheld = [r for r in absent if "/unseen_test/" in r]
+    withheld = [r for r in absent if "/unseen_test/" in r.replace("\\", "/")]
     other_absent = [r for r in absent if r not in withheld]
     print(f"verified {ok} files; {len(bad)} corrupted; {len(other_absent)} not downloaded; "
           f"{len(withheld)} unseen-test files withheld")

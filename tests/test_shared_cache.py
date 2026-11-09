@@ -120,7 +120,7 @@ def test_build_verify_load(built):
     val = eps[eps.split == "seen_val"]
     assert (val.groupby("task_id").failure.nunique() == 2).all()
     # task_min_step = min length per task
-    assert (eps.groupby("task_id").apply(lambda g: (g.task_min_step == g.length.min()).all())).all()
+    assert (eps.task_min_step == eps.groupby("task_id").length.transform("min")).all()
 
     assert run(KIT / "check_cache.py", "verify", "--cache", cache).returncode == 0
 
@@ -200,6 +200,7 @@ def test_task_names_and_provenance_recorded(tmp_path):
     man = json.loads((cache / "manifest.json").read_text())
     assert man["task_suite_name"] == "libero_10" and man["features_are_unnormalized"] is True
     assert "provenance/libero_commit.txt" in man["files"]  # checksummed, not copied in afterwards
+    assert not any("\\" in k for k in man["files"]), "manifest paths must use / on every OS"
 
 
 def test_capture_check(tmp_path):
