@@ -1,0 +1,4 @@
+numpy<2
+protobuf>=4.25,<5
+tensorflow-metadata<1.16
+mujoco<3
