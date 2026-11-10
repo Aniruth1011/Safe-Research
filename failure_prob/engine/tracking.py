@@ -4,12 +4,38 @@ import csv
 import json
 import os
 import tempfile
-import fcntl
+from contextlib import contextmanager
+
+try:  # POSIX (Linux, macOS, CARC)
+    import fcntl
+except ImportError:  # Windows has no fcntl
+    fcntl = None
+    import msvcrt
 from datetime import datetime, timezone
 from pathlib import Path
 
 
 INDEX_FIELDS = ["run_id", "experiment_id", "experiment_name", "model", "dataset", "backbone", "backbone_checkpoint", "layers", "seed", "split_version", "status", "start_time", "end_time", "trainable_parameters", "best_epoch", "val_roc_auc", "val_pr_auc", "val_tpr_at_5_fpr", "val_tpr_at_10_fpr", "test_roc_auc", "test_pr_auc", "test_tpr_at_5_fpr", "checkpoint_path", "config_path", "metrics_path", "git_commit", "error_message"]
+
+
+@contextmanager
+def _exclusive_lock(lock_path: Path):
+    """Exclusive inter-process lock on lock_path, on POSIX (fcntl) and Windows (msvcrt)."""
+    with lock_path.open("a+") as lock:
+        if fcntl is not None:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+        else:
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)  # blocks (retries) until the first byte is free
+            try:
+                yield
+            finally:
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 class RunTracker:
@@ -39,8 +65,7 @@ class RunTracker:
     def _update(self, row):
         self.index_path.parent.mkdir(parents=True, exist_ok=True)
         lock_path = self.index_path.with_suffix(self.index_path.suffix + ".lock")
-        with lock_path.open("w") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+        with _exclusive_lock(lock_path):
             rows = []
             if self.index_path.exists():
                 with self.index_path.open(newline="") as handle:

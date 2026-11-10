@@ -1,0 +1,5 @@
+# Shell/Slurm scripts must keep LF endings or bash on CARC fails, even if edited on Windows.
+*.sh     text eol=lf
+*.slurm  text eol=lf
+# The OpenVLA patch must stay byte-exact for `git apply`.
+*.patch  -text
