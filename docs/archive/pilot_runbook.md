@@ -14,7 +14,7 @@ Code: `vla-safe/openvla` fork, branch `akash/collector` (remote `akash-ravi/open
 - CPU sanity on the login node (no GPU): in the fork, `python -m pytest -q tests` (needs transformers==4.40.1 for the capture and dry-run tests) and `python experiments/robot/libero/audit_collection.py --help`.
 
 ## 1. Job template
-`experiments/robot/libero/slurm/collect_task.sbatch` (fork). Header: `#!/bin/bash -l`, `-A yzhao010_1531`, `-p debug -n 1 --gpus=a40:1 -t 01:00:00`, `--requeue`, `--open-mode=append`, plus `--cpus-per-task=8 --mem=48G` *(UNVERIFIED: from handoff T2)*. It sets `HF_HUB_OFFLINE=1`, `MUJOCO_GL=egl`, and requires an explicit `CUDA_HOME`. One job = one task = one episode range. Fill in `CKPT`, `COLLECT_ENV`, `CUDA_HOME`, `OUT_ROOT` (scratch, e.g. `/scratch1/akashrav/data/pilot`).
+`experiments/robot/libero/slurm/collect_task.sbatch` (fork). Header: `#!/bin/bash -l`, `-A <account>`, `-p debug -n 1 --gpus=a40:1 -t 01:00:00`, `--requeue`, `--open-mode=append`, plus `--cpus-per-task=8 --mem=48G` *(UNVERIFIED: from handoff T2)*. It sets `HF_HUB_OFFLINE=1`, `MUJOCO_GL=egl`, and requires an explicit `CUDA_HOME`. One job = one task = one episode range. Fill in `CKPT`, `COLLECT_ENV`, `CUDA_HOME`, `OUT_ROOT` (scratch, e.g. `/scratch1/<user>/data/pilot`).
 
 ## 2. Steps
 1. **Smoke job (1 task, 2 episodes)** — debug partition:
