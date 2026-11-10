@@ -58,7 +58,7 @@ jupytext==1.19.6
 keras==2.15.0
 kiwisolver==1.5.1
 libclang==18.1.1
--e file:///project2/yzhao010_1531/akashrav/LIBERO
+-e file:///project2/<group>/<user>/LIBERO
 llvmlite==0.50.0
 markdown==3.10.3
 markdown-it-py==4.2.0
@@ -92,7 +92,7 @@ nvidia-nvtx-cu12==12.1.105
 oauthlib==4.0.1
 opencv-python==4.11.0.86
 openexr==3.5.2
--e file:///project2/yzhao010_1531/akashrav/openvla
+-e file:///project2/<group>/<user>/openvla
 opt-einsum==3.4.0
 packaging==26.3
 pandas==2.3.3

@@ -29,7 +29,7 @@ Attention implementation must be identical for the whole collection (see compute
 
 ```bash
 cd /path/to/openvla            # fork, branch akash/collector
-ROOT=/scratch1/akashrav/data/<run>      # collection root: task00/ ... task09/, _quarantine/
+ROOT=/scratch1/<user>/data/<run>      # collection root: task00/ ... task09/, _quarantine/
 mkdir -p $HOME/audits          # --json must be OUTSIDE $ROOT
 
 D=$(date +%Y%m%d)
