@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -20,15 +21,40 @@ EPS = 3
 pytestmark = pytest.mark.skipif(shutil.which("bash") is None or shutil.which("sha256sum") is None,
                                 reason="needs bash and sha256sum")
 
-FAKE_MODAL = """#!/bin/bash
-# fake `modal volume get [--profile P] [--force] VOLUME REMOTE DEST`: copies from $FAKE_VOLUME_ROOT/<profile>/
-set -euo pipefail
-[ "$1 $2" = "volume get" ] || { echo "fake modal: unsupported $*" >&2; exit 2; }
-shift 2; profile=""; args=()
-while [ $# -gt 0 ]; do case "$1" in --profile) profile="$2"; shift 2;; --force) shift;; *) args+=("$1"); shift;; esac; done
-src="$FAKE_VOLUME_ROOT/$profile/${args[1]}"; dst="${args[2]}"
-[ -e "$src" ] || { echo "not found: ${args[1]}" >&2; exit 1; }
-rm -rf "$dst"; mkdir -p "$(dirname "$dst")"; cp -R "$src" "$dst"
+FAKE_MODAL = r"""#!{python}
+# Fake `modal volume get [--profile P] [--force] VOLUME REMOTE DEST`, a port of modal 1.6's cli/_download.py:
+#   entries = REMOTE itself if it is a file, else every file/dir below it (recursive); rel = path relative to
+#   REMOTE's parent (so it starts with REMOTE's basename); output = DEST/rel if DEST is an existing directory, else
+#   DEST itself for EVERY entry; an existing output is an error without --force (with --force it is replaced).
+import os, shutil, sys
+from pathlib import Path, PurePosixPath
+a = sys.argv[1:]
+assert a[:2] == ["volume", "get"], a
+a = a[2:]; profile = None; force = False; pos = []
+while a:
+    x = a.pop(0)
+    if x == "--profile": profile = a.pop(0)
+    elif x == "--force": force = True
+    else: pos.append(x)
+vol, remote, dest = pos[0], pos[1].rstrip("/"), Path(pos[2] if len(pos) > 2 else ".")
+root = Path(os.environ["FAKE_VOLUME_ROOT"]) / profile
+src = root / remote
+if not src.exists():
+    sys.exit(f"No such file or directory: {remote}")
+entries = [src] if src.is_file() else sorted(src.rglob("*"))
+start = PurePosixPath(remote).parent
+for e in entries:
+    rel = PurePosixPath(e.relative_to(root).as_posix()).relative_to(start)
+    out = dest / rel if dest.is_dir() else dest
+    if out.exists():
+        if not force:
+            sys.exit(f"UsageError: Output path '{out}' already exists. Use --force to overwrite the output directory")
+        os.remove(out) if out.is_file() else shutil.rmtree(out)
+    if e.is_file():
+        out.parent.mkdir(parents=True, exist_ok=True)   # raises FileExistsError if a parent is a file
+        shutil.copyfile(e, out)
+    else:
+        out.mkdir(parents=True, exist_ok=True)
 """
 
 
@@ -55,6 +81,7 @@ def make_task(vol: Path, profile: str, t: int, status="complete", gpu="NVIDIA A1
     work = vol / profile / "work"
     (work / "image_provenance").mkdir(parents=True, exist_ok=True)
     (work / "image_provenance" / "pip_freeze.txt").write_text("torch==2.2.0+cu121\n")
+    (work / "image_provenance" / "image_fingerprint.txt").write_text("0f65545c" + "0" * 56 + "\n")
     (work / "checkpoint_path.txt").write_text("/vol/hf/snapshots/abc\n")
     return tdir
 
@@ -63,7 +90,7 @@ def make_task(vol: Path, profile: str, t: int, status="complete", gpu="NVIDIA A1
 def env(tmp_path):
     fake = tmp_path / "bin" / "modal"
     fake.parent.mkdir()
-    fake.write_text(FAKE_MODAL)
+    fake.write_text(FAKE_MODAL.replace("{python}", sys.executable))
     fake.chmod(0o755)
     return dict(os.environ, MODAL_BIN=str(fake), FAKE_VOLUME_ROOT=str(tmp_path / "vol"),
                 PULL_ROOT=str(tmp_path / "scratch"), EPISODES_PER_TASK=str(EPS), ALLOW_OUTSIDE_SLURM="1")
@@ -119,3 +146,88 @@ def test_refuses_outside_a_slurm_job(env, tmp_path):
     e = {k: v for k, v in env.items() if k not in ("ALLOW_OUTSIDE_SLURM", "SLURM_JOB_ID")}
     r = pull(e, "--profile", "friend", "--tasks", "0")
     assert r.returncode != 0 and "never on a login node" in r.stderr
+
+
+# ---------------------------------------------------------------- real `modal volume get` semantics (CARC job 14000077)
+def fake_get(env, *args):
+    return subprocess.run([env["MODAL_BIN"], "volume", "get", "--profile", "friend", *args], env=env,
+                          capture_output=True, text=True)
+
+
+def test_fake_cli_matches_real_modal_semantics(env, tmp_path):
+    make_task(tmp_path / "vol", "friend", 0)
+    d = tmp_path / "dl"
+    # a folder into a NON-existing destination collapses into one file (each entry overwrites it)
+    assert fake_get(env, "--force", "cs566-collection", "work/image_provenance", str(d / "a")).returncode == 0
+    assert (d / "a").is_file()
+    # ... and without --force the second entry is an error
+    (tmp_path / "vol" / "friend" / "work" / "image_provenance" / "dpkg_packages.txt").write_text("x\n")
+    r = fake_get(env, "cs566-collection", "work/image_provenance", str(d / "b"))
+    assert r.returncode != 0 and "already exists" in r.stdout + r.stderr
+    # a folder into an EXISTING directory nests under the folder's own name
+    (d / "c").mkdir(parents=True)
+    assert fake_get(env, "cs566-collection", "work/image_provenance", str(d / "c")).returncode == 0
+    assert (d / "c" / "image_provenance" / "pip_freeze.txt").is_file()
+    # a single file into an existing directory keeps its name
+    assert fake_get(env, "cs566-collection", "work/checkpoint_path.txt", str(d / "c")).returncode == 0
+    assert (d / "c" / "checkpoint_path.txt").is_file()
+
+
+def test_reproduces_carc_job_14000077_with_the_old_command_sequence(env, tmp_path):
+    make_task(tmp_path / "vol", "friend", 0)
+    prov = tmp_path / "scratch" / RUN / "image_provenance" / "friend"
+    old = f"""set -e
+mkdir -p "{prov}"
+"$MODAL_BIN" volume get --profile friend --force cs566-collection work/image_provenance "{prov}.tmp"
+rm -rf "{prov}" && mv "{prov}.tmp" "{prov}"
+"$MODAL_BIN" volume get --profile friend --force cs566-collection work/checkpoint_path.txt "{prov}/checkpoint_path.txt"
+"""
+    r = subprocess.run(["bash", "-c", old], env=env, capture_output=True, text=True)
+    assert r.returncode != 0 and ("File exists" in r.stderr or "Not a directory" in r.stderr), r.stderr
+    assert prov.is_file()                                       # the state found on CARC
+
+
+def test_rerun_from_the_failed_carc_state_moves_the_bad_file_aside(env, tmp_path):
+    for t in (0, 1, 3, 4):
+        make_task(tmp_path / "vol", "friend", t)
+    run = Path(env["PULL_ROOT"]) / RUN
+    (run / "image_provenance").mkdir(parents=True)
+    (run / "image_provenance" / "friend").write_text("x" * 8248)          # the 8,248-byte FILE left on CARC
+    (run / "pull_log.tsv").write_text("utc\tprofile\ttask\tresult\n")  # header only
+    r = pull(env, "--profile", "friend", "--tasks", "0,1,3,4")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (run / "image_provenance" / "friend").is_dir()
+    assert (run / "image_provenance" / "friend" / "checkpoint_path.txt").is_file()
+    assert (run / "image_provenance" / "friend" / "image_fingerprint.txt").is_file()
+    moved = list((run / "_discarded").glob("*/image_provenance-friend"))
+    assert len(moved) == 1 and moved[0].is_file() and moved[0].stat().st_size == 8248   # kept, not deleted
+    assert all((run / f"task{t:02d}" / "TASK_META.json").exists() for t in (0, 1, 3, 4))
+    assert not list(run.glob(".incoming-*"))
+    # rerun: everything already verified is skipped, nothing moved
+    r = pull(env, "--profile", "friend", "--tasks", "0,1,3,4")
+    assert r.returncode == 0 and r.stdout.count("already pulled and verified; skipped") == 4, r.stdout + r.stderr
+    assert "unchanged (already in place)" in r.stdout
+    assert len(list((run / "_discarded").glob("*/*"))) == 1
+
+
+def test_a_corrupted_or_partial_local_task_is_moved_aside_and_repulled(env, tmp_path):
+    make_task(tmp_path / "vol", "friend", 5)
+    assert pull(env, "--profile", "friend", "--tasks", "5").returncode == 0
+    run = Path(env["PULL_ROOT"]) / RUN
+    (run / "task05" / "libero_10" / "task5--ep0--succ1.pkl").write_bytes(b"damaged on disk")
+    (run / ".incoming-task07").mkdir()                                     # leftover of an interrupted pull
+    r = pull(env, "--profile", "friend", "--tasks", "5")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "CHECKSUM MISMATCH" in r.stdout and (run / "task05" / "TASK_META.json").exists()
+    assert len(list((run / "_discarded").glob("*/task05"))) == 1
+    assert len(list((run / "_discarded").glob("*/.incoming-task07"))) == 1
+
+
+def test_comma_task_list_through_the_slurm_job(env, tmp_path):
+    for t in (0, 1, 3, 4):
+        make_task(tmp_path / "vol", "friend", t)
+    e = dict(env, PROFILE="friend", TASKS="0,1,3,4", SLURM_JOB_ID="1")     # exported, then --export=ALL
+    r = subprocess.run(["bash", "carc/04_pull_from_modal.slurm"], cwd=ROOT / "collection", env=e,
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert sorted(p.name for p in (Path(env["PULL_ROOT"]) / RUN).glob("task0*")) == ["task00", "task01", "task03", "task04"]

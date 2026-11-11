@@ -11,7 +11,9 @@
 #   rollouts/<run>/taskNN/libero_10/...      SAFE's files + .layers.pt + invalid markers + provenance/
 #   rollouts/<run>/taskNN/TASK_META.json     workspace profile, GPU, kit commit, timing, status
 #   rollouts/<run>/taskNN/SHA256SUMS         sha256 of every file under libero_10/, written when the task completed
-# Result on CARC: $PULL_ROOT/<run>/taskNN/ (same layout), plus $PULL_ROOT/<run>/image_provenance/<profile>/.
+# Result on CARC: $PULL_ROOT/<run>/taskNN/ (same layout), plus $PULL_ROOT/<run>/image_provenance/<profile>/ (a
+# directory). Reruns are safe: a task already pulled and still verified is skipped; anything partial, mismatched or
+# malformed (also leftovers of an interrupted pull) is moved to $PULL_ROOT/<run>/_discarded/<utc>/, never deleted.
 # A task is moved into place only after every check passes; a failed pull leaves nothing under taskNN/.
 # Nothing is ever deleted from the Volume.
 set -euo pipefail
@@ -86,50 +88,93 @@ print(f"  task {t}: {n_eps - n_inv} episodes + {n_inv} invalid markers, GPU {met
 PY
 }
 
-mkdir -p "$PULL_ROOT/$RUN_NOTE"
-LOG="$PULL_ROOT/$RUN_NOTE/pull_log.tsv"
+RUN_DIR="$PULL_ROOT/$RUN_NOTE"
+UTC=$(date -u +%Y%m%dT%H%M%SZ)
+DISCARD="$RUN_DIR/_discarded/$UTC"
+mkdir -p "$RUN_DIR"
+LOG="$RUN_DIR/pull_log.tsv"
 [ -f "$LOG" ] || printf 'utc\tprofile\ttask\tresult\n' > "$LOG"
+logrow() { printf '%s\t%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$PROFILE" "$1" "$2" >> "$LOG"; }
+discard() {  # move $1 aside as _discarded/<utc>/$2 (never delete), and say why
+  mkdir -p "$DISCARD"
+  mv "$1" "$DISCARD/$2"
+  echo "  moved $1 -> $DISCARD/$2 ($3)"
+}
 
-# Image provenance of this workspace (compared across workspaces before the cache is built)
-PROV="$PULL_ROOT/$RUN_NOTE/image_provenance/$PROFILE"
-mkdir -p "$PROV"
-"$MODAL_BIN" volume get --profile "$PROFILE" --force "$VOLUME" work/image_provenance "$PROV.tmp" >/dev/null
-rm -rf "$PROV" && mv "$PROV.tmp" "$PROV"
-"$MODAL_BIN" volume get --profile "$PROFILE" --force "$VOLUME" work/checkpoint_path.txt "$PROV/checkpoint_path.txt" >/dev/null
+# `modal volume get VOL REMOTE DEST` (modal 1.6): if DEST is an existing directory, files land in DEST/<basename of
+# REMOTE>/...; if DEST does not exist, EVERY file is written to DEST itself (a folder collapses into one file); an
+# existing DEST without --force is an error. So: always download into a fresh, existing, empty directory, then locate
+# the payload inside it (with or without the <basename> level).
+fetch() {  # $1 = remote path, $2 = fresh local dir (created here) ; prints the payload path
+  mkdir -p "$2"
+  "$MODAL_BIN" volume get --profile "$PROFILE" "$VOLUME" "$1" "$2/" >/dev/null || return 1
+  local base; base=$(basename "$1")
+  if [ -e "$2/$base" ]; then echo "$2/$base"; else echo "$2"; fi
+}
+
+# Leftovers of an interrupted earlier pull are moved aside, never reused.
+for d in "$RUN_DIR"/.incoming-*; do [ -e "$d" ] && discard "$d" "$(basename "$d")" "left over from an interrupted pull"; done
+
+# ---- image provenance of this workspace: a directory image_provenance/<profile>/ (pip freeze, commits, fingerprint,
+#      checkpoint_path.txt), compared across workspaces by 05_build_cache_from_modal.slurm
+PROV="$RUN_DIR/image_provenance/$PROFILE"
+mkdir -p "$RUN_DIR/image_provenance"
+INC="$RUN_DIR/.incoming-provenance-$PROFILE"
+P=$(fetch work/image_provenance "$INC") || die "could not download work/image_provenance from volume $VOLUME"
+[ -f "$P/image_fingerprint.txt" ] || die "work/image_provenance in volume $VOLUME has no image_fingerprint.txt"
+INC_C="$RUN_DIR/.incoming-checkpoint-$PROFILE"
+CK=$(fetch work/checkpoint_path.txt "$INC_C") || die "could not download work/checkpoint_path.txt"
+[ -f "$CK" ] || CK="$CK/checkpoint_path.txt"
+mv "$CK" "$P/checkpoint_path.txt"
+rmdir "$INC_C" 2>/dev/null || true
+if [ -d "$PROV" ] && diff -r -q "$PROV" "$P" >/dev/null; then
+  echo "image provenance for $PROFILE: unchanged (already in place)"
+  rm -rf "$INC"   # a byte-identical duplicate of what is already in place
+else
+  [ -e "$PROV" ] && discard "$PROV" "image_provenance-$PROFILE" "differs from the volume or is not a directory"
+  mv "$P" "$PROV"
+  rm -rf "$INC"   # only empty helper folders remain here
+  echo "image provenance for $PROFILE: $(cat "$PROV/image_fingerprint.txt")"
+fi
+
+verify_task() {  # $1 = task folder, $2 = task id: checksums, file list, completeness, GPU, profile, one attempt
+  local d="$1" t="$2"
+  [ -f "$d/TASK_META.json" ] && [ -f "$d/SHA256SUMS" ] && [ -d "$d/libero_10" ] || { echo "  task $t: TASK_META.json/SHA256SUMS/libero_10 missing"; return 1; }
+  ( cd "$d" && sha256sum --quiet -c SHA256SUMS ) || { echo "  task $t: CHECKSUM MISMATCH"; return 1; }
+  local listed present
+  listed=$(cut -c67- "$d/SHA256SUMS" | sort); present=$(cd "$d" && find libero_10 -type f | sort)
+  [ "$listed" = "$present" ] || { echo "  task $t: files on disk differ from SHA256SUMS"; return 1; }
+  check_task_dir "$d" "$t"
+}
 
 failed=0
 for t in $(expand_tasks "$TASKS"); do
   tt=$(printf '%02d' "$t")
-  final="$PULL_ROOT/$RUN_NOTE/task$tt"
+  final="$RUN_DIR/task$tt"
   if [ -e "$final" ]; then
-    echo "task $t: $final already exists; checking it again (delete it yourself to re-pull)"
-    check_task_dir "$final" "$t" || { failed=1; continue; }
+    if verify_task "$final" "$t"; then
+      echo "task $t: already pulled and verified; skipped"; logrow "$t" "already-verified"; continue
+    fi
+    discard "$final" "task$tt" "failed verification"
+  fi
+  inc="$RUN_DIR/.incoming-task$tt"
+  echo "task $t: pulling rollouts/$RUN_NOTE/task$tt from volume $VOLUME (profile $PROFILE)"
+  if ! src=$(fetch "rollouts/$RUN_NOTE/task$tt" "$inc"); then
+    echo "task $t: download failed"; logrow "$t" "download-failed"; failed=1
+    [ -e "$inc" ] && discard "$inc" "incoming-task$tt" "download failed"
     continue
   fi
-  stage="$PULL_ROOT/$RUN_NOTE/.incoming-task$tt"
-  rm -rf "$stage"
-  echo "task $t: pulling rollouts/$RUN_NOTE/task$tt from volume $VOLUME (profile $PROFILE)"
-  if ! "$MODAL_BIN" volume get --profile "$PROFILE" "$VOLUME" "rollouts/$RUN_NOTE/task$tt" "$stage" >/dev/null; then
-    echo "task $t: download failed"; printf '%s\t%s\t%s\tdownload-failed\n' "$(date -u +%FT%TZ)" "$PROFILE" "$t" >> "$LOG"
-    failed=1; continue
+  if ! verify_task "$src" "$t"; then
+    logrow "$t" "verification-failed"; failed=1
+    discard "$inc" "incoming-task$tt" "failed verification after download"
+    continue
   fi
-  # `modal volume get` of a folder may nest it under its own name; normalise to $stage/{TASK_META.json,...}
-  [ -f "$stage/TASK_META.json" ] || { [ -d "$stage/task$tt" ] && stage="$stage/task$tt"; }
-  if ! ( cd "$stage" && sha256sum --quiet -c SHA256SUMS ); then
-    echo "task $t: CHECKSUM MISMATCH"; printf '%s\t%s\t%s\tchecksum-failed\n' "$(date -u +%FT%TZ)" "$PROFILE" "$t" >> "$LOG"
-    failed=1; continue
+  mv "$src" "$final"
+  if [ -e "$inc" ]; then  # only when the CLI nested the folder: the helper directory must now be empty
+    rmdir "$inc" 2>/dev/null || discard "$inc" "incoming-task$tt-rest" "unexpected extra files next to the task folder"
   fi
-  listed=$(cut -c67- "$stage/SHA256SUMS" | sort); present=$(cd "$stage" && find libero_10 -type f | sort)
-  if [ "$listed" != "$present" ]; then
-    echo "task $t: files on disk differ from SHA256SUMS"; failed=1; continue
-  fi
-  if ! check_task_dir "$stage" "$t"; then
-    printf '%s\t%s\t%s\tincomplete\n' "$(date -u +%FT%TZ)" "$PROFILE" "$t" >> "$LOG"; failed=1; continue
-  fi
-  mv "$stage" "$final"
-  rm -rf "$PULL_ROOT/$RUN_NOTE/.incoming-task$tt"
-  printf '%s\t%s\t%s\tok\n' "$(date -u +%FT%TZ)" "$PROFILE" "$t" >> "$LOG"
+  logrow "$t" "ok"
 done
 
-[ "$failed" = 0 ] || die "some tasks failed (see above and $LOG); nothing was deleted on Modal"
-echo "pull_from_modal: all requested tasks verified under $PULL_ROOT/$RUN_NOTE"
+[ "$failed" = 0 ] || die "some tasks failed (see above and $LOG); nothing was deleted, on Modal or here"
+echo "pull_from_modal: all requested tasks verified under $RUN_DIR"
