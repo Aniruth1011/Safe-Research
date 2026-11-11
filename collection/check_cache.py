@@ -75,9 +75,27 @@ def index(d: Path) -> dict[tuple[int, int], Path]:
     return out
 
 
+def report_invalid(d: Path, label: str = "") -> dict[tuple[int, int], str]:
+    """Print the invalid-episode markers (task{T}--ep{E}--invalid.json, must-fix 4) of a rollout folder."""
+    out = {}
+    for p in sorted(d.glob("task*--ep*--invalid.json")):
+        m = re.match(r"^task(\d+)--ep(\d+)--invalid\.json$", p.name)
+        if m:
+            try:
+                out[(int(m.group(1)), int(m.group(2)))] = json.loads(p.read_text()).get("exception_type", "?")
+            except (OSError, ValueError):
+                out[(int(m.group(1)), int(m.group(2)))] = "UNREADABLE MARKER"
+    if out:
+        print(f"{label}{len(out)} invalid episodes (no data, skipped): "
+              + ", ".join(f"task{t}--ep{e} ({x})" for (t, e), x in sorted(out.items())))
+    return out
+
+
 def compare_runs(a: Path, b: Path, layer: int, pool: str) -> int:
     import torch
     ia, ib = index(a), index(b)
+    report_invalid(a, "run a: ")
+    report_invalid(b, "run b: ")
     common = sorted(set(ia) & set(ib))
     if not common:
         print("No episodes in common")
@@ -125,6 +143,7 @@ def capture(rollout_dir: Path) -> int:
     import pickle
     import torch
     eps = sorted(rollout_dir.glob("task*--ep*--succ*.csv"))
+    report_invalid(rollout_dir)
     if not eps:
         print(f"no completed episodes in {rollout_dir}")
         return 1

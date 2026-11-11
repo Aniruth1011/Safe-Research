@@ -79,6 +79,14 @@ Each file is one layer × one pooling × one split, about 0.4–0.7 GB with full
 - **Off CARC (Kaggle, Colab):** upload `manifest.json`, `CHECKSUMS.sha256`, `episodes.csv`, `splits.json`, `norm_stats/` and the needed `features/<pool>/{train,seen_val}/L*.npy` files to a private Kaggle Dataset or a private Hugging Face dataset. Check that platform's size limits first.
 - After downloading, everyone runs `python check_cache.py verify --cache <dir>`. Withheld unseen files and layers you didn't download are reported but don't count as errors. Corrupted files do.
 
+## Invalid episodes
+
+With `--save_all_layers`, an episode that raises an ordinary exception does not kill the job. The patched script writes `task{T}--ep{E}--invalid.json` (atomic) **instead of** that episode's `.csv`/`.pkl`/`.layers.pt`/`.mp4`, resets the env and continues. The marker is a JSON object: `format` (1), `kind`, `task_suite_name`, `task_id`, `episode_idx`, `init_state_index`, `seed`, `step_index` (env step incl. the settling steps), `num_steps_wait`, `policy_steps_completed`, `exception_type`, `exception_message`, `traceback`, `timestamp_utc`, `job`, `invalid_count_in_job_range`, `max_invalid_episodes`.
+- `--resume` counts a marker as done. To retry an episode, delete its marker.
+- Systemic errors are never recorded; they stop the job: Ctrl-C/SystemExit, MemoryError, CUDA OOM and CUDA/cuBLAS/cuDNN/driver errors, device-side asserts, flash-attn/EGL/OpenGL errors, import errors, a full disk. Errors before the first episode stop it too.
+- More than `--max_invalid_episodes` (default 3) markers in the job's task range also stop the job. If the cause was systemic, delete the markers before resuming.
+- `build_cache.py` requires every missing episode to have exactly one marker, refuses an episode that has both a marker and data, and lists invalid episodes under `invalid_episodes` in `manifest.json`. `--max-invalid N` sets a dataset-wide limit. `check_cache.py capture`/`compare-runs` list the markers.
+
 ## Using it
 
 ```python
