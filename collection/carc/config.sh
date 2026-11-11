@@ -5,12 +5,15 @@
 # Your CARC Slurm account (the PI/project account you normally pass to --account)
 export CARC_ACCOUNT="CHANGE_ME"                     # e.g. "smith_123"
 
-# Where code, model weights and outputs live. /scratch1 is large and fast; /project2 is shareable with your group.
+# Where code, model weights and outputs live. /scratch1 is large and fast (not backed up); /project2 is shareable
+# with your group.
 export WORK="/scratch1/${USER:-$(id -un)}/safe_cache_work"       # clones + Python env + HF cache
 export ROLLOUT_ROOT="/scratch1/${USER:-$(id -un)}/safe_rollouts" # raw rollouts (~150-200 GB with all layers, 3 poolings)
-# CARC project directories are /project2/<account>, NOT /project/<account> (seen with `myquota`, 2026-11-06).
-# If `myquota` shows a different project path for your group, edit this line.
-export CACHE_ROOT="/project2/$CARC_ACCOUNT/safe_cache"   # final versioned cache (same size again); share this
+# Final versioned cache (about the size of the rollouts again). Default: /scratch1, next to the rollouts.
+# An exported CACHE_ROOT wins over this default, so a job can write elsewhere without editing this file, e.g. to share
+# it with your group: `export CACHE_ROOT=/project2/<group>/safe_cache` before `sbatch --export=ALL ...`.
+# CARC project directories are /project2/<group>, NOT /project/<group> (seen with `myquota`, 2026-11-06).
+export CACHE_ROOT="${CACHE_ROOT:-/scratch1/${USER:-$(id -un)}/safe_cache}"
 export CACHE_VERSION="v1"
 
 # --- Python environment (pins and reasons: ../constraints.txt) ------------------------------

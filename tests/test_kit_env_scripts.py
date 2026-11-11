@@ -101,7 +101,8 @@ def test_config_pins_and_paths():
     assert exported["ENV_MODE"].startswith('"uv"')                       # the verified mode is the default
     assert OPENVLA_COMMIT in exported["OPENVLA_COMMIT"]
     assert re.search(r'"[0-9a-f]{40}"', exported["LIBERO_COMMIT"])
-    assert exported["CACHE_ROOT"].startswith('"/project2/')
+    assert exported["CACHE_ROOT"] == '"${CACHE_ROOT:-/scratch1/${USER:-$(id -un)}/safe_cache}"'  # /scratch1 default,
+    # and an exported CACHE_ROOT overrides it (test_cache_root_default_and_override)
     assert not any("/project/" in ln for ln in lines), "CARC project space is /project2/<account>"
     assert "CHANGE_ME" in exported["CARC_ACCOUNT"]                       # account-specific: stays a placeholder
     setup = (CARC / "00_setup_env.sh").read_text()
@@ -113,12 +114,29 @@ def test_guard_rejects_placeholders_and_accepts_a_filled_config(tmp_path):
     env = base_env(tmp_path)
     r = run([BASH, "-euo", "pipefail", "-c", f'source "{CARC / "config.sh"}"; kit_check_config'], env=env)
     assert r.returncode != 0
-    assert "CARC_ACCOUNT" in r.stderr and "CACHE_ROOT" in r.stderr and "CUDA_HOME" in r.stderr and "CHANGE_ME" in r.stderr
+    assert "CARC_ACCOUNT" in r.stderr and "CUDA_HOME" in r.stderr and "CHANGE_ME" in r.stderr
 
     good = write_config(tmp_path / "kit/carc/config.sh", CARC_ACCOUNT="acct_123", CUDA_HOME="/opt/cuda-12.4")
     r = run([BASH, "-euo", "pipefail", "-c", f'source "{good}"; cd /; kit_check_config; echo "$CACHE_ROOT"'], env=env)
     assert r.returncode == 0, r.stderr
-    assert r.stdout.strip() == "/project2/acct_123/safe_cache"
+    assert r.stdout.strip() == "/scratch1/tester/safe_cache"
+
+
+def test_cache_root_default_and_override(tmp_path):
+    """Default /scratch1/<user>/safe_cache; an exported CACHE_ROOT (e.g. passed with sbatch --export=ALL) wins."""
+    cfg = CARC / "config.sh"
+    probe = f'source "{cfg}"; echo "$CACHE_ROOT"'
+    env = base_env(tmp_path)
+    r = run([BASH, "-euo", "pipefail", "-c", probe], env=env)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "/scratch1/tester/safe_cache"
+    r = run([BASH, "-euo", "pipefail", "-c", probe], env={**env, "CACHE_ROOT": "/project2/grp_1/safe_cache"})
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "/project2/grp_1/safe_cache"
+    env.pop("USER")  # no $USER in the job environment: falls back to `id -un`
+    r = run([BASH, "-euo", "pipefail", "-c", probe], env=env)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == f"/scratch1/{subprocess.run(['id', '-un'], capture_output=True, text=True).stdout.strip()}/safe_cache"
 
 
 @pytest.mark.parametrize("name,value,needle", [

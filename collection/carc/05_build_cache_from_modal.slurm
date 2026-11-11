@@ -12,6 +12,7 @@
 set -euo pipefail
 source carc/config.sh
 set +u; source carc/activate_env.sh; set -u
+echo "cache will be written to $CACHE_ROOT/$CACHE_VERSION"
 
 RUN_DIR="${PULL_ROOT:-/scratch1/${USER:-$(id -un)}/rollouts}/$RUN_NOTE"
 FLAT="$RUN_DIR/libero_10"          # one flat view (symlinks) of all task folders, the layout build_cache.py reads
