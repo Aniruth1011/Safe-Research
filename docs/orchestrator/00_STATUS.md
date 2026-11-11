@@ -8,7 +8,7 @@ Last updated: **2026-11-10** (orchestrator). Read this first; the other files in
 |---|---|---|
 | 0a | Git cleanup (plan row G0) | **Done and pushed 2026-11-10** |
 | 0 | Understanding pack (`01`–`06` in this folder) | **Done 2026-11-10** |
-| 1 | The five kit fixes, as a follow-up PR | In progress (F1–F5 restarted 2026-11-10; first attempt left nothing) |
+| 1 | The five kit fixes, as a follow-up PR | **Integrated and tested 2026-11-10; waiting for Akash's OK to open the PR** |
 | 2 | Modal smoke test (≤ $3) | Not started. Needs Phase 1 + Akash's approval |
 | 3 | Full collection (500 episodes) | Out of scope until Akash approves, the team answers the checklist, and the fix PR is merged |
 
@@ -28,15 +28,15 @@ Last updated: **2026-11-10** (orchestrator). Read this first; the other files in
 - **Decisions confirmed by Akash (2026-11-10):** A10 is the single GPU type, Modal only. `VLA_Task_Plan_v5.xlsx` is current (v4 outdated).
 - **Tooling on the laptop:** `uv`, two Python 3.10 virtual environments (`.venv-kit310`, `.venv-ov310`).
 
-## In progress
+## Phase 1 result (2026-11-10, CPU, laptop)
 
-| Subagent | Task | Effort |
-|---|---|---|
-| F1 | Modal app (A10), portable smoke script, CARC job syntax | high |
-| F2 | Pins in every install path, uv fallback, flash-attn install hard-fail | high |
-| F3 | Run-time attention guard, run fingerprint, mixed-dataset refusal | high |
-| F4 | Invalid episodes: marker, resume, cap; cache build accepts them | high |
-| F5 | Raw block 32 as layer index 33 | high |
+- `akash/kit-fixes` @ `6b50ca8` (pushed): all five fixes merged; `collection/openvla_all_layers.patch` regenerated from
+  openvla `akash/kit-patch` @ `bf38c80` (pushed) with `git diff 300dce2 akash/kit-patch`; it applies cleanly to `300dce2`.
+- **Kit tests:** `pytest -q` = **111 passed, 2 skipped** (Python 3.10.22, `.venv-kit310`). Skips: T6 (needs a GPU) and the
+  Modal import test (`modal` not in that venv; run by hand with the Modal CLI's Python: the app builds 4 functions and 3 entrypoints, nothing sent to Modal).
+- **Patch-side tests:** `pytest -q tests/` = **67 passed** (Python 3.10, torch 2.2.0, transformers 4.40.1, `.venv-ov310`), including one test that runs fixes 3+4+5 together in the real episode loop.
+- Not testable on a laptop (the smoke test checks them): EGL on Modal, flash-attn in the Modal image, the real OpenVLA config reporting `flash_attention_2`, A10 speed.
+- Incident: the previous session's F2 agent revived after its usage limit and wrote into `sr-fix2` at the same time as ours; it was stopped, and the two versions were reconciled file by file (F2b).
 
 ## Blocked / waiting on Akash
 
@@ -50,7 +50,7 @@ Last updated: **2026-11-10** (orchestrator). Read this first; the other files in
    ≤ $3 smoke test this crosses the $25 stop-and-ask line, and the worst case touches the $30 ceiling. Image builds,
    Volume storage and the CPU cache build are not counted. The smoke test (A5/A6) must settle this before A8.
 
-Next gate: approval to open the fix PR.
+3. **Gate: open the fix PR** (`akash-ravi:akash/kit-fixes` → `Aniruth1011/Safe-Research:main`). Draft description ready.
 
 ## Next
 
