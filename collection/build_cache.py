@@ -4,7 +4,7 @@
 Input: a rollout folder written by the patched `run_libero_eval.py --save_all_layers True`, containing per episode
     task{T}--ep{E}--succ{S}.csv        (written last; marks the episode complete)
     task{T}--ep{E}--succ{S}.pkl        (SAFE's original last-layer features, unchanged)
-    task{T}--ep{E}--succ{S}.layers.pt  ((T, P, 33, D) bfloat16, all layers, P poolings)
+    task{T}--ep{E}--succ{S}.layers.pt  ((T, P, L, D) bfloat16, all layers, P poolings; L=34 with raw block 32, else 33)
 
 Output (CACHE_ROOT/<version>/):
     manifest.json         everything about the cache, incl. sha256 of every file
@@ -39,6 +39,7 @@ FP16_MAX = 65504.0
 LAYER_CONVENTION = (
     "hf_hidden_states: 0=embeddings, i(1..31)=output of decoder layer i (pre-norm), "
     "32=output of decoder layer 32 after final RMSNorm (SAFE's last layer). Spreadsheet L<i> == index i."
+    " 33 (only in 34-layer datasets, see layer_names)=output of decoder layer 32 BEFORE the final RMSNorm."
 )
 
 
@@ -96,6 +97,34 @@ def load_episode(row, mmap: bool = False) -> tuple[torch.Tensor, dict]:
     return payload["features"], payload
 
 
+# Files without `layer_names` (written before raw block 32 was added) follow this 33-layer convention.
+LEGACY_LAYER_NAMES = ["emb"] + [f"block{i:02d}" for i in range(1, 32)] + ["block32_postnorm"]
+
+
+def layer_names_of(payload: dict, n_layers: int) -> list[str]:
+    """Layer names of one .layers.pt (`layer_names` key; absent = legacy 33-layer convention)."""
+    names = payload.get("layer_names")
+    if names is None:
+        if n_layers != len(LEGACY_LAYER_NAMES):
+            raise ValueError(f"no layer_names and {n_layers} layers (only 33-layer files may omit layer_names)")
+        return list(LEGACY_LAYER_NAMES)
+    if len(names) != n_layers:
+        raise ValueError(f"{len(names)} layer_names for {n_layers} saved layers")
+    return list(names)
+
+
+def check_layer_names(path, payload: dict, n_layers: int, expected: list[str] | None) -> list[str]:
+    """This file's layer names; exits if they are unreadable or differ from `expected` (mixed 33/34-layer dataset)."""
+    try:
+        names = layer_names_of(payload, n_layers)
+    except ValueError as e:
+        sys.exit(f"{path}: {e}")
+    if expected is not None and names != expected:
+        sys.exit(f"{path}: mixed layer conventions in one dataset ({len(names)} layers, last {names[-1]!r} vs "
+                 f"{len(expected)} layers, last {expected[-1]!r}); use rollouts from one --save_raw_block32 setting")
+    return names
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--rollout-dir", required=True, type=Path)
@@ -142,6 +171,7 @@ def main():
 
     # ---------- lengths + per-episode consistency ----------
     lengths, names, suites, pools0, shape0 = [], [], [], None, None
+    layer_names0 = None
     for row in df.itertuples():
         feats, payload = load_episode(row, mmap=True)
         n_csv = len(pd.read_csv(row.csv))
@@ -149,6 +179,7 @@ def main():
             sys.exit(f"{row.layers}: {feats.shape[0]} feature steps but {n_csv} csv rows")
         if bool(payload.get("episode_success")) != bool(row.success):
             sys.exit(f"{row.layers}: success flag disagrees with filename")
+        layer_names0 = check_layer_names(row.layers, payload, feats.shape[2], layer_names0)
         if pools0 is None:
             pools0, shape0 = list(payload["pools"]), tuple(feats.shape[1:])
         elif list(payload["pools"]) != pools0 or tuple(feats.shape[1:]) != shape0:
@@ -307,6 +338,7 @@ def main():
             "source_rollout_dir": str(args.rollout_dir.resolve()),
             "layer_convention": LAYER_CONVENTION,
             "num_hidden_states": n_layers,
+            "layer_names": layer_names0,
             "layers_exported": layers,
             "pools_exported": pools,
             "pool_meaning": {"mean": "mean over the 7 action tokens (SAFE token_idx_rel=mean)",

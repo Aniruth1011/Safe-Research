@@ -98,6 +98,10 @@ def compare_runs(a: Path, b: Path, layer: int, pool: str) -> int:
             pb = torch.load(lb, map_location="cpu", weights_only=False, mmap=True)
             k = first_div if first_div is not None else n
             if k > 0:
+                from build_cache import layer_names_of
+                if layer_names_of(pa, pa["features"].shape[2]) != layer_names_of(pb, pb["features"].shape[2]):
+                    print(f"refusing to compare {la.name}: runs use different layer conventions (33 vs 34 layers?)")
+                    return 1
                 pi = pa["pools"].index(pool)
                 xa = pa["features"][:k, pi, layer].float()
                 xb = pb["features"][:k, pi, layer].float()
@@ -120,10 +124,13 @@ def capture(rollout_dir: Path) -> int:
 
     SAFE's pkl holds hidden_states[-1][0,-1,:] for each of the 7 action tokens: (T, 7, D).
     Our layer index 32 must reproduce it: first == pkl[:,0], last == pkl[:,6] exactly, mean == pkl.mean(1)
-    up to bfloat16 rounding. Also checks that layers are not accidentally duplicated.
+    up to bfloat16 rounding. Also checks that layers are not accidentally duplicated, and that all episodes share
+    one layer convention (`layer_names`; 34-layer files add raw block 32 at index 33, which this check skips).
     """
     import pickle
     import torch
+    from build_cache import layer_names_of
+    names0 = None
     eps = sorted(rollout_dir.glob("task*--ep*--succ*.csv"))
     if not eps:
         print(f"no completed episodes in {rollout_dir}")
@@ -137,13 +144,21 @@ def capture(rollout_dir: Path) -> int:
             continue
         lay = torch.load(lp, map_location="cpu", weights_only=False)
         ref = pickle.load(open(pp, "rb"))["hidden_states"]  # (T, 7, D)
-        f, pools = lay["features"], lay["pools"]          # (T, P, 33, D)
+        f, pools = lay["features"], lay["pools"]          # (T, P, 33 or 34, D)
         n_rows = len(pd.read_csv(csv))
         msgs = []
+        try:
+            names = layer_names_of(lay, f.shape[2])
+        except ValueError as e:
+            names = None
+            msgs.append(str(e))
+        names0 = names0 or names
+        if names is not None and names != names0:
+            msgs.append(f"mixed layer conventions: {len(names)} layers vs {len(names0)} in an earlier episode")
         if not (f.shape[0] == ref.shape[0] == n_rows):
             msgs.append(f"length mismatch layers={f.shape[0]} pkl={ref.shape[0]} csv={n_rows}")
         else:
-            last_layer = f.shape[2] - 1
+            last_layer = 32  # SAFE's s[-1] = block 32 after the final norm ("block32_postnorm"), also in 34-layer files
             if "first" in pools and not torch.equal(f[:, pools.index("first"), last_layer], ref[:, 0].to(f.dtype)):
                 msgs.append("first-token L32 != SAFE pkl token 0")
             if "last" in pools and not torch.equal(f[:, pools.index("last"), last_layer], ref[:, -1].to(f.dtype)):
