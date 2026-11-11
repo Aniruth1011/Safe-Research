@@ -1,9 +1,223 @@
+diff --git a/experiments/robot/libero/episode_guard.py b/experiments/robot/libero/episode_guard.py
+new file mode 100644
+index 0000000..98941dd
+--- /dev/null
++++ b/experiments/robot/libero/episode_guard.py
+@@ -0,0 +1,208 @@
++"""Invalid-episode handling for `run_libero_eval.py --save_all_layers` (shared-cache kit, must-fix 4 / choice E2).
++
++SAFE's script re-raises ANY exception from the step loop, so one bad episode kills a whole collection job. With
++`--save_all_layers` the patched script instead calls `EpisodeGuard.record_invalid()`:
++
++  * ordinary per-episode error (e.g. a simulator error for one initial state):
++      - every output of that episode that already exists (`task{t}--ep{e}--succ*`: .mp4/.pkl/.layers.pt/.csv and
++        their .tmp files, e.g. left over from an earlier, killed attempt) is removed FIRST,
++      - then the marker `task{t}--ep{e}--invalid.json` is written atomically (per-process tmp file, fsync, rename),
++      - the episode writes NO .mp4/.pkl/.layers.pt/.csv (the replay video is dropped too: a `--succ0.mp4` would
++        claim an outcome the episode never had; the marker's traceback and step index are the debugging record, and
++        the episode can be replayed from its fixed initial state),
++      - the env is reset (rebuilt if the reset itself fails) and the job continues with the next episode.
++  * systemic error (see `is_systemic`): re-raised unchanged, no marker. These would hit every later episode too.
++  * more than `max_invalid_episodes` markers in the job's task range (markers already on disk from earlier runs
++    count, so restarts cannot reset the count): the marker is written, then `TooManyInvalidEpisodes` aborts the job
++    (non-zero exit). If the cause turns out to be systemic, delete the listed markers before resuming.
++
++Re-attempting an episode (a run without --resume restarts at episode 0) deletes its old marker first.
++
++Resume: SAFE's `--resume` starts each task after the highest episode index that has a `.csv`. With `--save_all_layers`
++the markers are added to that set (`invalid_markers`), so a deterministic error is not retried forever. Delete a
++marker to retry that episode.
++
++Errors before the first episode (model load, processor, env construction, provenance) happen outside the step loop
++and are never caught here. Exceptions outside the step loop's try block (env.reset / set_init_state at the start of
++an episode, writing the outputs) are not caught either and still abort the job, as in SAFE.
++
++Marker format (JSON object, `format` = 1): format, kind="invalid_episode", task_suite_name, task_id, episode_idx,
++init_state_index, seed, step_index (env step counter t incl. the num_steps_wait settling steps), num_steps_wait,
++policy_steps_completed, exception_type (module-qualified), exception_message, traceback, timestamp_utc (ISO 8601),
++job {slurm_job_id, slurm_array_task_id, modal_task_id, pid}, invalid_count_in_job_range, max_invalid_episodes.
++"""
++from __future__ import annotations
++
++import datetime as dt
++import errno
++import json
++import os
++import re
++import sys
++import traceback as tb
++from pathlib import Path
++from typing import Callable, Iterable, Optional
++
++MARKER_FORMAT = 1
++MARKER_RE = re.compile(r"^task(\d+)--ep(\d+)--invalid\.json$")
++
++# Substrings (case-insensitive) that mark an error as systemic regardless of its Python type: CUDA / driver / cuBLAS /
++# cuDNN failures, device-side asserts, OOM, flash-attn refusing the GPU, and a broken offscreen-render (EGL/OpenGL) context.
++SYSTEMIC_PATTERNS = (
++    "cuda error", "cuda out of memory", "out of memory", "device-side assert", "illegal memory access",
++    "unspecified launch failure", "cublas_status", "cudnn_status", "cudnn error", "nccl error", "cuda driver",
++    "no cuda gpus", "ecc error", "flashattention", "flash_attn", "egl_", "glerror", "opengl",
++)
++# Python types that are never per-episode: interpreter/OOM signals and code/installation problems.
++SYSTEMIC_TYPES = (MemoryError, ImportError, NameError, SyntaxError)
++# Disk full / quota / read-only filesystem: nothing further can be written, not even a marker.
++SYSTEMIC_ERRNOS = {errno.ENOSPC, errno.EROFS} | ({errno.EDQUOT} if hasattr(errno, "EDQUOT") else set())
++
++
++class TooManyInvalidEpisodes(RuntimeError):
++    """Raised (chained to the episode's exception) when the invalid-episode cap is exceeded."""
++
++
++def marker_path(save_folder: Path, task_id: int, episode_idx: int) -> Path:
++    return Path(save_folder) / f"task{task_id}--ep{episode_idx}--invalid.json"
++
++
++def invalid_markers(save_folder: Path, task_id: int) -> list[Path]:
++    """Markers of one task, in the same shape as SAFE's `glob(f"task{t}--ep*--succ*.csv")` result for --resume."""
++    return sorted(p for p in Path(save_folder).glob(f"task{task_id}--ep*--invalid.json") if MARKER_RE.match(p.name))
++
++
++def _cuda_oom_type():
++    torch = sys.modules.get("torch")
++    return getattr(getattr(torch, "cuda", None), "OutOfMemoryError", None) if torch is not None else None
++
++
++def is_systemic(exc: BaseException) -> bool:
++    """True if `exc` (or anything in its __cause__/__context__ chain) must abort the whole job."""
++    seen, cur = set(), exc
++    oom = _cuda_oom_type()
++    while cur is not None and id(cur) not in seen and len(seen) < 20:
++        seen.add(id(cur))
++        if not isinstance(cur, Exception):  # KeyboardInterrupt, SystemExit, GeneratorExit
++            return True
++        if isinstance(cur, SYSTEMIC_TYPES) or (oom is not None and isinstance(cur, oom)):
++            return True
++        if isinstance(cur, OSError) and cur.errno in SYSTEMIC_ERRNOS:
++            return True
++        text = f"{type(cur).__name__}: {cur}".lower()
++        if any(p in text for p in SYSTEMIC_PATTERNS):
++            return True
++        cur = cur.__cause__ or cur.__context__
++    return False
++
++
++def atomic_write_json(obj: dict, path: Path) -> None:
++    """Per-process tmp file in the same directory, fsync, os.replace (atomic on POSIX); tmp removed on any failure."""
++    path = Path(path)
++    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
++    try:
++        with open(tmp, "w") as f:
++            json.dump(obj, f, indent=1, sort_keys=True, default=str)
++            f.write("\n")
++            f.flush()
++            os.fsync(f.fileno())
++        os.replace(tmp, path)
++    except BaseException:
++        if tmp.exists():
++            tmp.unlink()
++        raise
++
++
++def remove_episode_outputs(save_folder: Path, task_id: int, episode_idx: int) -> list[Path]:
++    """Delete every `task{t}--ep{e}--succ*` file (mp4/pkl/layers.pt/csv and their .tmp). `--ep1--` never matches ep10."""
++    removed = []
++    for p in sorted(Path(save_folder).glob(f"task{task_id}--ep{episode_idx}--succ*")):
++        if p.is_file():
++            p.unlink()
++            removed.append(p)
++    return removed
++
++
++def _job_identity() -> dict:
++    return {"slurm_job_id": os.environ.get("SLURM_JOB_ID"), "slurm_array_task_id": os.environ.get("SLURM_ARRAY_TASK_ID"),
++            "modal_task_id": os.environ.get("MODAL_TASK_ID"), "pid": os.getpid()}
++
++
++class EpisodeGuard:
++    """One per job. `task_ids` = the job's task range; the cap counts markers of those tasks on disk."""
++
++    def __init__(self, save_folder: Path, max_invalid_episodes: int, task_ids: Iterable[int],
++                 task_suite_name: str = "", seed: Optional[int] = None):
++        if int(max_invalid_episodes) < 0:
++            raise ValueError(f"max_invalid_episodes must be >= 0, got {max_invalid_episodes}")
++        self.save_folder = Path(save_folder)
++        self.max_invalid = int(max_invalid_episodes)
++        self.task_ids = list(task_ids)
++        self.task_suite_name = task_suite_name
++        self.seed = seed
++        self.written: list[Path] = []  # markers written by this process
++
++    def invalid_count(self) -> int:
++        return sum(len(invalid_markers(self.save_folder, t)) for t in self.task_ids)
++
++    def record_invalid(self, exc: BaseException, *, task_id: int, episode_idx: int, step_index: int,
++                       num_steps_wait: int = 0, policy_steps_completed: int = 0) -> bool:
++        """Returns False for a systemic error (caller re-raises it unchanged). Otherwise removes the episode's partial
++        outputs, writes its marker and returns True (caller drops the episode and continues), unless the cap is now
++        exceeded, in which case TooManyInvalidEpisodes is raised from `exc`."""
++        if is_systemic(exc):
++            return False
++        remove_episode_outputs(self.save_folder, task_id, episode_idx)  # before the marker: never both on disk
++        path = marker_path(self.save_folder, task_id, episode_idx)
++        count = self.invalid_count() + (0 if path.exists() else 1)
++        record = {
++            "format": MARKER_FORMAT,
++            "kind": "invalid_episode",
++            "task_suite_name": self.task_suite_name,
++            "task_id": int(task_id),
++            "episode_idx": int(episode_idx),
++            "init_state_index": int(episode_idx),
++            "seed": self.seed,
++            "step_index": int(step_index),
++            "num_steps_wait": int(num_steps_wait),
++            "policy_steps_completed": int(policy_steps_completed),
++            "exception_type": f"{type(exc).__module__}.{type(exc).__qualname__}",
++            "exception_message": str(exc),
++            "traceback": "".join(tb.format_exception(type(exc), exc, exc.__traceback__)),
++            "timestamp_utc": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
++            "job": _job_identity(),
++            "invalid_count_in_job_range": count,
++            "max_invalid_episodes": self.max_invalid,
++        }
++        atomic_write_json(record, path)
++        self.written.append(path)
++        print(f"[invalid episode] task {task_id} ep {episode_idx} at step {step_index}: "
++              f"{record['exception_type']}: {exc}\n  marker: {path} ({count}/{self.max_invalid} allowed)", flush=True)
++        if count > self.max_invalid:
++            raise TooManyInvalidEpisodes(
++                f"{count} invalid episodes in tasks {self.task_ids} exceed max_invalid_episodes={self.max_invalid}; "
++                f"aborting the job. Markers written by this run: {[str(p) for p in self.written]}. If the cause is "
++                f"systemic, delete those markers before --resume (resume treats a marker as done).") from exc
++        return True
++
++    def discard_marker(self, task_id: int, episode_idx: int) -> None:
++        """Called when an episode is (re-)attempted, e.g. by a run without --resume: its old marker no longer applies
++        and must not end up next to the new outputs."""
++        marker_path(self.save_folder, task_id, episode_idx).unlink(missing_ok=True)
++
++    @staticmethod
++    def recover_env(env, make_env: Callable[[], object]):
++        """Reset the env after an invalid episode; if the reset fails (non-systemically), close it and build a new one.
++        A failure of the rebuild propagates (the job cannot continue without an env)."""
++        try:
++            env.reset()
++            return env
++        except Exception as e:
++            if is_systemic(e):
++                raise
++            print(f"[invalid episode] env.reset() failed ({type(e).__name__}: {e}); rebuilding the env", flush=True)
++        try:
++            env.close()
++        except Exception:
++            pass
++        return make_env()
 diff --git a/experiments/robot/libero/layer_cache.py b/experiments/robot/libero/layer_cache.py
 new file mode 100644
-index 0000000..c4b65d0
+index 0000000..8af6022
 --- /dev/null
 +++ b/experiments/robot/libero/layer_cache.py
-@@ -0,0 +1,117 @@
+@@ -0,0 +1,210 @@
 +"""Save every OpenVLA hidden-state layer during LIBERO rollouts (shared-cache extension).
 +
 +Layer convention (HuggingFace `output_hidden_states`, LLaMA-2 backbone, 33 entries):
@@ -11,10 +225,18 @@ index 0000000..c4b65d0
 +    index i, 1-31 = output of decoder layer i (before the final RMSNorm)
 +    index 32      = output of decoder layer 32 AFTER the final RMSNorm
 +                    (this is exactly the "last layer" SAFE uses, `s[-1]`)
-+So spreadsheet "L4" == index 4, ..., "L32" == index 32.
++    index 33      = output of decoder layer 32 BEFORE the final RMSNorm ("raw block 32"); only present
++                    with `save_raw_block32=True` (the default with --save_all_layers). It is not in
++                    `hidden_states`, so it is captured by a forward PRE-hook on the final norm
++                    (`model.language_model.model.norm`), once per generated token. Pending team approval
++                    (review checklist item 3); `--save_raw_block32 False` gives the old 33-layer files.
++So spreadsheet "L4" == index 4, ..., "L32" == index 32. Indices 0-32 mean the same with or without index 33.
++Every `.layers.pt` stores `layer_names` (one string per index): "emb", "block01".."block31",
++"block32_postnorm", and "block32_prenorm" for index 33. Files without `layer_names` predate this key and
++follow the 33-layer convention.
 +
 +Per generated action token, SAFE keeps the hidden state at the last sequence position
-+(`s[-1][0, -1, :]`). We do the same for every layer, giving (7 tokens, 33 layers, 4096),
++(`s[-1][0, -1, :]`). We do the same for every layer, giving (7 tokens, L layers, 4096) with L = 33 or 34,
 +then reduce over the 7 action tokens with the poolings SAFE uses via `token_idx_rel`:
 +    mean  -> token_idx_rel="mean"
 +    first -> token_idx_rel=0.0 (state before the first action token is generated)
@@ -34,8 +256,11 @@ index 0000000..c4b65d0
 +
 +LAYER_CONVENTION = (
 +    "hf_hidden_states: 0=embeddings, i(1..31)=output of decoder layer i (pre-norm), "
-+    "32=output of decoder layer 32 after final RMSNorm (SAFE's last layer)"
++    "32=output of decoder layer 32 after final RMSNorm (SAFE's last layer), "
++    "33 (only if save_raw_block32; see layer_names)=output of decoder layer 32 BEFORE the final RMSNorm "
++    "(forward pre-hook on the final norm)"
 +)
++LEGACY_NUM_LAYERS = 33  # files without `layer_names`: 0=emb, 1..31 blocks, 32=block 32 after the final norm
 +VALID_POOLS = ("mean", "first", "last")
 +
 +
@@ -47,12 +272,89 @@ index 0000000..c4b65d0
 +    return pools
 +
 +
-+def pool_all_layers(all_hidden_states, pools: list[str]) -> torch.Tensor:
-+    """all_hidden_states: tuple over generated tokens, each a tuple over layers of (bs=1, seq, D).
++def make_layer_names(n_blocks: int = 32, raw_block32: bool = False) -> list[str]:
++    """Names of the saved layer indices: emb, block01.., block{N}_postnorm[, block{N}_prenorm]."""
++    names = ["emb"] + [f"block{i:02d}" for i in range(1, n_blocks)] + [f"block{n_blocks:02d}_postnorm"]
++    if raw_block32:
++        names.append(f"block{n_blocks:02d}_prenorm")
++    return names
 +
-+    Returns a CPU bfloat16 tensor (P, L, D): P poolings, L layers (33 for OpenVLA-7B).
++
++def find_final_norm(model):
++    """The language model's final RMSNorm. OpenVLA: model.language_model.model.norm (LlamaRMSNorm);
++    a plain LlamaForCausalLM (tests): model.model.norm."""
++    lm = getattr(model, "language_model", model)
++    norm = getattr(getattr(lm, "model", None), "norm", None)
++    if norm is None or "RMSNorm" not in type(norm).__name__:
++        raise TypeError(f"save_raw_block32: expected <model>.language_model.model.norm to be an RMSNorm, got {type(norm)}")
++    return norm
++
++
++def layer_names_for(model, raw_block32: bool) -> list[str]:
++    """Layer names for this model; also fails early if the final norm cannot be located."""
++    if raw_block32:
++        find_final_norm(model)
++    lm = getattr(model, "language_model", model)
++    return make_layer_names(len(lm.model.layers), raw_block32)
++
++
++class RawBlock32Capture:
++    """Forward PRE-hook on the final RMSNorm: records its input (the raw output of the last decoder block) at the
++    last sequence position, once per language-model forward = once per generated token. Use as a context
++    manager so the hook is removed after generation and on error."""
++
++    def __init__(self, model):
++        self.norm = find_final_norm(model)
++        self.states: list[torch.Tensor] = []
++        self.seq_lens: list[int] = []
++        self._handle = None
++
++    def _hook(self, _module, args):
++        h = args[0]
++        self.states.append(h[0, -1, :].detach().clone())
++        self.seq_lens.append(int(h.shape[1]))
++
++    def __enter__(self):
++        self._handle = self.norm.register_forward_pre_hook(self._hook)
++        return self
++
++    def __exit__(self, *exc):
++        self._handle.remove()
++        self._handle = None
++        return False
++
++    def aligned_states(self, all_hidden_states) -> list[torch.Tensor]:
++        """Captured states, after checking one capture per generated token in the order of `all_hidden_states`
++        (first forward = the prompt pass, whose sequence length is the prompt length; then one token each)."""
++        n = len(all_hidden_states)
++        if len(self.states) != n:
++            raise RuntimeError(f"raw block-32 hook fired {len(self.states)} times for {n} generated tokens")
++        expected = [int(token_states[-1].shape[1]) for token_states in all_hidden_states]
++        if self.seq_lens != expected:
++            raise RuntimeError(f"raw block-32 captures out of order: seq lens {self.seq_lens} != hidden_states {expected}")
++        return self.states
++
++
++def call_with_raw_block32(enabled: bool, model, fn, *args, **kwargs):
++    """Return (fn(*args, **kwargs), RawBlock32Capture or None). With enabled=False this is just fn(...)."""
++    if not enabled:
++        return fn(*args, **kwargs), None
++    with RawBlock32Capture(model) as capture:
++        result = fn(*args, **kwargs)
++    return result, capture
++
++
++def pool_all_layers(all_hidden_states, pools: list[str], raw_block32: RawBlock32Capture | None = None) -> torch.Tensor:
++    """all_hidden_states: tuple over generated tokens, each a tuple over layers of (bs=1, seq, D).
++    raw_block32: the capture from `call_with_raw_block32`; if given, it is appended as the last layer index.
++
++    Returns a CPU bfloat16 tensor (P, L, D): P poolings, L layers (33 for OpenVLA-7B, 34 with raw block 32).
 +    """
-+    per_token = [torch.stack([layer[0, -1, :] for layer in token_states], dim=0) for token_states in all_hidden_states]
++    per_token = [[layer[0, -1, :] for layer in token_states] for token_states in all_hidden_states]
++    if raw_block32 is not None:
++        for layers, raw in zip(per_token, raw_block32.aligned_states(all_hidden_states)):
++            layers.append(raw)
++    per_token = [torch.stack(layers, dim=0) for layers in per_token]
 +    tok = torch.stack(per_token, dim=0)  # (n_tokens, L, D)
 +    out = []
 +    for p in pools:
@@ -66,13 +368,18 @@ index 0000000..c4b65d0
 +
 +
 +def save_episode_layers(path: Path, steps: list[torch.Tensor], pools: list[str], meta: dict) -> None:
-+    """Write (T, P, L, D) bfloat16 tensor atomically (tmp file + rename)."""
++    """Write (T, P, L, D) bfloat16 tensor atomically (tmp file + rename).
++    meta["layer_names"] (one name per layer index) is stored; if absent, L must be 33 (legacy convention)."""
 +    feats = torch.stack(steps, dim=0) if steps else torch.empty(0)
++    names = list(meta.get("layer_names") or make_layer_names())
++    if feats.dim() == 4 and feats.shape[2] != len(names):
++        raise ValueError(f"{feats.shape[2]} layers saved but {len(names)} layer_names: {names[-2:]}")
 +    payload = {
 +        "features": feats,
 +        "pools": pools,
 +        "layer_convention": LAYER_CONVENTION,
 +        **meta,
++        "layer_names": names,
 +    }
 +    tmp = path.with_suffix(path.suffix + ".tmp")
 +    torch.save(payload, tmp)
@@ -121,33 +428,195 @@ index 0000000..c4b65d0
 +    }
 +    path.parent.mkdir(parents=True, exist_ok=True)
 +    path.write_text(json.dumps(info, indent=2, default=str) + "\n")
+diff --git a/experiments/robot/libero/run_guards.py b/experiments/robot/libero/run_guards.py
+new file mode 100644
+index 0000000..ad89010
+--- /dev/null
++++ b/experiments/robot/libero/run_guards.py
+@@ -0,0 +1,135 @@
++"""Run-time guards for `run_libero_eval.py --save_all_layers` (shared-cache kit, must-fix 3 + dataset consistency).
++
++Only used when `--save_all_layers` is on. With it off, SAFE's script never calls anything here.
++
++1. `require_flash_attention_2(model, requested)` refuses to run unless the LOADED model really uses
++   `flash_attention_2`. It checks what transformers 4.40.1 actually configured, not just the CLI string:
++     - the requested `--attn_implementation`,
++     - `model.config._attn_implementation` (a property; it reads "eager" when nothing was set, and transformers
++       silently picks "sdpa" when `attn_implementation` is left as None),
++     - `model.language_model.config._attn_implementation` (OpenVLA builds its Llama backbone from this),
++     - the class of every attention module in the language model (must be `*FlashAttention2`),
++     - that the `flash_attn` package is importable.
++   Any mismatch raises `RunGuardError` (uncaught -> traceback + non-zero exit). There is no fallback to sdpa/eager.
++
++2. `build_run_fingerprint(attention)` records what must be identical across the whole dataset: attention
++   implementation, GPU name, MuJoCo render backend (`MUJOCO_GL`, plus `PYOPENGL_PLATFORM` when set; EGL vs OSMesa
++   changes pixels, hence policy inputs) and the torch / transformers / flash-attn versions. The fingerprint is
++   stored under the key `run_fingerprint` in the provenance JSON and in every `.layers.pt` payload;
++   `collection/build_cache.py` refuses to build a cache from a mixed dataset.
++
++This module imports only the standard library and torch, so importing it has no side effects on SAFE's script.
++"""
++from __future__ import annotations
++
++import importlib.util
++import json
++import os
++import sys
++from pathlib import Path
++
++import torch
++
++REQUIRED_ATTN_IMPLEMENTATION = "flash_attention_2"
++FINGERPRINT_KEY = "run_fingerprint"
++FINGERPRINT_SCHEMA_VERSION = 1
++RENDER_ENV_VARS = ("MUJOCO_GL", "PYOPENGL_PLATFORM")  # MUJOCO_GL always recorded; PYOPENGL_PLATFORM only if set
++
++
++class RunGuardError(RuntimeError):
++    """The run would produce data that cannot be mixed into the shared dataset; refuse to start."""
++
++
++def _config_attn(config) -> str | None:
++    # transformers 4.40.1: PretrainedConfig._attn_implementation is a property over `_attn_implementation_internal`
++    return getattr(config, "_attn_implementation", None) if config is not None else None
++
++
++def _attention_class_names(module) -> list[str]:
++    names = set()
++    for m in module.modules():
++        name = type(m).__name__
++        if name.endswith("Attention") or name.endswith("Attention2"):
++            names.add(name)
++    return sorted(names)
++
++
++def require_flash_attention_2(model, requested: str | None) -> dict:
++    """Raise RunGuardError unless `model` really runs flash_attention_2. Returns what was found (for the fingerprint)."""
++    language_model = getattr(model, "language_model", None)
++    found = {
++        "requested": requested,
++        "model_config": _config_attn(getattr(model, "config", None)),
++        "language_model_config": _config_attn(getattr(language_model, "config", None)) if language_model is not None else None,
++        "attention_classes": _attention_class_names(language_model if language_model is not None else model),
++    }
++    problems = []
++    if requested != REQUIRED_ATTN_IMPLEMENTATION:
++        problems.append(f"--attn_implementation is {requested!r}")
++    if found["model_config"] != REQUIRED_ATTN_IMPLEMENTATION:
++        problems.append(f"model.config._attn_implementation is {found['model_config']!r}")
++    if language_model is not None and found["language_model_config"] != REQUIRED_ATTN_IMPLEMENTATION:
++        problems.append(f"model.language_model.config._attn_implementation is {found['language_model_config']!r}")
++    if not found["attention_classes"]:
++        problems.append("no attention modules found in the language model (cannot verify the implementation)")
++    non_fa2 = [n for n in found["attention_classes"] if "FlashAttention2" not in n]
++    if non_fa2:
++        problems.append(f"language-model attention modules are not FlashAttention2: {non_fa2}")
++    if importlib.util.find_spec("flash_attn") is None:
++        problems.append("the flash_attn package is not importable")
++    if problems:
++        raise RunGuardError(
++            f"--save_all_layers requires attention implementation {REQUIRED_ATTN_IMPLEMENTATION!r} for the whole "
++            "dataset; refusing to run (no fallback to sdpa/eager):\n  - " + "\n  - ".join(problems)
++            + "\nInstall flash-attn==2.5.5 and run with --attn_implementation flash_attention_2.")
++    return {"attn_implementation": found["model_config"], "attention_classes": found["attention_classes"]}
++
++
++def _version(dist: str, module: str) -> str | None:
++    try:
++        from importlib.metadata import version
++        return version(dist)
++    except Exception:
++        mod = sys.modules.get(module)
++        return getattr(mod, "__version__", None) if mod is not None else None
++
++
++def gpu_name() -> str | None:
++    try:
++        return torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
++    except Exception:
++        return None
++
++
++def render_backend(environ=None) -> dict:
++    env = os.environ if environ is None else environ
++    backend = {"MUJOCO_GL": env.get("MUJOCO_GL")}
++    if env.get("PYOPENGL_PLATFORM") is not None:
++        backend["PYOPENGL_PLATFORM"] = env.get("PYOPENGL_PLATFORM")
++    return backend
++
++
++def build_run_fingerprint(attention: dict, environ=None) -> dict:
++    """`attention` is the dict returned by `require_flash_attention_2`."""
++    return {
++        "schema_version": FINGERPRINT_SCHEMA_VERSION,
++        "attn_implementation": attention["attn_implementation"],
++        "attention_classes": list(attention["attention_classes"]),
++        "gpu_name": gpu_name(),
++        "render_backend": render_backend(environ),
++        "versions": {
++            "torch": _version("torch", "torch"),
++            "transformers": _version("transformers", "transformers"),
++            "flash_attn": _version("flash-attn", "flash_attn"),
++        },
++    }
++
++
++def add_fingerprint_to_provenance(path: Path, fingerprint: dict) -> None:
++    """Add `run_fingerprint` to an existing provenance JSON (written by layer_cache.write_provenance), atomically."""
++    path = Path(path)
++    info = json.loads(path.read_text())
++    info[FINGERPRINT_KEY] = fingerprint
++    tmp = path.with_suffix(path.suffix + ".tmp")
++    tmp.write_text(json.dumps(info, indent=2, default=str) + "\n")
++    os.replace(tmp, path)
 diff --git a/experiments/robot/libero/run_libero_eval.py b/experiments/robot/libero/run_libero_eval.py
-index 8ea9db8..1bacc9e 100644
+index 8ea9db8..4c2f719 100644
 --- a/experiments/robot/libero/run_libero_eval.py
 +++ b/experiments/robot/libero/run_libero_eval.py
-@@ -52,6 +52,12 @@ from experiments.robot.unc_utils import (
+@@ -48,10 +48,24 @@ from experiments.robot.robot_utils import (
+ from experiments.robot.viz_utils import (
+     PoseCumulator
+ )
++from experiments.robot.libero import episode_guard  # [Shared cache] invalid-episode markers (E2)
+ from experiments.robot.unc_utils import (
      compute_token_uncertainty_metrics,
      compute_samples_uncertainty_metrics,
  )
 +from experiments.robot.libero.layer_cache import (
++    call_with_raw_block32,
++    layer_names_for,
 +    parse_pools,
 +    pool_all_layers,
 +    save_episode_layers,
 +    write_provenance,
 +)
++from experiments.robot.libero.run_guards import (
++    add_fingerprint_to_provenance,
++    build_run_fingerprint,
++    require_flash_attention_2,
++)
  
  
  @dataclass
-@@ -73,6 +79,8 @@ class GenerateConfig:
+@@ -73,6 +87,9 @@ class GenerateConfig:
      output_logits: bool = True                       # Whether to output logits from the model
      output_attentions: bool = False                  # Whether to output attention weights from the model
      output_hidden_states: bool = False               # Whether to output hidden states from the model
-+    save_all_layers: bool = False                    # [Shared cache] Also save ALL 33 hidden-state layers per step (needs output_hidden_states)
++    save_all_layers: bool = False                    # [Shared cache] Also save ALL 33 hidden-state layers (+ raw block 32, see below) per step (needs output_hidden_states)
 +    all_layers_pooling: str = "mean,first,last"      # [Shared cache] Reductions over the 7 action tokens to store
++    save_raw_block32: bool = True                    # [Shared cache] With save_all_layers: add layer 33 = block-32 output BEFORE the final RMSNorm
  
      #################################################################################################################
      # LIBERO environment-specific parameters
-@@ -114,6 +122,11 @@ def eval_libero(cfg: GenerateConfig) -> None:
+@@ -83,6 +100,7 @@ class GenerateConfig:
+     task_start_index: Optional[int] = None                     # Start task index (inclusive)
+     task_end_index: Optional[int] = None                       # End task index (inclusive)
+     resume: bool = False                            # Resume from a previous run
++    max_invalid_episodes: int = 3                    # [Shared cache] With save_all_layers: abort once more episodes than this in the task range are invalid
+ 
+     #################################################################################################################
+     # Utils
+@@ -114,6 +132,11 @@ def eval_libero(cfg: GenerateConfig) -> None:
          assert cfg.center_crop, "Expecting `center_crop==True` because model was trained with image augmentations!"
      assert not (cfg.load_in_8bit and cfg.load_in_4bit), "Cannot use both 8-bit and 4-bit quantization!"
  
@@ -159,17 +628,52 @@ index 8ea9db8..1bacc9e 100644
      # Set random seed
      set_seed_everywhere(cfg.seed)
  
-@@ -154,6 +167,9 @@ def eval_libero(cfg: GenerateConfig) -> None:
+@@ -122,6 +145,9 @@ def eval_libero(cfg: GenerateConfig) -> None:
+     
+     # Load model
+     model = get_model(cfg)
++    if cfg.save_all_layers:
++        # [Run guards] Hard-fail unless the loaded model really runs flash_attention_2 (no sdpa/eager fallback)
++        run_fingerprint = build_run_fingerprint(require_flash_attention_2(model, cfg.attn_implementation))
+ 
+     # [OpenVLA] Check that the model contains the action un-normalization key
+     if cfg.model_family == "openvla":
+@@ -154,15 +180,25 @@ def eval_libero(cfg: GenerateConfig) -> None:
      save_root = Path(cfg.save_root)
      save_folder = save_root / f"{cfg.run_id_note}" /  f"{cfg.task_suite_name}"
      save_folder.mkdir(parents=True, exist_ok=True)
 +    if cfg.save_all_layers:
 +        prov_name = f"provenance--tasks{cfg.task_start_index}-{cfg.task_end_index}--job{os.environ.get('SLURM_JOB_ID', 'local')}.json"
 +        write_provenance(save_folder / "provenance" / prov_name, cfg, model)
++        add_fingerprint_to_provenance(save_folder / "provenance" / prov_name, run_fingerprint)
++    if cfg.save_all_layers:  # [Shared cache] one name per saved layer index (33 or 34 layers)
++        all_layer_names = layer_names_for(model, cfg.save_raw_block32)
  
      # Start evaluation
      total_episodes, total_successes = 0, 0
-@@ -229,6 +245,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
+     task_start_index = cfg.task_start_index if cfg.task_start_index is not None else 0
+     task_end_index = cfg.task_end_index + 1 if cfg.task_end_index is not None else num_tasks_in_suite
++    guard = episode_guard.EpisodeGuard(save_folder, cfg.max_invalid_episodes, range(task_start_index, task_end_index),
++                                       cfg.task_suite_name, cfg.seed) if cfg.save_all_layers else None
+     for task_id in trange(task_start_index, task_end_index):
+         if cfg.resume:
+             # Check for existing saved results. 
+             existing_results = list(save_folder.glob(f"task{task_id}--ep*--succ*.csv"))
++            if guard is not None:  # [Shared cache] an invalid-episode marker also counts as done
++                existing_results += episode_guard.invalid_markers(save_folder, task_id)
+             # Get the maximum episode index existing
+             max_existing_episode = max([int(str(p).split("--ep")[1].split("--")[0]) for p in existing_results]) if existing_results else -1
+             if max_existing_episode + 1 >= cfg.num_trials_per_task:
+@@ -186,6 +222,8 @@ def eval_libero(cfg: GenerateConfig) -> None:
+         # Start episodes
+         task_episodes, task_successes = 0, 0
+         for episode_idx in trange(start_episode, cfg.num_trials_per_task):
++            if guard is not None:  # [Shared cache] re-attempting an episode makes its old invalid marker obsolete
++                guard.discard_marker(task_id, episode_idx)
+             print(f"\nTask: {task_description}")
+             
+             if cfg.use_wandb:
+@@ -229,6 +267,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
              logs_cum = defaultdict(float)
              pose_cumulator = PoseCumulator()
              hidden_states_episode = []
@@ -177,18 +681,51 @@ index 8ea9db8..1bacc9e 100644
              logs_to_dump = []
              
              while t < max_steps + cfg.num_steps_wait:
-@@ -285,6 +302,10 @@ def eval_libero(cfg: GenerateConfig) -> None:
+@@ -258,7 +297,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
+                     }
+                     
+                     # Query model to get action
+-                    actions = get_action(
++                    actions, raw_block32 = call_with_raw_block32(cfg.save_all_layers and cfg.save_raw_block32, model, get_action,
+                         cfg,
+                         model,
+                         observation,
+@@ -285,6 +324,10 @@ def eval_libero(cfg: GenerateConfig) -> None:
                          
                          # Save the hidden states for further analysis
                          hidden_states_episode.append(hidden_states_last_layer.detach().cpu())
 +
 +                        if cfg.save_all_layers:
-+                            # (P, 33, 4096) bf16: every layer, pooled over the 7 action tokens
-+                            all_layers_episode.append(pool_all_layers(all_hidden_states, all_layer_pools))
++                            # (P, 33 or 34, 4096) bf16: every layer (+ raw block 32), pooled over the 7 action tokens
++                            all_layers_episode.append(pool_all_layers(all_hidden_states, all_layer_pools, raw_block32))
                          
  
                      # Normalize gripper action [0,1] -> [-1,+1] because the environment expects the latter
-@@ -423,7 +444,21 @@ def eval_libero(cfg: GenerateConfig) -> None:
+@@ -378,6 +421,12 @@ def eval_libero(cfg: GenerateConfig) -> None:
+                     # log_file.write(f"Caught exception: {e}\n")
+                     # excepted = True
+                     # break
++                    # [Shared cache] Ordinary error -> invalid-episode marker, skip the episode; systemic errors re-raise
++                    if guard is not None and guard.record_invalid(e, task_id=task_id, episode_idx=episode_idx, step_index=t,
++                                                                  num_steps_wait=cfg.num_steps_wait,
++                                                                  policy_steps_completed=len(replay_images)):
++                        excepted = True
++                        break
+                     raise e
+                     
+             if cfg.use_wandb:
+@@ -400,6 +449,10 @@ def eval_libero(cfg: GenerateConfig) -> None:
+                 
+                 wandb.finish(quiet=True)
+ 
++            if excepted:  # [Shared cache] invalid episode: no .mp4/.pkl/.layers.pt/.csv; reset the env and go on
++                env = guard.recover_env(env, lambda: get_libero_env(task, cfg.model_family, resolution=256)[0])
++                continue
++
+             task_episodes += 1
+             total_episodes += 1
+             
+@@ -423,7 +476,23 @@ def eval_libero(cfg: GenerateConfig) -> None:
                  }
                  pickle.dump(save_dict, open(hidden_states_path, "wb"))
                  print(f"Saved hidden states at path {hidden_states_path}")
@@ -205,9 +742,757 @@ index 8ea9db8..1bacc9e 100644
 +                    "episode_success": bool(done),
 +                    "init_state_index": episode_idx,
 +                    "seed": cfg.seed,
++                    "run_fingerprint": run_fingerprint,
++                    "layer_names": all_layer_names,
 +                })
 +                print(f"Saved all-layer features at path {layers_path}")
 +
              if cfg.save_logs:
                  logs_path = mp4_path.with_suffix(".csv")
                  df = pd.DataFrame(logs_to_dump)
+@@ -435,9 +504,11 @@ def eval_libero(cfg: GenerateConfig) -> None:
+             print(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
+ 
+         # Log final results
+-        print(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
+-        print(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
++        print(f"Current task success rate: {float(task_successes) / float(max(task_episodes, 1))}")
++        print(f"Current total success rate: {float(total_successes) / float(max(total_episodes, 1))}")
+         
++    if cfg.save_all_layers and "env" not in locals():
++        return  # [Shared cache] --resume found every task done: no env was created, and a finished job must exit 0
+     env.close()
+ 
+ 
+diff --git a/tests/test_kit_episode_guard.py b/tests/test_kit_episode_guard.py
+new file mode 100644
+index 0000000..a7bee03
+--- /dev/null
++++ b/tests/test_kit_episode_guard.py
+@@ -0,0 +1,376 @@
++"""Must-fix 4 (choice E2): invalid-episode markers in the patched run_libero_eval.py --save_all_layers.
++
++CPU only. LIBERO, robosuite, tensorflow, wandb and the OpenVLA model are replaced by in-process fakes installed in
++sys.modules before run_libero_eval is imported; the real episode loop, layer_cache.py and episode_guard.py run.
++"""
++import importlib.util
++import json
++import sys
++import types
++from pathlib import Path
++from types import SimpleNamespace
++
++import numpy as np
++import pytest
++import torch
++
++REPO = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(REPO))
++from experiments.robot.libero import episode_guard as eg  # noqa: E402
++
++N_LAYERS, D, N_TOK, SUCCESS_AT = 33, 8, 7, 3  # every non-failing fake episode succeeds after 3 policy steps
++
++# ----------------------------------------------------------------------------------------------------------------------
++# Fakes for the simulator / model / logging. Behaviour is driven by SCEN, reset per test.
++# ----------------------------------------------------------------------------------------------------------------------
++SCEN: dict = {}
++
++
++def _new_scenario(**kw):
++    SCEN.clear()
++    SCEN.update(fail={}, reset_fail=set(), attempts=[], envs_built=0, resets=0)
++    SCEN.update(kw)
++
++
++def _maybe_raise(where, task, ep, policy_step):
++    spec = SCEN["fail"].get((task, ep))
++    if spec and spec[0] == where and spec[1] == policy_step:
++        exc = spec[2]
++        raise exc() if isinstance(exc, type) else exc
++
++
++class FakeEnv:
++    def __init__(self, task_id):
++        self.task_id, self.ep, self.policy_t = task_id, None, 0
++        self.env = SimpleNamespace(parsed_problem={"goal_state": []})
++        SCEN["envs_built"] += 1
++
++    def reset(self):
++        SCEN["resets"] += 1
++        if (self.task_id, SCEN["resets"]) in SCEN["reset_fail"]:
++            raise ValueError("fake reset failure")
++
++    def set_init_state(self, state):
++        self.ep, self.policy_t = state[1], 0
++        SCEN["attempts"].append(state)
++        return self._obs()
++
++    def _obs(self):
++        return {"robot0_eef_pos": np.zeros(3), "robot0_eef_quat": np.array([0, 0, 0, 1.0]),
++                "robot0_gripper_qpos": np.zeros(2), "task": self.task_id, "ep": self.ep}
++
++    def step(self, action):
++        if action != [0.0] * 7:  # not a settling (dummy) step
++            _maybe_raise("step", self.task_id, self.ep, self.policy_t)
++            self.policy_t += 1
++        return self._obs(), 0.0, self.policy_t >= SUCCESS_AT, {}
++
++    def close(self):
++        pass
++
++
++def fake_get_action(cfg, model, observation, task_description, processor=None, n_samples=1):
++    t, e = observation["_task_ep"]
++    _maybe_raise("action", t, e, SCEN.get("_policy_t", {}).get((t, e), 0))
++    SCEN.setdefault("_policy_t", {})
++    SCEN["_policy_t"][(t, e)] = SCEN["_policy_t"].get((t, e), 0) + 1
++    hs = tuple(tuple(torch.full((1, 1, D), float(k * 100 + l), dtype=torch.bfloat16) for l in range(N_LAYERS))
++               for k in range(N_TOK))
++    return np.full(7, 0.1), {"hidden_states": hs}
++
++
++class FakeSuite:
++    n_tasks = 2
++
++    def get_task(self, i):
++        return SimpleNamespace(name=f"task{i}", language=f"fake task {i}", id=i)
++
++    def get_task_init_states(self, i):
++        return [(i, e) for e in range(50)]
++
++
++def _install_fakes(monkeypatch):
++    def mod(name, **attrs):
++        m = types.ModuleType(name)
++        m.__dict__.update(attrs)
++        monkeypatch.setitem(sys.modules, name, m)
++        return m
++
++    mod("wandb", init=lambda **k: None, log=lambda *a, **k: None, finish=lambda **k: None, Image=lambda x: x)
++    libero = mod("libero")
++    libero.libero = mod("libero.libero")
++    libero.libero.benchmark = mod("libero.libero.benchmark", get_benchmark_dict=lambda: {"libero_10": FakeSuite})
++
++    def get_libero_image(obs, resize_size):  # smuggle the episode id to fake_get_action through the observation
++        SCEN["_cur"] = (obs["task"], obs["ep"])
++        return np.zeros((4, 4, 3), np.uint8)
++
++    def save_video(images, path):
++        Path(path).write_bytes(b"mp4")
++
++    mod("experiments.robot.libero.libero_utils", get_libero_dummy_action=lambda fam: [0.0] * 7,
++        get_libero_env=lambda task, fam, resolution=256: (FakeEnv(task.id), task.language),
++        get_libero_image=get_libero_image, quat2axisangle=lambda q: np.zeros(3),
++        save_rollout_video_given_path=save_video)
++    mod("experiments.robot.openvla_utils", get_processor=lambda cfg: None, get_text_tokens=None)
++
++    def get_action(cfg, model, observation, task_description, processor=None, n_samples=1):
++        observation["_task_ep"] = SCEN["_cur"]
++        return fake_get_action(cfg, model, observation, task_description, processor, n_samples)
++
++    mod("experiments.robot.robot_utils", get_action=get_action, get_image_resize_size=lambda cfg: 224,
++        get_model=lambda cfg: SimpleNamespace(norm_stats={"libero_10": {}}, config=SimpleNamespace()),
++        invert_gripper_action=lambda a: a, normalize_gripper_action=lambda a, binarize=True: a,
++        set_seed_everywhere=lambda s: None)
++
++    class PoseCumulator:
++        cum_pos = cum_rot = 0.0
++
++        def update(self, *a):
++            pass
++
++    mod("experiments.robot.viz_utils", PoseCumulator=PoseCumulator)
++    mod("experiments.robot.unc_utils", compute_token_uncertainty_metrics=lambda out, model: {"m": 0.5},
++        compute_samples_uncertainty_metrics=None)
++
++
++@pytest.fixture()
++def rle(monkeypatch):
++    _install_fakes(monkeypatch)
++    spec = importlib.util.spec_from_file_location("rle_under_test", REPO / "experiments/robot/libero/run_libero_eval.py")
++    m = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(m)
++    # Fixes 3 and 5 also act on the loaded model; they have their own tests (test_kit_run_guards.py,
++    # test_kit_raw_block32.py). Here the model is a stand-in, so stub those two entry points.
++    m.require_flash_attention_2 = lambda model, requested: {
++        "attn_implementation": "flash_attention_2", "attention_classes": ["FakeFlashAttention2"]}
++    m.layer_names_for = lambda model, raw_block32: [f"layer{i:02d}" for i in range(N_LAYERS)]
++    _new_scenario()
++    return m
++
++
++def make_cfg(rle, tmp_path, **kw):
++    base = dict(pretrained_checkpoint="fake", task_suite_name="libero_10", num_steps_wait=2, num_trials_per_task=4,
++                use_wandb=False, save_root=str(tmp_path), run_id_note="t", output_hidden_states=True,
++                save_all_layers=True, save_raw_block32=False, task_start_index=0, task_end_index=0,
++                max_invalid_episodes=3)
++    base.update(kw)
++    return rle.GenerateConfig(**base)
++
++
++def folder(tmp_path):
++    return tmp_path / "t" / "libero_10"
++
++
++def files_of(tmp_path, t, e):
++    return sorted(p.name for p in folder(tmp_path).glob(f"task{t}--ep{e}--*"))
++
++
++# ----------------------------------------------------------------------------------------------------------------------
++# End-to-end through the real episode loop
++# ----------------------------------------------------------------------------------------------------------------------
++def test_invalid_episode_is_recorded_and_job_continues(rle, tmp_path):
++    out = folder(tmp_path)
++    out.mkdir(parents=True)
++    # leftovers of an earlier attempt of ep1 that was killed between SAFE's non-atomic .pkl and .csv writes
++    for name in ("task0--ep1--succ0.mp4", "task0--ep1--succ0.pkl", "task0--ep1--succ0.layers.pt",
++                 "task0--ep1--succ1.layers.pt.tmp", "task0--ep10--succ1.csv", "task1--ep1--succ1.csv"):
++        (out / name).write_text("stale")
++    SCEN["fail"][(0, 1)] = ("step", 1, ValueError("MuJoCo: unstable simulation"))
++    rle.eval_libero(make_cfg(rle, tmp_path))
++
++    assert files_of(tmp_path, 0, 1) == ["task0--ep1--invalid.json"]  # no csv/pkl/layers.pt/mp4/tmp left
++    assert (out / "task0--ep10--succ1.csv").exists() and (out / "task1--ep1--succ1.csv").exists()  # others untouched
++    rec = json.loads((out / "task0--ep1--invalid.json").read_text())
++    assert rec["format"] == 1 and rec["kind"] == "invalid_episode"
++    assert (rec["task_id"], rec["episode_idx"], rec["init_state_index"], rec["seed"]) == (0, 1, 1, 7)
++    assert rec["exception_type"] == "builtins.ValueError" and "unstable simulation" in rec["exception_message"]
++    assert "Traceback" in rec["traceback"] and "ValueError" in rec["traceback"]
++    assert rec["step_index"] == 2 + 1 and rec["num_steps_wait"] == 2 and rec["policy_steps_completed"] == 2
++    assert rec["timestamp_utc"].endswith("+00:00") and rec["invalid_count_in_job_range"] == 1
++    assert rec["max_invalid_episodes"] == 3 and "pid" in rec["job"]
++    for e in (0, 2, 3):  # the job went on with the next episodes
++        names = files_of(tmp_path, 0, e)
++        assert [n.split(".", 1)[1] for n in names] == ["csv", "layers.pt", "mp4", "pkl"], names
++    assert not list(out.glob("*.tmp"))
++    assert SCEN["resets"] == 4 + 1  # one reset per episode + the recovery reset after the invalid one
++
++
++def test_resume_counts_marker_as_done_even_when_it_is_the_last_episode(rle, tmp_path):
++    SCEN["fail"][(0, 3)] = ("step", 0, ValueError("deterministic"))
++    rle.eval_libero(make_cfg(rle, tmp_path))
++    assert [e for _, e in SCEN["attempts"]] == [0, 1, 2, 3]
++    _new_scenario(fail={(0, 3): ("step", 0, ValueError("deterministic"))})
++    # task 1 still has work: SAFE's own script ends with env.close() and crashes (UnboundLocalError) when --resume
++    # finds every task of the range complete, independent of this fix
++    rle.eval_libero(make_cfg(rle, tmp_path, resume=True, task_end_index=1))
++    assert all(t == 1 for t, _ in SCEN["attempts"])  # task 0 ep3 is not retried: 3 csv + 1 marker = complete
++
++
++def test_resume_with_every_task_done_exits_cleanly(rle, tmp_path):
++    # SAFE's script ends with env.close(); when --resume finds the whole range complete no env exists.
++    # With save_all_layers the job must still finish normally (a retry loop would read a crash as failure).
++    SCEN["fail"][(0, 3)] = ("step", 0, ValueError("deterministic"))
++    rle.eval_libero(make_cfg(rle, tmp_path))
++    _new_scenario()
++    rle.eval_libero(make_cfg(rle, tmp_path, resume=True))  # must not raise UnboundLocalError
++    assert SCEN.get("attempts", []) == []
++
++
++def test_resume_with_every_task_done_without_flag_is_unchanged(rle, tmp_path):
++    rle.eval_libero(make_cfg(rle, tmp_path, save_all_layers=False))
++    with pytest.raises(UnboundLocalError):  # SAFE's original behaviour, deliberately untouched
++        rle.eval_libero(make_cfg(rle, tmp_path, save_all_layers=False, resume=True))
++
++
++def test_resume_after_kill_starts_after_the_marker(rle, tmp_path):
++    SCEN["fail"][(0, 1)] = ("step", 0, ValueError("bad init state"))
++    SCEN["fail"][(0, 2)] = ("step", 1, KeyboardInterrupt)  # the job is killed during ep2
++    with pytest.raises(KeyboardInterrupt):
++        rle.eval_libero(make_cfg(rle, tmp_path))
++    assert files_of(tmp_path, 0, 2) == [] and files_of(tmp_path, 0, 1) == ["task0--ep1--invalid.json"]
++    _new_scenario()
++    rle.eval_libero(make_cfg(rle, tmp_path, resume=True))
++    assert [e for _, e in SCEN["attempts"]] == [2, 3]  # highest done = marker of ep1 -> restart at ep2
++
++
++@pytest.mark.parametrize("where,exc", [
++    ("action", RuntimeError("CUDA error: device-side assert triggered")),
++    ("action", torch.cuda.OutOfMemoryError("CUDA out of memory. Tried to allocate 20.00 MiB")),
++    ("action", RuntimeError("CUBLAS_STATUS_EXECUTION_FAILED when calling cublasGemmEx")),
++    ("action", MemoryError()),
++    ("step", KeyboardInterrupt),
++    ("step", SystemExit(3)),
++])
++def test_systemic_errors_abort_without_marker(rle, tmp_path, where, exc):
++    SCEN["fail"][(0, 1)] = (where, 1, exc)
++    with pytest.raises(type(exc) if not isinstance(exc, type) else exc):
++        rle.eval_libero(make_cfg(rle, tmp_path))
++    assert not list(folder(tmp_path).glob("*invalid.json*"))
++    assert [e for _, e in SCEN["attempts"]] == [0, 1]
++
++
++def test_cap_aborts_job_and_counts_markers_already_on_disk(rle, tmp_path):
++    out = folder(tmp_path)
++    out.mkdir(parents=True)
++    eg.atomic_write_json({"format": 1}, out / "task0--ep9--invalid.json")  # from an earlier run of this task range
++    eg.atomic_write_json({"format": 1}, out / "task1--ep0--invalid.json")  # other task: outside the range, not counted
++    SCEN["fail"][(0, 0)] = ("step", 0, ValueError("a"))
++    SCEN["fail"][(0, 1)] = ("action", 0, ValueError("b"))
++    with pytest.raises(eg.TooManyInvalidEpisodes, match="max_invalid_episodes=2") as ei:
++        rle.eval_libero(make_cfg(rle, tmp_path, max_invalid_episodes=2))
++    assert isinstance(ei.value.__cause__, ValueError)
++    assert files_of(tmp_path, 0, 1) == ["task0--ep1--invalid.json"]  # the marker that crossed the cap is kept
++    assert [e for _, e in SCEN["attempts"]] == [0, 1]  # ep2 never started
++
++
++def test_rerun_without_resume_replaces_stale_marker(rle, tmp_path):
++    SCEN["fail"][(0, 2)] = ("step", 0, ValueError("transient"))
++    rle.eval_libero(make_cfg(rle, tmp_path))
++    assert files_of(tmp_path, 0, 2) == ["task0--ep2--invalid.json"]
++    _new_scenario()
++    rle.eval_libero(make_cfg(rle, tmp_path))  # no --resume: SAFE redoes every episode; ep2 now completes
++    assert [n.split(".", 1)[1] for n in files_of(tmp_path, 0, 2)] == ["csv", "layers.pt", "mp4", "pkl"]
++
++
++def test_cap_zero_aborts_on_first_invalid(rle, tmp_path):
++    SCEN["fail"][(0, 0)] = ("step", 0, ValueError("a"))
++    with pytest.raises(eg.TooManyInvalidEpisodes):
++        rle.eval_libero(make_cfg(rle, tmp_path, max_invalid_episodes=0))
++
++
++def test_without_save_all_layers_safe_behaviour_is_unchanged(rle, tmp_path):
++    SCEN["fail"][(0, 1)] = ("step", 1, ValueError("MuJoCo: unstable simulation"))
++    with pytest.raises(ValueError, match="unstable"):
++        rle.eval_libero(make_cfg(rle, tmp_path, save_all_layers=False))
++    assert not list(folder(tmp_path).glob("*invalid*"))
++    assert [e for _, e in SCEN["attempts"]] == [0, 1]
++
++
++def test_without_save_all_layers_resume_ignores_markers(rle, tmp_path):
++    out = folder(tmp_path)
++    out.mkdir(parents=True)
++    (out / "task0--ep3--invalid.json").write_text("{}")
++    rle.eval_libero(make_cfg(rle, tmp_path, save_all_layers=False, resume=True))
++    assert [e for _, e in SCEN["attempts"]] == [0, 1, 2, 3]
++
++
++def test_env_is_rebuilt_when_recovery_reset_fails(rle, tmp_path):
++    SCEN["fail"][(0, 0)] = ("step", 0, ValueError("a"))
++    SCEN["reset_fail"].add((0, 2))  # 2nd reset = the recovery reset after the invalid ep0
++    rle.eval_libero(make_cfg(rle, tmp_path))
++    assert SCEN["envs_built"] == 2
++    assert [e for _, e in SCEN["attempts"]] == [0, 1, 2, 3]
++
++
++def test_task_where_every_episode_is_invalid_does_not_crash_the_summary(rle, tmp_path):
++    for e in range(4):
++        SCEN["fail"][(0, e)] = ("step", 0, ValueError("x"))
++    rle.eval_libero(make_cfg(rle, tmp_path, max_invalid_episodes=10))  # no ZeroDivisionError
++    assert len(list(folder(tmp_path).glob("task0--ep*--invalid.json"))) == 4
++    assert not list(folder(tmp_path).glob("task0--*succ*"))
++
++
++# ----------------------------------------------------------------------------------------------------------------------
++# Unit tests of episode_guard.py
++# ----------------------------------------------------------------------------------------------------------------------
++@pytest.mark.parametrize("exc,systemic", [
++    (ValueError("MuJoCo: unstable simulation"), False),
++    (AssertionError("x"), False),
++    (KeyError("robot0_eef_pos"), False),
++    (RuntimeError("shape mismatch"), False),
++    (KeyboardInterrupt(), True),
++    (SystemExit(1), True),
++    (MemoryError(), True),
++    (torch.cuda.OutOfMemoryError("CUDA out of memory"), True),
++    (RuntimeError("CUDA error: an illegal memory access was encountered"), True),
++    (RuntimeError("CUDA error: device-side assert triggered"), True),
++    (RuntimeError("cuDNN error: CUDNN_STATUS_INTERNAL_ERROR"), True),
++    (RuntimeError("FlashAttention only supports Ampere GPUs or newer."), True),
++    (RuntimeError("EGL_NOT_INITIALIZED"), True),
++    (ModuleNotFoundError("No module named 'flash_attn'"), True),
++    (NameError("x"), True),
++    (OSError(28, "No space left on device"), True),
++    (OSError(2, "No such file"), False),
++])
++def test_is_systemic(exc, systemic):
++    assert eg.is_systemic(exc) is systemic
++
++
++def test_is_systemic_follows_exception_chain():
++    try:
++        try:
++            raise RuntimeError("CUDA error: unspecified launch failure")
++        except RuntimeError as inner:
++            raise ValueError("wrapped") from inner
++    except ValueError as outer:
++        assert eg.is_systemic(outer)
++
++
++def test_atomic_write_leaves_no_tmp_on_failure(tmp_path, monkeypatch):
++    def boom(a, b):
++        raise OSError(5, "I/O error")
++
++    monkeypatch.setattr(eg.os, "replace", boom)
++    with pytest.raises(OSError):
++        eg.atomic_write_json({"a": 1}, tmp_path / "task0--ep0--invalid.json")
++    assert list(tmp_path.iterdir()) == []
++
++
++def test_invalid_markers_ignore_tmp_and_other_tasks(tmp_path):
++    for n in ("task1--ep2--invalid.json", "task1--ep3--invalid.json.123.tmp", "task11--ep0--invalid.json",
++              "task1--ep4--succ1.csv"):
++        (tmp_path / n).write_text("{}")
++    assert [p.name for p in eg.invalid_markers(tmp_path, 1)] == ["task1--ep2--invalid.json"]
++
++
++def test_record_invalid_returns_false_for_systemic_and_writes_nothing(tmp_path):
++    g = eg.EpisodeGuard(tmp_path, 3, [0])
++    (tmp_path / "task0--ep0--succ0.pkl").write_text("x")
++    assert g.record_invalid(RuntimeError("CUDA error: x"), task_id=0, episode_idx=0, step_index=5) is False
++    assert sorted(p.name for p in tmp_path.iterdir()) == ["task0--ep0--succ0.pkl"]
++
++
++def test_negative_cap_rejected(tmp_path):
++    with pytest.raises(ValueError):
++        eg.EpisodeGuard(tmp_path, -1, [0])
+diff --git a/tests/test_kit_raw_block32.py b/tests/test_kit_raw_block32.py
+new file mode 100644
+index 0000000..ccbb32a
+--- /dev/null
++++ b/tests/test_kit_raw_block32.py
+@@ -0,0 +1,146 @@
++"""Must-fix 5 (raw block 32 = layer index 33): CPU tests of layer_cache.py on a tiny random LlamaForCausalLM
++(3 blocks, hidden 32, fp32), driven through greedy generate(max_new_tokens=7, output_hidden_states=True) with KV cache,
++exactly as OpenVLA's predict_action does. Needs transformers==4.40.1 (the fork's pin); skipped otherwise.
++The GPU proof on the real 7B model is Safe-Research tests/gpu/test_layer_mapping.py (T6)."""
++import sys
++from pathlib import Path
++
++import pytest
++import torch
++
++transformers = pytest.importorskip("transformers")
++if transformers.__version__ != "4.40.1":
++    pytest.skip(f"needs transformers==4.40.1, found {transformers.__version__}", allow_module_level=True)
++from transformers import LlamaConfig, LlamaForCausalLM  # noqa: E402
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++from experiments.robot.libero import layer_cache as lc  # noqa: E402
++
++N_BLOCKS, D, N_TOK, POOLS = 3, 32, 7, ["mean", "first", "last"]
++
++
++def _old_pool_all_layers(all_hidden_states, pools):
++    """Verbatim copy of pool_all_layers from Rhea's patch commit b5cb926 (the 33-layer reference)."""
++    per_token = [torch.stack([layer[0, -1, :] for layer in token_states], dim=0) for token_states in all_hidden_states]
++    tok = torch.stack(per_token, dim=0)  # (n_tokens, L, D)
++    out = []
++    for p in pools:
++        if p == "mean":
++            out.append(tok.float().mean(dim=0))
++        elif p == "first":
++            out.append(tok[0].float())
++        else:
++            out.append(tok[-1].float())
++    return torch.stack(out, dim=0).to(torch.bfloat16).cpu()
++
++
++class FakeVLA(torch.nn.Module):
++    """Mimics OpenVLA's attribute path: model.language_model = LlamaForCausalLM."""
++
++    def __init__(self, lm):
++        super().__init__()
++        self.language_model = lm
++
++
++@pytest.fixture(scope="module")
++def model():
++    cfg = LlamaConfig(vocab_size=64, hidden_size=D, intermediate_size=64, num_hidden_layers=N_BLOCKS,
++                      num_attention_heads=4, num_key_value_heads=4, max_position_embeddings=64)
++    torch.manual_seed(0)
++    return LlamaForCausalLM(cfg).float().eval()
++
++
++def generate(model, seed=0, n_prompt=9):
++    ids = torch.randint(1, 64, (1, n_prompt), generator=torch.Generator().manual_seed(seed))
++    with torch.no_grad():
++        return model.generate(ids, attention_mask=torch.ones_like(ids), max_new_tokens=N_TOK, min_new_tokens=N_TOK,
++                              do_sample=False, output_hidden_states=True, return_dict_in_generate=True,
++                              use_cache=True, pad_token_id=0)
++
++
++def test_capture_matches_block_output_and_norm(model):
++    block_out = []
++    h = model.model.layers[-1].register_forward_hook(lambda _m, _i, out: block_out.append(out[0][0, -1].clone()))
++    try:
++        out, cap = lc.call_with_raw_block32(True, FakeVLA(model), generate, model)
++    finally:
++        h.remove()
++    hs = out["hidden_states"]
++    assert len(hs) == N_TOK and all(len(s) == N_BLOCKS + 1 for s in hs)
++    assert len(cap.states) == len(block_out) == N_TOK  # one capture per generated token
++    assert cap.seq_lens == [9] + [1] * (N_TOK - 1)       # first forward = the prompt pass
++    raw = cap.aligned_states(hs)
++    for j in range(N_TOK):
++        assert torch.equal(raw[j], block_out[j])                                      # pre-norm = last block's output
++        assert torch.equal(model.model.norm(raw[j][None, None])[0, 0], hs[j][-1][0, -1])  # norm(raw) = hidden_states[-1]
++        assert not torch.equal(raw[j], hs[j][-1][0, -1])
++        assert not torch.equal(raw[j], hs[j][-2][0, -1])                             # hs[-2] is block N-1, not N
++    assert not model.model.norm._forward_pre_hooks  # removed after generation
++
++
++def test_tokens_unchanged_by_hook(model):
++    ref = generate(model, seed=3)
++    hooked, _ = lc.call_with_raw_block32(True, model, generate, model, seed=3)
++    assert torch.equal(ref["sequences"], hooked["sequences"])
++
++
++def test_pooled_has_extra_layer_and_old_layers_unchanged(model):
++    out, cap = lc.call_with_raw_block32(True, model, generate, model, seed=1)
++    hs = out["hidden_states"]
++    new = lc.pool_all_layers(hs, POOLS, cap)
++    old = _old_pool_all_layers(hs, POOLS)
++    assert new.shape == (3, N_BLOCKS + 2, D) and new.dtype == torch.bfloat16
++    assert torch.equal(new[:, : N_BLOCKS + 1], old)  # indices 0..N keep their exact meaning
++    raw = torch.stack(cap.states)  # (7, D)
++    assert torch.equal(new[0, -1], raw.float().mean(0).to(torch.bfloat16))
++    assert torch.equal(new[1, -1], raw[0].to(torch.bfloat16)) and torch.equal(new[2, -1], raw[-1].to(torch.bfloat16))
++
++
++def test_flag_off_reproduces_old_output(model, tmp_path):
++    out, cap = lc.call_with_raw_block32(False, model, generate, model, seed=2)
++    assert cap is None and not model.model.norm._forward_pre_hooks
++    new = lc.pool_all_layers(out["hidden_states"], POOLS)
++    assert torch.equal(new, _old_pool_all_layers(out["hidden_states"], POOLS))
++    names = lc.layer_names_for(model, raw_block32=False)
++    assert names == ["emb", "block01", "block02", "block03_postnorm"]
++    lc.save_episode_layers(tmp_path / "a.layers.pt", [new, new], POOLS, {"task_id": 0, "layer_names": names})
++    payload = torch.load(tmp_path / "a.layers.pt", weights_only=False)
++    assert torch.equal(payload["features"], torch.stack([new, new])) and payload["layer_names"] == names
++
++
++def test_hook_count_mismatch_fails_loudly(model):
++    out, cap = lc.call_with_raw_block32(True, model, generate, model)
++    with torch.no_grad():  # an extra forward while capturing -> 8 captures for 7 tokens
++        with cap:
++            model(torch.ones(1, 2, dtype=torch.long))
++    with pytest.raises(RuntimeError, match="fired 8 times for 7 generated tokens"):
++        lc.pool_all_layers(out["hidden_states"], POOLS, cap)
++    cap.states, cap.seq_lens = cap.states[:N_TOK], [1] + cap.seq_lens[1:N_TOK]
++    with pytest.raises(RuntimeError, match="out of order"):
++        cap.aligned_states(out["hidden_states"])
++
++
++def test_hook_removed_on_error(model):
++    def boom(m):
++        generate(m)
++        raise ValueError("simulated failure inside get_action")
++    with pytest.raises(ValueError, match="simulated"):
++        lc.call_with_raw_block32(True, model, boom, model)
++    assert not model.model.norm._forward_pre_hooks
++
++
++def test_layer_names_and_save_validation(tmp_path):
++    names = lc.make_layer_names(32, raw_block32=True)
++    assert len(names) == 34 and names[0] == "emb" and names[1] == "block01" and names[31] == "block31"
++    assert names[32] == "block32_postnorm" and names[33] == "block32_prenorm"
++    assert lc.make_layer_names(32) == names[:33]
++    f34 = torch.zeros(3, 34, 4).to(torch.bfloat16)
++    lc.save_episode_layers(tmp_path / "b.layers.pt", [f34], POOLS, {"layer_names": names})
++    assert torch.load(tmp_path / "b.layers.pt", weights_only=False)["layer_names"] == names
++    with pytest.raises(ValueError, match="34 layers saved but 33 layer_names"):  # no names = legacy 33 only
++        lc.save_episode_layers(tmp_path / "c.layers.pt", [f34], POOLS, {})
++    lc.save_episode_layers(tmp_path / "d.layers.pt", [f34[:, :33]], POOLS, {})
++    assert torch.load(tmp_path / "d.layers.pt", weights_only=False)["layer_names"] == names[:33]
++    assert "33 (only if save_raw_block32" in lc.LAYER_CONVENTION
++    with pytest.raises(TypeError, match="RMSNorm"):
++        lc.find_final_norm(torch.nn.Linear(2, 2))
+diff --git a/tests/test_kit_run_guards.py b/tests/test_kit_run_guards.py
+new file mode 100644
+index 0000000..a48c4fd
+--- /dev/null
++++ b/tests/test_kit_run_guards.py
+@@ -0,0 +1,192 @@
++"""CPU tests for experiments/robot/libero/run_guards.py (must-fix 3, run-time half, + E3 run fingerprint).
++
++LIBERO, robosuite, tensorflow and flash-attn are not installable on the dev Mac, so these tests exercise run_guards
++directly with mocked models and tiny real transformers-4.40.1 Llama models, not the rollout loop.
++"""
++import ast
++import importlib.util
++import json
++import sys
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++import torch
++from torch import nn
++
++REPO = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(REPO))
++from experiments.robot.libero import run_guards as rg  # noqa: E402
++
++FA2 = "flash_attention_2"
++
++
++class LlamaFlashAttention2(nn.Module):
++    pass
++
++
++class LlamaSdpaAttention(nn.Module):
++    pass
++
++
++class LlamaAttention(nn.Module):
++    pass
++
++
++def fake_vla(top_attn=FA2, lm_attn=FA2, attn_cls=LlamaFlashAttention2, n_layers=2):
++    """Mimics OpenVLAForActionPrediction: .config and .language_model (with its own .config)."""
++    vla = nn.Module()
++    vla.config = SimpleNamespace(_attn_implementation=top_attn)
++    lm = nn.Module()
++    lm.config = SimpleNamespace(_attn_implementation=lm_attn)
++    lm.layers = nn.ModuleList([nn.ModuleDict({"self_attn": attn_cls()}) for _ in range(n_layers)])
++    vla.language_model = lm
++    vla.vision_backbone = nn.ModuleDict({"attn": LlamaAttention()})  # e.g. timm ViT attention: must be ignored
++    return vla
++
++
++@pytest.fixture()
++def flash_attn_importable(monkeypatch):
++    real = importlib.util.find_spec
++    monkeypatch.setattr(rg.importlib.util, "find_spec",
++                        lambda name, *a, **k: SimpleNamespace(name=name) if name == "flash_attn" else real(name, *a, **k))
++
++
++def test_accepts_real_flash_attention_2(flash_attn_importable):
++    out = rg.require_flash_attention_2(fake_vla(), FA2)
++    assert out == {"attn_implementation": FA2, "attention_classes": ["LlamaFlashAttention2"]}
++
++
++@pytest.mark.parametrize("kwargs, requested, needle", [
++    ({}, "sdpa", "--attn_implementation is 'sdpa'"),
++    ({}, None, "--attn_implementation is None"),
++    ({"top_attn": "sdpa"}, FA2, "model.config._attn_implementation is 'sdpa'"),
++    ({"top_attn": "eager"}, FA2, "model.config._attn_implementation is 'eager'"),
++    ({"lm_attn": "sdpa"}, FA2, "model.language_model.config._attn_implementation is 'sdpa'"),
++    ({"attn_cls": LlamaSdpaAttention}, FA2, "not FlashAttention2: ['LlamaSdpaAttention']"),  # config lies
++    ({"attn_cls": LlamaAttention}, FA2, "not FlashAttention2: ['LlamaAttention']"),
++    ({"n_layers": 0}, FA2, "no attention modules found"),
++])
++def test_refuses_anything_but_flash_attention_2(flash_attn_importable, kwargs, requested, needle):
++    with pytest.raises(rg.RunGuardError) as e:
++        rg.require_flash_attention_2(fake_vla(**kwargs), requested)
++    assert needle in str(e.value) and "no fallback" in str(e.value)
++
++
++def test_refuses_when_flash_attn_package_missing(monkeypatch):
++    real = importlib.util.find_spec
++    monkeypatch.setattr(rg.importlib.util, "find_spec",
++                        lambda name, *a, **k: None if name == "flash_attn" else real(name, *a, **k))
++    with pytest.raises(rg.RunGuardError, match="flash_attn package is not importable"):
++        rg.require_flash_attention_2(fake_vla(), FA2)
++
++
++def test_run_guard_error_is_not_swallowed_as_success():
++    # uncaught -> Python exits non-zero; it must not be a SystemExit(0)/Warning
++    assert issubclass(rg.RunGuardError, RuntimeError)
++
++
++# ---- real transformers 4.40.1 models (the attribute the guard reads is the one transformers actually sets) ----
++transformers = pytest.importorskip("transformers")
++needs_4401 = pytest.mark.skipif(transformers.__version__ != "4.40.1", reason="needs transformers==4.40.1")
++
++
++def tiny_llama(impl):
++    from transformers import LlamaConfig, LlamaForCausalLM
++    cfg = LlamaConfig(vocab_size=32, hidden_size=16, intermediate_size=32, num_hidden_layers=2, num_attention_heads=2,
++                      num_key_value_heads=2, max_position_embeddings=16, attn_implementation=impl)
++    return LlamaForCausalLM(cfg)
++
++
++def wrap(lm):
++    vla = nn.Module()
++    vla.config = SimpleNamespace(_attn_implementation=lm.config._attn_implementation)
++    vla.language_model = lm
++    return vla
++
++
++@needs_4401
++@pytest.mark.parametrize("impl, actual", [("eager", "eager"), ("sdpa", "sdpa"), (None, "sdpa")])
++def test_real_llama_without_flash_attention_is_refused(flash_attn_importable, impl, actual):
++    lm = tiny_llama(impl)
++    assert lm.config._attn_implementation == actual  # None silently becomes sdpa in 4.40.1
++    with pytest.raises(rg.RunGuardError):
++        rg.require_flash_attention_2(wrap(lm), FA2)
++
++
++@needs_4401
++def test_real_llama_with_flash_attention_2_modules_is_accepted(flash_attn_importable):
++    from transformers.models.llama.modeling_llama import LlamaFlashAttention2
++    lm = tiny_llama("eager")
++    for i, layer in enumerate(lm.model.layers):  # flash-attn is not installable here: swap the module classes in
++        layer.self_attn = LlamaFlashAttention2(lm.config, layer_idx=i)
++    lm.config._attn_implementation = FA2
++    out = rg.require_flash_attention_2(wrap(lm), FA2)
++    assert out["attention_classes"] == ["LlamaFlashAttention2"]
++
++
++# ---- fingerprint ----
++def test_fingerprint_contents(monkeypatch):
++    monkeypatch.setattr(rg.torch.cuda, "is_available", lambda: True)
++    monkeypatch.setattr(rg.torch.cuda, "get_device_name", lambda i=0: "NVIDIA A10")
++    fp = rg.build_run_fingerprint({"attn_implementation": FA2, "attention_classes": ["LlamaFlashAttention2"]},
++                                  environ={"MUJOCO_GL": "egl", "PYOPENGL_PLATFORM": "egl", "OTHER": "x"})
++    assert fp["attn_implementation"] == FA2 and fp["gpu_name"] == "NVIDIA A10"
++    assert fp["render_backend"] == {"MUJOCO_GL": "egl", "PYOPENGL_PLATFORM": "egl"}
++    assert fp["versions"]["torch"] is not None
++    assert fp["versions"]["transformers"] == transformers.__version__
++    assert set(fp["versions"]) == {"torch", "transformers", "flash_attn"}
++    json.dumps(fp)  # must be JSON-serialisable for the provenance file
++
++
++def test_fingerprint_without_gpu_and_optional_pyopengl(monkeypatch):
++    monkeypatch.setattr(rg.torch.cuda, "is_available", lambda: False)
++    fp = rg.build_run_fingerprint({"attn_implementation": FA2, "attention_classes": []}, environ={"MUJOCO_GL": "osmesa"})
++    assert fp["gpu_name"] is None and fp["render_backend"] == {"MUJOCO_GL": "osmesa"}
++    assert rg.render_backend({}) == {"MUJOCO_GL": None}
++
++
++def test_fingerprint_lands_in_provenance_and_layers_payload(tmp_path):
++    from experiments.robot.libero.layer_cache import save_episode_layers, write_provenance
++    fp = rg.build_run_fingerprint({"attn_implementation": FA2, "attention_classes": ["LlamaFlashAttention2"]},
++                                  environ={"MUJOCO_GL": "egl"})
++    prov = tmp_path / "provenance" / "provenance--tasks0-0--joblocal.json"
++    write_provenance(prov, {"seed": 7})
++    rg.add_fingerprint_to_provenance(prov, fp)
++    info = json.loads(prov.read_text())
++    assert info["run_fingerprint"] == fp and info["cfg"] == {"seed": 7}  # existing keys untouched
++    assert not list(prov.parent.glob("*.tmp"))
++    # same meta dict shape run_libero_eval.py passes, plus the ONE new key
++    path = tmp_path / "task0--ep0--succ1.layers.pt"
++    save_episode_layers(path, [torch.zeros(3, 33, 4, dtype=torch.bfloat16)], ["mean", "first", "last"],
++                        {"task_id": 0, "episode_idx": 0, "episode_success": True, "seed": 7, "run_fingerprint": fp})
++    payload = torch.load(path, weights_only=False)
++    assert payload["run_fingerprint"] == fp and payload["features"].shape == (1, 3, 33, 4)
++
++
++# ---- the call sites in run_libero_eval.py are only reached with --save_all_layers ----
++def test_call_sites_are_gated_by_save_all_layers():
++    src = (REPO / "experiments" / "robot" / "libero" / "run_libero_eval.py").read_text()
++    tree = ast.parse(src)
++    guarded = {"require_flash_attention_2", "build_run_fingerprint", "add_fingerprint_to_provenance"}
++    seen = set()
++
++    def visit(node, gated):
++        if isinstance(node, ast.If) and "save_all_layers" in ast.unparse(node.test):
++            for child in node.body:
++                visit(child, True)
++            for child in node.orelse:
++                visit(child, gated)
++            return
++        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in guarded:
++            assert gated, f"{node.func.id} called outside an `if cfg.save_all_layers` block (line {node.lineno})"
++            seen.add(node.func.id)
++        if isinstance(node, ast.Name) and node.id == "run_fingerprint" and isinstance(node.ctx, ast.Load):
++            assert gated, f"run_fingerprint used outside an `if cfg.save_all_layers` block (line {node.lineno})"
++        for child in ast.iter_child_nodes(node):
++            visit(child, gated)
++
++    visit(tree, False)
++    assert seen == guarded
++    # the guard runs right after the model is loaded, before any rollout or provenance write
++    assert src.index("require_flash_attention_2(model, cfg.attn_implementation)") < src.index("write_provenance(save_folder")
