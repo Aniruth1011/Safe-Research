@@ -273,7 +273,7 @@ def test_fixed_seeds_consistent_everywhere():
     import re
     cfg = (KIT / "carc" / "config.sh").read_text()
     assert re.search(r"^export SEED=(\d+)", cfg, re.M).group(1) == str(PROTO.ROLLOUT_SEED)
-    for slurm in ("01_smoke_test.slurm", "02_rollouts.slurm"):
+    for slurm in ("../smoke_test.sh", "02_rollouts.slurm"):  # 01_smoke_test.slurm runs smoke_test.sh
         assert '--seed "$SEED"' in (KIT / "carc" / slurm).read_text()
     src = (KIT / "build_cache.py").read_text()
     assert f'"--unseen-tasks", type=int, nargs="+", default={list(PROTO.UNSEEN_TASKS)}' in src

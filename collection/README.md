@@ -72,6 +72,22 @@ Each `01`–`03` script reads `carc/config.sh` by relative path, so submit it fr
 
 **Storage (rough):** about 0.8 MB per step for 3 poolings × 33 layers. At roughly 350 steps × 500 episodes, that's ~150 GB of raw rollouts, plus about the same again for the cache. Setting `POOLING="mean"` in `config.sh` cuts this ~3×, but drops Exp 14.
 
+## Running on Modal (A10)
+
+`modal_app.py` runs the same collection on [Modal](https://modal.com), on **one A10 per task** (`gpu="A10"`). A10 is the single GPU type for the whole dataset: never mix GPU types across the 500 episodes. Every `modal run` costs money, so agree on the spend first.
+
+- **Image:** CUDA 12.1 devel base, Python 3.10, every `pip install` constrained by `constraints.txt` (the single source of truth for pins; the build fails if a required pin is missing or not honored). `vla-safe/openvla` is checked out at exactly `300dce2` (the build fails otherwise), with `openvla_all_layers.patch` applied by `git apply`. LIBERO is at a pinned commit, with a `.pth` file and a pre-written config, so there is no interactive prompt. flash-attn 2.5.5 is installed last (`CUDA_HOME` set). Rendering is headless EGL (`MUJOCO_GL=egl`).
+- **Volumes:** `cs566-hf-cache` holds the checkpoint and the small code files of `openvla/openvla-7b`, so the processor loads offline. `cs566-collection` holds the rollouts, the smoke outputs, the cache and the provenance files. Provenance files can contain host names and job IDs, so never commit anything from the volumes to this public repo.
+
+Run from the repo root:
+
+1. `modal run collection/modal_app.py::download_model` downloads the checkpoint into the volume (CPU only).
+2. `modal run collection/modal_app.py::smoke` runs `smoke_test.sh` on one A10, on task 1 (a seen task) with 2 episodes. It checks the environment (pins, flash-attn, EGL, LIBERO), loads the model, rolls out with `--save_all_layers` (including a resume check) and runs the L32 capture check. Pass `--full` to add the repeat run and the tiny cache build. It prints `timing_summary.txt`. The A10 speed is unmeasured until this runs.
+3. `modal run --detach collection/modal_app.py::rollouts --confirm-full-run --sec-per-episode <from smoke>` runs tasks 0–9, 50 episodes each, with seed 7 and `--resume`, one container per task (4 h timeout each). Without `--confirm-full-run` (or `CS566_CONFIRM_FULL_RUN=1`), it only prints the GPU-hour and cost estimate and exits. Relaunching continues where it stopped. `--tasks 3,7` reruns only those tasks. Each container refuses to run if the GPU name or the image differs from what earlier tasks of the same run recorded.
+4. `modal run --detach collection/modal_app.py::build_cache` runs the same capture check, then `build_cache.py`, then `check_cache.py verify` on the volume (CPU only).
+
+The smoke test is the same script on CARC (`carc/01_smoke_test.slurm`) and on Modal. On Modal it does not source `carc/activate_env.sh` (`KIT_ON_MODAL=1`).
+
 ## Getting it to teammates
 
 Each file is one layer × one pooling × one split, about 0.4–0.7 GB with full-size data. People download only what they need.
