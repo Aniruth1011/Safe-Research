@@ -116,6 +116,20 @@ VOLUMES = {HF_MOUNT: hf_volume, DATA_MOUNT: data_volume}
 # ----------------------------------------------------------------------------------------------------------------
 # Image
 # ----------------------------------------------------------------------------------------------------------------
+FINGERPRINT_FILE = "image_fingerprint.txt"
+SMOKE_VALIDATED_FILE = "smoke_validated_images.json"  # committed record of image fingerprints a full smoke test passed on
+
+
+def image_fingerprint(prov_dir: Path) -> str:
+    """Content hash of an image: pip freeze, OS packages, Python, repo commits, patch, builder version.
+    Modal image IDs are per workspace, so the same image built in two workspaces is compared by this hash."""
+    import hashlib
+    h = hashlib.sha256()
+    for f in sorted(p for p in Path(prov_dir).iterdir() if p.is_file() and p.name != FINGERPRINT_FILE):
+        h.update(f.name.encode() + b"\0" + f.read_bytes() + b"\0")
+    return h.hexdigest()
+
+
 def _finish_image() -> None:
     """Build step (runs once, inside the image): LIBERO .pth + config, pin check, provenance files."""
     import importlib.metadata as md
@@ -175,6 +189,10 @@ def _finish_image() -> None:
         Path(PROVENANCE_DIR, f"{name}_commit.txt").write_text(head.stdout)
     diff = subprocess.run(["git", "-C", OPENVLA_DIR, "diff", "--stat"], check=True, capture_output=True, text=True)
     Path(PROVENANCE_DIR, "openvla_patch_stat.txt").write_text(diff.stdout)
+    dpkg = subprocess.run(["dpkg-query", "-W", "-f=${Package}=${Version}\n"], check=True, capture_output=True, text=True)
+    Path(PROVENANCE_DIR, "dpkg_packages.txt").write_text("".join(sorted(dpkg.stdout.splitlines(keepends=True))))
+    Path(PROVENANCE_DIR, "python_version.txt").write_text(sys.version + "\n")
+    Path(PROVENANCE_DIR, FINGERPRINT_FILE).write_text(image_fingerprint(Path(PROVENANCE_DIR)) + "\n")
 
 
 image = (
@@ -338,16 +356,58 @@ def download_model() -> str:
 
 
 @app.function(gpu=GPU, volumes=VOLUMES, timeout=SMOKE_TIMEOUT_S, cpu=ROLLOUT_CPU_CORES, memory=ROLLOUT_MEMORY_MIB)
-def smoke_remote(task_id: int = 1, episodes: int = 2, full: bool = False) -> str:
-    """Runs collection/smoke_test.sh on one A10 and returns its timing summary."""
+def smoke_remote(task_id: int = 1, episodes: int = 2, full: bool = False, workspace_profile: str = "",
+                 kit_commit: str = "") -> str:
+    """Runs collection/smoke_test.sh on one A10 and returns its timing summary. A FULL pass (resume, capture, repeat,
+    build) records this image's fingerprint as validated in this workspace's volume (work/smoke_passes/)."""
     out = f"{SMOKE_ROOT}/{time.strftime('%Y%m%d-%H%M%S')}"
     env = {**OFFLINE, "CKPT": _checkpoint(), "SMOKE_ROOT": out, "SMOKE_TASK": str(task_id),
            "SMOKE_EPISODES": str(episodes), "SMOKE_FULL": "1" if full else "0"}
     try:
-        _run(["bash", f"{KIT_DIR}/smoke_test.sh"], env=env)
+        _run(["bash", f"{KIT_DIR}/smoke_test.sh"], env=env)  # raises unless every smoke check passed
+        summary = Path(out, "timing_summary.txt").read_text()
+        if full:
+            fp, image_id = current_image()
+            rec = {"image_fingerprint": fp, "modal_image_id": image_id, "workspace_profile": workspace_profile,
+                   "kit_commit": kit_commit, "gpu_name": _gpu_name(), "smoke_dir": out, "task": task_id,
+                   "episodes": episodes, "full": True, "passed_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                   "timing_summary": summary}
+            Path(WORK_DIR, "smoke_passes").mkdir(parents=True, exist_ok=True)
+            _write_json_atomic(Path(WORK_DIR, "smoke_passes", f"{fp}.json"), rec)
+            summary += f"\nimage fingerprint {fp} (Modal image {image_id}) recorded as smoke-validated\n"
     finally:
         data_volume.commit()
-    return Path(out, "timing_summary.txt").read_text()
+    return summary
+
+
+def current_image() -> tuple[str, str | None]:
+    """(content fingerprint, Modal image ID if the runtime exposes it) of the image this container runs."""
+    fp = Path(PROVENANCE_DIR, FINGERPRINT_FILE).read_text().strip()
+    if fp != image_fingerprint(Path(PROVENANCE_DIR)):
+        raise RuntimeError("image provenance does not match its recorded fingerprint")
+    return fp, os.environ.get("MODAL_IMAGE_ID")
+
+
+def smoke_validation(fp: str) -> dict | None:
+    """The full smoke pass recorded for this image fingerprint: in this workspace's volume, or committed in
+    collection/smoke_validated_images.json (a pass in another workspace on a byte-identical image)."""
+    local = Path(WORK_DIR, "smoke_passes", f"{fp}.json")
+    if local.exists():
+        return {"source": "this workspace", **json.loads(local.read_text())}
+    committed = Path(KIT_DIR, SMOKE_VALIDATED_FILE)
+    if committed.exists():
+        rec = json.loads(committed.read_text()).get(fp)
+        if rec:
+            return {"source": f"committed {SMOKE_VALIDATED_FILE}", **rec}
+    return None
+
+
+@app.function(volumes=VOLUMES, timeout=300, cpu=0.25, memory=512)
+def image_check() -> dict:
+    """CPU: this workspace's image fingerprint and its smoke validation (checked before any GPU is launched)."""
+    data_volume.reload()
+    fp, image_id = current_image()
+    return {"image_fingerprint": fp, "modal_image_id": image_id, "smoke_validation": smoke_validation(fp)}
 
 
 def usd_per_container_hour() -> float:
@@ -413,12 +473,24 @@ def rollout_task(task_id: int, workspace_profile: str, kit_commit: str, episodes
     if meta and meta.get("workspace_profile") != workspace_profile:
         raise RuntimeError(f"task {task_id} was started in workspace {meta.get('workspace_profile')!r}; "
                            "a partial task is rerun from scratch in a fresh volume, never continued across workspaces")
+    fp, image_id = current_image()
+    validation = smoke_validation(fp)
+    if validation is None:
+        raise RuntimeError(f"image {fp[:16]} (Modal {image_id}) has not passed a full smoke test; run "
+                           "`modal run collection/modal_app.py::smoke --full` in this workspace first")
+    if meta.get("image_fingerprint") not in (None, fp):
+        raise RuntimeError(f"task {task_id} was started on image {meta['image_fingerprint'][:16]}, now {fp[:16]}: "
+                           "a task runs on one image; rerun it from scratch on the validated image")
     _guard_one_environment(run_note)
     gpu = _gpu_name()
     attempt = {"container_id": os.environ.get("MODAL_TASK_ID"), "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                "workspace_profile": workspace_profile, "gpu_name": gpu, "kit_commit": kit_commit}
+    attempt["modal_image_id"] = image_id
     meta.update({"task": task_id, "run_note": run_note, "workspace_profile": workspace_profile, "gpu_name": gpu,
                  "kit_commit": kit_commit, "image_builder_version": IMAGE_BUILDER_VERSION,
+                 "image_fingerprint": fp, "modal_image_id": image_id,
+                 "smoke_validation": {k: validation.get(k) for k in ("source", "workspace_profile", "passed_utc",
+                                                                     "modal_image_id", "kit_commit")},
                  "episodes_expected": episodes, "timeout_s": ROLLOUT_TIMEOUT_S, "cpu_cores": ROLLOUT_CPU_CORES,
                  "memory_mib": ROLLOUT_MEMORY_MIB, "status": "running"})
     meta.setdefault("attempts", []).append(attempt)
@@ -525,8 +597,9 @@ def smoke(task: int = 1, episodes: int = 2, full: bool = False):
     """1 task, 2 episodes by default (task 1: a seen task; 0, 3, 5 are the locked unseen tasks)."""
     print(f"Smoke test on one {GPU}: at most {SMOKE_TIMEOUT_S // 60} min ~ "
           f"${SMOKE_TIMEOUT_S / 3600 * A10_USD_PER_HOUR:.2f} GPU (upper bound).")
+    profile, commit = _launch_context()
     download_model.remote()
-    print(smoke_remote.remote(task, episodes, full))
+    print(smoke_remote.remote(task, episodes, full, profile, commit))
 
 
 def _launch_context() -> tuple[str, str]:
@@ -563,6 +636,13 @@ def rollouts(confirm_full_run: bool = False, tasks: str = "", sec_per_episode: f
               "estimate above and getting the OK for the spend.")
         sys.exit(2)
     download_model.remote()
+    img = image_check.remote()
+    if img["smoke_validation"] is None:
+        raise SystemExit(f"Image {img['image_fingerprint'][:16]} (Modal {img['modal_image_id']}) in workspace {profile} "
+                         "has not passed a full smoke test. Run `modal run collection/modal_app.py::smoke --full` here "
+                         "first (needs Akash's OK for the spend). No GPU was started.")
+    print(f"Image {img['image_fingerprint'][:16]} validated by smoke test: {img['smoke_validation']['source']}, "
+          f"{img['smoke_validation'].get('passed_utc')}")
     for res in rollout_task.map(task_ids, kwargs={"run_note": run_note, "workspace_profile": profile,
                                                   "kit_commit": commit}, return_exceptions=True):
         print(res if isinstance(res, Exception) else

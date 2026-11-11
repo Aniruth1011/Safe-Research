@@ -214,11 +214,13 @@ def _helpers(**consts):
     import ast as _ast
     import calendar, hashlib, json as _json, os as _os, time as _time  # noqa: F401,E401
     tree = _ast.parse(_src())
-    names = {"usd_per_container_hour", "task_dir", "episode_accounting", "write_sha256sums", "spend_report"}
+    names = {"usd_per_container_hour", "task_dir", "episode_accounting", "write_sha256sums", "spend_report",
+             "image_fingerprint"}
     ns = {"Path": Path, "json": _json, "os": _os, "time": _time, "calendar": calendar,
           "A10_USD_PER_HOUR": 0.000306 * 3600, "CPU_USD_PER_CORE_HOUR": 0.0000131 * 3600,
           "RAM_USD_PER_GIB_HOUR": 0.00000222 * 3600, "ROLLOUT_CPU_CORES": 2.0, "ROLLOUT_MEMORY_MIB": 16384,
-          "CONTAINER_OVERHEAD_S": 180, "ROLLOUT_ROOT": "/vol/data/rollouts", **consts}
+          "CONTAINER_OVERHEAD_S": 180, "ROLLOUT_ROOT": "/vol/data/rollouts",
+          "FINGERPRINT_FILE": "image_fingerprint.txt", **consts}
     code = [n for n in tree.body if isinstance(n, _ast.FunctionDef) and n.name in names]
     exec(compile(_ast.Module(body=code, type_ignores=[]), "modal_app_helpers", "exec"), ns)
     return ns
@@ -265,3 +267,32 @@ def test_spend_report_per_workspace_and_projection():
     rep = h["spend_report"](metas)
     assert "workspace akashrav: ~$1.32" in rep and "workspace friend: ~$1.32" in rep   # (3420 + 180) s each
     assert "Projected for the 1 unfinished task(s) [2]: ~1.0 h ~ $1.32" in rep
+
+
+def test_image_fingerprint_is_a_content_hash(tmp_path):
+    fp = _helpers()["image_fingerprint"]
+    a, b = tmp_path / "a", tmp_path / "b"
+    for d in (a, b):
+        d.mkdir()
+        (d / "pip_freeze.txt").write_text("torch==2.2.0+cu121\n")
+        (d / "dpkg_packages.txt").write_text("libegl1=1.4.0\n")
+    (a / "image_fingerprint.txt").write_text("ignored\n")             # its own file is not hashed
+    assert fp(a) == fp(b) and len(fp(a)) == 64
+    (b / "dpkg_packages.txt").write_text("libegl1=1.4.1\n")            # an OS package drift changes the image
+    assert fp(a) != fp(b)
+
+
+def test_full_run_requires_a_smoke_validated_image():
+    src = _src()
+    assert 'Path(PROVENANCE_DIR, FINGERPRINT_FILE).write_text(image_fingerprint(Path(PROVENANCE_DIR))' in src
+    assert '"dpkg_packages.txt"' in src and '"python_version.txt"' in src
+    # only a FULL smoke pass validates an image, recorded per workspace volume
+    assert "if full:" in src and 'Path(WORK_DIR, "smoke_passes", f"{fp}.json")' in src
+    # rollout_task refuses an unvalidated image and records the image in TASK_META
+    body = src[src.index("def rollout_task("):src.index("def task_status(")]
+    assert "if validation is None:" in body and "raise RuntimeError" in body
+    assert '"image_fingerprint": fp, "modal_image_id": image_id' in body
+    assert "a task runs on one image" in body
+    # the launcher checks on CPU before any GPU starts
+    launch = src[src.index("def rollouts("):src.index("def spend_report(")]
+    assert launch.index("image_check.remote()") < launch.index("rollout_task.map(")
