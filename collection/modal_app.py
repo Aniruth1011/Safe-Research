@@ -747,6 +747,19 @@ def spend_report(metas: list[dict]) -> str:
 
 
 @app.local_entrypoint()
+def image():
+    """CPU only: this workspace's image fingerprint and whether a full smoke test validated it (exit 3 if not)."""
+    img = image_check.remote()
+    committed = json.loads((KIT_LOCAL / SMOKE_VALIDATED_FILE).read_text())
+    print(f"Workspace profile: {os.environ.get('MODAL_PROFILE', '(default profile)')}")
+    print(f"Image fingerprint: {img['image_fingerprint']}   Modal image: {img['modal_image_id']}")
+    print(f"Matches the committed smoke-validated fingerprint: {img['image_fingerprint'] in committed}")
+    print(f"Smoke validation: {img['smoke_validation'] and img['smoke_validation']['source']}")
+    if img["smoke_validation"] is None:
+        sys.exit(3)
+
+
+@app.local_entrypoint()
 def status(run_note: str = RUN_NOTE):
     """Per-task status and spend in the workspace selected by MODAL_PROFILE (CPU only, ~free)."""
     print(f"Workspace profile: {os.environ.get('MODAL_PROFILE', '(default profile)')}")
