@@ -23,6 +23,8 @@ Design:
 """
 from __future__ import annotations
 
+import calendar
+import json
 import os
 import shlex
 import subprocess
@@ -76,6 +78,10 @@ A10_USD_PER_HOUR = 0.000306 * 3600  # ~= $1.10
 A40_SEC_PER_EPISODE = (81, 157)  # measured on CARC A40, 2026-11-09
 A10_GPU_HOURS_ESTIMATE = (12, 24)  # ESTIMATE (not measured) for all 500 episodes, from the compute plan 2026-11-10
 ROLLOUT_CPU_CORES = 2.0  # physical cores (= 4 vCPU), billed in addition to the GPU
+CPU_USD_PER_CORE_HOUR = 0.0000131 * 3600
+RAM_USD_PER_GIB_HOUR = 0.00000222 * 3600
+WAVE_SIZE = 5  # Akash 2026-11-10: launch at most 5 tasks at a time; report spend and get approval between waves
+CONTAINER_OVERHEAD_S = 180  # ESTIMATE: boot + image pull per container, billed but not inside the function's own timing
 ROLLOUT_MEMORY_MIB = 16384
 
 REQUIRED_EXACT_PINS = [  # must appear as `name==version` in constraints.txt and be installed at that version
@@ -344,25 +350,125 @@ def smoke_remote(task_id: int = 1, episodes: int = 2, full: bool = False) -> str
     return Path(out, "timing_summary.txt").read_text()
 
 
+def usd_per_container_hour() -> float:
+    return A10_USD_PER_HOUR + ROLLOUT_CPU_CORES * CPU_USD_PER_CORE_HOUR + ROLLOUT_MEMORY_MIB / 1024 * RAM_USD_PER_GIB_HOUR
+
+
+def task_dir(run_note: str, task_id: int) -> Path:
+    """One folder per task, so finished tasks can be pulled independently: rollouts/<run>/taskNN/."""
+    return Path(ROLLOUT_ROOT, run_note, f"task{task_id:02d}")
+
+
+def _write_json_atomic(path: Path, obj: dict) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=2, sort_keys=True) + "\n")
+    os.replace(tmp, path)
+
+
+def episode_accounting(ep_dir: Path, task_id: int, episodes: int) -> dict:
+    """Per episode: complete (.csv + .pkl + .layers.pt), invalid (marker only) or missing."""
+    complete, invalid, missing = [], [], []
+    for e in range(episodes):
+        exts = {p.name.split(".", 1)[1] for p in ep_dir.glob(f"task{task_id}--ep{e}--succ*")}
+        if (ep_dir / f"task{task_id}--ep{e}--invalid.json").exists() and not exts:
+            invalid.append(e)
+        elif {"csv", "pkl", "layers.pt"} <= exts:
+            complete.append(e)
+        else:
+            missing.append(e)
+    return {"complete": len(complete), "invalid": invalid, "missing": missing}
+
+
+def write_sha256sums(tdir: Path) -> int:
+    """`sha256sum -c` format, paths relative to the task folder (only libero_10/ is covered)."""
+    import hashlib
+    lines = []
+    for f in sorted(p for p in (tdir / "libero_10").rglob("*") if p.is_file() and not p.name.endswith(".tmp")):
+        h = hashlib.sha256()
+        with open(f, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 22), b""):
+                h.update(chunk)
+        lines.append(f"{h.hexdigest()}  {f.relative_to(tdir)}")
+    (tdir / "SHA256SUMS").write_text("\n".join(lines) + "\n")
+    return len(lines)
+
+
 @app.function(gpu=GPU, volumes=VOLUMES, timeout=ROLLOUT_TIMEOUT_S, cpu=ROLLOUT_CPU_CORES, memory=ROLLOUT_MEMORY_MIB,
-              max_containers=N_TASKS)
-def rollout_task(task_id: int, episodes: int = EPISODES_PER_TASK, run_note: str = RUN_NOTE) -> dict:
-    """One LIBERO-10 task (50 episodes, seed 7, --resume) on one A10; outputs go to the data volume."""
+              max_containers=WAVE_SIZE)
+def rollout_task(task_id: int, workspace_profile: str, kit_commit: str, episodes: int = EPISODES_PER_TASK,
+                 run_note: str = RUN_NOTE) -> dict:
+    """One LIBERO-10 task (50 episodes, seed 7, --resume) on one A10, into its own folder rollouts/<run>/taskNN/.
+
+    TASK_META.json is written when the task starts (status "running") and updated when it ends ("complete" when every
+    episode has its files or an invalid marker, else "partial"/"failed"). A container killed by its timeout or by a
+    credit limit leaves "running": such a task is NOT pulled, and is rerun from scratch in the other workspace.
+    Every attempt records workspace, GPU, container and seconds (for spend and provenance)."""
     assert 0 <= task_id < N_TASKS, task_id
+    tdir = task_dir(run_note, task_id)
+    tdir.mkdir(parents=True, exist_ok=True)
+    meta_path = tdir / "TASK_META.json"
+    meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+    if meta.get("status") == "complete":
+        return meta
+    if meta and meta.get("workspace_profile") != workspace_profile:
+        raise RuntimeError(f"task {task_id} was started in workspace {meta.get('workspace_profile')!r}; "
+                           "a partial task is rerun from scratch in a fresh volume, never continued across workspaces")
     _guard_one_environment(run_note)
-    t0 = time.time()
+    gpu = _gpu_name()
+    attempt = {"container_id": os.environ.get("MODAL_TASK_ID"), "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+               "workspace_profile": workspace_profile, "gpu_name": gpu, "kit_commit": kit_commit}
+    meta.update({"task": task_id, "run_note": run_note, "workspace_profile": workspace_profile, "gpu_name": gpu,
+                 "kit_commit": kit_commit, "image_builder_version": IMAGE_BUILDER_VERSION,
+                 "episodes_expected": episodes, "timeout_s": ROLLOUT_TIMEOUT_S, "cpu_cores": ROLLOUT_CPU_CORES,
+                 "memory_mib": ROLLOUT_MEMORY_MIB, "status": "running"})
+    meta.setdefault("attempts", []).append(attempt)
+    _write_json_atomic(meta_path, meta)
+    data_volume.commit()
+    t0, error = time.time(), None
     try:
-        _run(rollout_args(_checkpoint(), task_id, episodes, ROLLOUT_ROOT, run_note), cwd=OPENVLA_DIR, env=OFFLINE)
+        _run(rollout_args(_checkpoint(), task_id, episodes, str(tdir.parent), tdir.name), cwd=OPENVLA_DIR, env=OFFLINE)
+    except subprocess.CalledProcessError as e:
+        error = f"run_libero_eval.py exited with {e.returncode}"
     finally:
+        acct = episode_accounting(tdir / "libero_10", task_id, episodes)
+        done = not acct["missing"] and error is None
+        attempt.update({"finished_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "seconds": round(time.time() - t0), "error": error})
+        meta.update({"episodes_complete": acct["complete"], "episodes_invalid": acct["invalid"],
+                     "episodes_missing": acct["missing"], "status": "complete" if done else ("failed" if error else "partial")})
+        if done:
+            meta["sha256sums_files"] = write_sha256sums(tdir)
+        _write_json_atomic(meta_path, meta)
         data_volume.commit()
-    done = len(list(Path(ROLLOUT_ROOT, run_note, "libero_10").glob(f"task{task_id}--ep*--succ*.csv")))
-    return {"task": task_id, "complete": done, "expected": episodes, "seconds": round(time.time() - t0)}
+    if error:
+        raise RuntimeError(f"task {task_id}: {error}; TASK_META status {meta['status']}")
+    return meta
+
+
+@app.function(volumes=VOLUMES, timeout=600, cpu=0.25, memory=512)
+def task_status(run_note: str = RUN_NOTE) -> list[dict]:
+    """CPU: every task's TASK_META.json in this workspace's volume (for spend reports)."""
+    data_volume.reload()
+    out = []
+    for t in range(N_TASKS):
+        f = task_dir(run_note, t) / "TASK_META.json"
+        out.append(json.loads(f.read_text()) if f.exists() else {"task": t, "status": "not started"})
+    return out
 
 
 @app.function(volumes=VOLUMES, timeout=BUILD_TIMEOUT_S, cpu=2.0, memory=32768)
 def build_cache_remote(run_note: str = RUN_NOTE, version: str = CACHE_VERSION, extra_build_args: str = "") -> None:
     """CPU: capture check on every episode -> build_cache.py -> check_cache.py verify, all on the data volume."""
-    rollout_dir = f"{ROLLOUT_ROOT}/{run_note}/libero_10"
+    rollout_dir = "/tmp/flat/libero_10"  # flat view (symlinks) of rollouts/<run>/taskNN/libero_10, as build_cache reads
+    Path(rollout_dir, "provenance").mkdir(parents=True, exist_ok=True)
+    for t in range(N_TASKS):
+        src = task_dir(run_note, t) / "libero_10"
+        if json.loads((task_dir(run_note, t) / "TASK_META.json").read_text()).get("status") != "complete":
+            raise RuntimeError(f"task {t} is not complete in this workspace; build on CARC from pulled tasks instead")
+        for f in src.glob("task*"):
+            os.symlink(f, Path(rollout_dir, f.name))
+        for f in (src / "provenance").glob("*"):
+            os.symlink(f, Path(rollout_dir, "provenance", f.name))
     prov = Path(WORK_DIR, "provenance", run_note)
     prov_files = sorted(str(p) for p in prov.glob("*.txt")) + [CHECKPOINT_PATH_FILE]
     try:
@@ -423,18 +529,87 @@ def smoke(task: int = 1, episodes: int = 2, full: bool = False):
     print(smoke_remote.remote(task, episodes, full))
 
 
+def _launch_context() -> tuple[str, str]:
+    """(workspace profile, kit commit). The profile must be chosen explicitly; the tree must be clean so the
+    commit recorded in every TASK_META.json is the code that ran."""
+    profile = os.environ.get("MODAL_PROFILE", "")
+    if not profile:
+        raise SystemExit("Set MODAL_PROFILE (e.g. MODAL_PROFILE=friend) so the workspace is chosen explicitly.")
+    repo = KIT_LOCAL.parent
+    dirty = subprocess.run(["git", "-C", str(repo), "status", "--porcelain", "--untracked-files=no"],
+                           check=True, capture_output=True, text=True).stdout.strip()
+    if dirty:
+        raise SystemExit(f"Refusing to launch from a modified tree (commit first):\n{dirty}")
+    commit = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True,
+                            text=True).stdout.strip()
+    return profile, commit
+
+
 @app.local_entrypoint()
-def rollouts(confirm_full_run: bool = False, tasks: str = "0-9", sec_per_episode: float = 0.0,
+def rollouts(confirm_full_run: bool = False, tasks: str = "", sec_per_episode: float = 0.0,
              run_note: str = RUN_NOTE):
+    """Launch ONE wave (at most WAVE_SIZE tasks), e.g. MODAL_PROFILE=friend modal run --detach
+    collection/modal_app.py::rollouts --tasks 0-4 --sec-per-episode <smoke> --confirm-full-run"""
+    if not tasks:
+        raise SystemExit(f"Pass --tasks explicitly (a wave of at most {WAVE_SIZE} tasks, e.g. 0-4).")
     task_ids = parse_tasks(tasks)
+    if len(task_ids) > WAVE_SIZE:
+        raise SystemExit(f"{len(task_ids)} tasks requested; launch waves of at most {WAVE_SIZE} and report spend between them.")
+    profile, commit = _launch_context()
+    print(f"Workspace profile: {profile}   kit commit: {commit[:12]}   run: {run_note}   tasks: {task_ids}")
     print(cost_estimate(len(task_ids), sec_per_episode))
     if not (confirm_full_run or os.environ.get("CS566_CONFIRM_FULL_RUN") == "1"):
         print("Refusing to launch: pass --confirm-full-run (or set CS566_CONFIRM_FULL_RUN=1) after reading the "
               "estimate above and getting the OK for the spend.")
         sys.exit(2)
     download_model.remote()
-    for res in rollout_task.map(task_ids, kwargs={"run_note": run_note}, return_exceptions=True):
-        print(res)
+    for res in rollout_task.map(task_ids, kwargs={"run_note": run_note, "workspace_profile": profile,
+                                                  "kit_commit": commit}, return_exceptions=True):
+        print(res if isinstance(res, Exception) else
+              {k: res.get(k) for k in ("task", "status", "episodes_complete", "episodes_invalid", "episodes_missing")})
+    print(spend_report(task_status.remote(run_note)))
+
+
+def spend_report(metas: list[dict]) -> str:
+    """Container-hours x published rates, per workspace, plus a projection for the tasks not yet complete.
+    Estimates: add CONTAINER_OVERHEAD_S per attempt for boot/image pull; check the Modal dashboard as well."""
+    rate = usd_per_container_hour()
+    lines = [f"{'task':>4} {'status':<12} {'done':>4} {'inv':>3} {'workspace':<10} {'gpu':<12} {'hours':>6} {'USD':>6}"]
+    per_ws: dict[str, float] = {}
+    done_hours = []
+    for m in metas:
+        secs_by_ws: dict[str, float] = {}
+        for a in m.get("attempts", []):
+            secs = a.get("seconds")
+            if secs is None and a.get("started_utc"):  # still running or killed: count up to now (upper bound)
+                secs = time.time() - calendar.timegm(time.strptime(a["started_utc"], "%Y-%m-%dT%H:%M:%SZ"))
+            secs_by_ws[a.get("workspace_profile", "?")] = secs_by_ws.get(a.get("workspace_profile", "?"), 0) \
+                + (secs or 0) + CONTAINER_OVERHEAD_S
+        hours = sum(secs_by_ws.values()) / 3600
+        for ws, sec in secs_by_ws.items():
+            per_ws[ws] = per_ws.get(ws, 0.0) + sec / 3600 * rate
+        if m.get("status") == "complete":
+            done_hours.append(hours)
+        lines.append(f"{m['task']:>4} {m.get('status', '?'):<12} {m.get('episodes_complete', 0):>4} "
+                     f"{len(m.get('episodes_invalid', [])):>3} {m.get('workspace_profile', '-'):<10} "
+                     f"{m.get('gpu_name', '-'):<12} {hours:>6.2f} {hours * rate:>6.2f}")
+    lines.append(f"Rate: ${rate:.3f}/container-hour (A10 + {ROLLOUT_CPU_CORES} cores + {ROLLOUT_MEMORY_MIB // 1024} GiB), "
+                 f"+{CONTAINER_OVERHEAD_S} s per attempt (estimate).")
+    for ws, usd in sorted(per_ws.items()):
+        lines.append(f"Spent so far on rollouts, workspace {ws}: ~${usd:.2f}")
+    remaining = [m["task"] for m in metas if m.get("status") != "complete"]
+    if remaining and done_hours:
+        per_task = sum(done_hours) / len(done_hours)
+        lines.append(f"Projected for the {len(remaining)} unfinished task(s) {remaining}: ~{per_task * len(remaining):.1f} h "
+                     f"~ ${per_task * len(remaining) * rate:.2f} (mean of {len(done_hours)} completed task(s)).")
+    return "\n".join(lines)
+
+
+@app.local_entrypoint()
+def status(run_note: str = RUN_NOTE):
+    """Per-task status and spend in the workspace selected by MODAL_PROFILE (CPU only, ~free)."""
+    print(f"Workspace profile: {os.environ.get('MODAL_PROFILE', '(default profile)')}")
+    print(spend_report(task_status.remote(run_note)))
 
 
 @app.local_entrypoint()

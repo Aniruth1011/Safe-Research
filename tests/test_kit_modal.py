@@ -206,3 +206,62 @@ def test_image_builder_pinned_for_python_310():
     assert src.index('os.environ["MODAL_IMAGE_BUILDER_VERSION"] = IMAGE_BUILDER_VERSION') < src.index("import modal  #")
     assert 'add_python="3.10"' in src
     assert '"image_builder_version.txt"' in src
+
+
+# ---------------------------------------------------------------- workspace-portable full run (2026-11-10)
+def _helpers(**consts):
+    """Exec the pure helper functions of modal_app.py without importing modal."""
+    import ast as _ast
+    import calendar, hashlib, json as _json, os as _os, time as _time  # noqa: F401,E401
+    tree = _ast.parse(_src())
+    names = {"usd_per_container_hour", "task_dir", "episode_accounting", "write_sha256sums", "spend_report"}
+    ns = {"Path": Path, "json": _json, "os": _os, "time": _time, "calendar": calendar,
+          "A10_USD_PER_HOUR": 0.000306 * 3600, "CPU_USD_PER_CORE_HOUR": 0.0000131 * 3600,
+          "RAM_USD_PER_GIB_HOUR": 0.00000222 * 3600, "ROLLOUT_CPU_CORES": 2.0, "ROLLOUT_MEMORY_MIB": 16384,
+          "CONTAINER_OVERHEAD_S": 180, "ROLLOUT_ROOT": "/vol/data/rollouts", **consts}
+    code = [n for n in tree.body if isinstance(n, _ast.FunctionDef) and n.name in names]
+    exec(compile(_ast.Module(body=code, type_ignores=[]), "modal_app_helpers", "exec"), ns)
+    return ns
+
+
+def test_one_folder_per_task_and_wave_limit():
+    src = _src()
+    assert 'return Path(ROLLOUT_ROOT, run_note, f"task{task_id:02d}")' in src
+    assert "WAVE_SIZE = 5" in src and "max_containers=WAVE_SIZE" in src
+    assert "if len(task_ids) > WAVE_SIZE:" in src
+    assert 'os.environ.get("MODAL_PROFILE", "")' in src            # workspace chosen explicitly
+    assert '"status", "--porcelain"' in src                          # launched only from a committed tree
+    assert "never continued across workspaces" in src
+
+
+def test_episode_accounting_and_checksums(tmp_path):
+    h = _helpers()
+    ep = tmp_path / "task01" / "libero_10"
+    (ep / "provenance").mkdir(parents=True)
+    for e, exts in ((0, ("csv", "pkl", "layers.pt", "mp4")), (2, ("mp4", "pkl"))):
+        for x in exts:
+            (ep / f"task1--ep{e}--succ0.{x}").write_text(x)
+    (ep / "task1--ep1--invalid.json").write_text("{}")
+    (ep / "task1--ep0--succ0.layers.pt.tmp").write_text("partial")
+    acct = h["episode_accounting"](ep, 1, 3)
+    assert acct == {"complete": 1, "invalid": [1], "missing": [2]}
+    n = h["write_sha256sums"](tmp_path / "task01")
+    lines = (tmp_path / "task01" / "SHA256SUMS").read_text().splitlines()
+    assert n == len(lines) == 7 and all(len(l.split("  ")[0]) == 64 for l in lines)
+    assert not any(l.endswith(".tmp") for l in lines)
+
+
+def test_spend_report_per_workspace_and_projection():
+    h = _helpers()
+    rate = h["usd_per_container_hour"]()
+    assert abs(rate - 1.3238) < 1e-3                                  # A10 + 2 cores + 16 GiB, modal.com/pricing 2026-11-10
+    metas = [
+        {"task": 0, "status": "complete", "workspace_profile": "friend", "gpu_name": "NVIDIA A10",
+         "episodes_complete": 50, "episodes_invalid": [], "attempts": [{"workspace_profile": "friend", "seconds": 3420}]},
+        {"task": 1, "status": "complete", "workspace_profile": "akashrav", "gpu_name": "NVIDIA A10",
+         "episodes_complete": 49, "episodes_invalid": [7], "attempts": [{"workspace_profile": "akashrav", "seconds": 3420}]},
+        {"task": 2, "status": "not started"},
+    ]
+    rep = h["spend_report"](metas)
+    assert "workspace akashrav: ~$1.32" in rep and "workspace friend: ~$1.32" in rep   # (3420 + 180) s each
+    assert "Projected for the 1 unfinished task(s) [2]: ~1.0 h ~ $1.32" in rep
