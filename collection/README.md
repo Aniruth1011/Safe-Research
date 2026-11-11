@@ -92,12 +92,27 @@ Each `01`–`03` script reads `carc/config.sh` by relative path, so submit it fr
 - **Image:** CUDA 12.1 devel base, Python 3.10, every `pip install` constrained by `constraints.txt` (the single source of truth for pins; the build fails if a required pin is missing or not honored). `vla-safe/openvla` is checked out at exactly `300dce2` (the build fails otherwise), with `openvla_all_layers.patch` applied by `git apply`. LIBERO is at a pinned commit, with a `.pth` file and a pre-written config, so there is no interactive prompt. flash-attn 2.5.5 is installed last (`CUDA_HOME` set). Rendering is headless EGL (`MUJOCO_GL=egl`).
 - **Volumes:** `cs566-hf-cache` holds the checkpoint and the small code files of `openvla/openvla-7b`, so the processor loads offline. `cs566-collection` holds the rollouts, the smoke outputs, the cache and the provenance files. Provenance files can contain host names and job IDs, so never commit anything from the volumes to this public repo.
 
-Run from the repo root:
+Run from the repo root, choosing the workspace explicitly with `MODAL_PROFILE=<profile>` on every command. The
+step-by-step procedure for the team's run (two workspaces, waves, pulling to CARC) is in
+`docs/orchestrator/07_RUNBOOK_MODAL.md` on the `akash/extraction` branch of the fork.
 
-1. `modal run collection/modal_app.py::download_model` downloads the checkpoint into the volume (CPU only).
-2. `modal run collection/modal_app.py::smoke` runs `smoke_test.sh` on one A10, on task 1 (a seen task) with 2 episodes. It checks the environment (pins, flash-attn, EGL, LIBERO), loads the model, rolls out with `--save_all_layers` (including a resume check) and runs the L32 capture check. Pass `--full` to add the repeat run and the tiny cache build. It prints `timing_summary.txt`. The A10 speed is unmeasured until this runs.
-3. `modal run --detach collection/modal_app.py::rollouts --confirm-full-run --sec-per-episode <from smoke>` runs tasks 0–9, 50 episodes each, with seed 7 and `--resume`, one container per task (4 h timeout each). Without `--confirm-full-run` (or `CS566_CONFIRM_FULL_RUN=1`), it only prints the GPU-hour and cost estimate and exits. Relaunching continues where it stopped. `--tasks 3,7` reruns only those tasks. Each container refuses to run if the GPU name or the image differs from what earlier tasks of the same run recorded.
-4. `modal run --detach collection/modal_app.py::build_cache` runs the same capture check, then `build_cache.py`, then `check_cache.py verify` on the volume (CPU only).
+1. `modal run collection/modal_app.py::download_model` (CPU only): builds the image (Modal image builder pinned to
+   2025.06, because 2026.10 rejects Python 3.10), downloads the checkpoint into the HF volume and copies the image's
+   provenance, including its content fingerprint, to `work/image_provenance` in the data volume.
+2. `modal run collection/modal_app.py::smoke --full` runs `smoke_test.sh` on one A10, on task 1 (a seen task), with
+   2 episodes: environment, model load, resume, capture, repeat run and a tiny cache build. A full pass records the
+   image fingerprint as smoke-validated. Full-run tasks refuse any image without such a pass.
+3. `modal run --detach collection/modal_app.py::rollouts --tasks 0-4 --sec-per-episode <from smoke> --confirm-full-run`
+   launches one wave of at most 5 tasks, one A10 container per task, seed 7, `--resume`. Each task writes its own
+   folder `rollouts/<run>/taskNN/` with `TASK_META.json` (workspace, GPU, image fingerprint, kit commit, every
+   attempt's time) and, when complete, `SHA256SUMS`. Without `--confirm-full-run` it only prints the estimate.
+4. `modal run collection/modal_app.py::status` lists every task's state and the spend per workspace, and projects
+   the cost of the unfinished tasks.
+5. Pull finished tasks to CARC with `carc/04_pull_from_modal.slurm` (CPU job), which checks checksums and completeness.
+   Then build there with `carc/05_build_cache_from_modal.slurm`. `build_cache` on Modal is an alternative when every
+   task finished in one workspace.
+
+Nothing is deleted from a Modal Volume until the cache on CARC has verified.
 
 The smoke test is the same script on CARC (`carc/01_smoke_test.slurm`) and on Modal. On Modal it does not source `carc/activate_env.sh` (`KIT_ON_MODAL=1`).
 
