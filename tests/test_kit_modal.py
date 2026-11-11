@@ -348,3 +348,33 @@ def test_spend_counts_discarded_attempts():
               "episodes_complete": 50, "episodes_invalid": [], "attempts": [{"workspace_profile": "friend", "seconds": 3420}],
               "discarded_attempts": [{"attempts": [{"workspace_profile": "friend", "seconds": 3420}]}]}]
     assert "workspace friend: ~$2.65" in h["spend_report"](metas)   # 2 x (3420 + 180) s at $1.3238/h
+
+
+# ---------------------------------------------------------------- one exact GPU type (wave 1 finding, 2026-11-11)
+def test_every_container_checks_the_exact_gpu_before_touching_outputs():
+    src = _src()
+    assert 'EXPECTED_GPU_NAME = "NVIDIA A10"' in src
+    body = src[src.index("def rollout_task("):src.index("def task_status(")]
+    # a task "complete" on another GPU is not complete for the dataset
+    assert 'if meta.get("status") == "complete" and meta.get("gpu_name") == EXPECTED_GPU_NAME:' in body
+    # the GPU check comes before any output is moved (discard) or written (TASK_META, rollout)
+    i = body.index("require_expected_gpu(gpu, task_id)")
+    assert i < body.index("discard_partial(") and i < body.index("_write_json_atomic(meta_path")
+    assert '"wrong-gpu"' in src and "completed on a GPU other than" in src
+    smoke = src[src.index("def smoke_remote("):src.index("def current_image(")]
+    assert "require_expected_gpu(_gpu_name())" in smoke                 # a smoke pass on another GPU validates nothing
+    launch = src[src.index("def rollouts("):src.index("def spend_report(")]
+    assert "WRONG_GPU_RETRIES" in launch and 'WRONG_GPU task=(\\d+)' in launch
+    assert "states.get(t) == \"complete\" and gpus.get(t) == EXPECTED_GPU_NAME" in launch
+
+
+def test_wrong_gpu_error_names_the_task():
+    import ast as _ast
+    tree = _ast.parse(_src())
+    code = [n for n in tree.body if isinstance(n, (_ast.ClassDef, _ast.FunctionDef))
+            and n.name in ("WrongGPU", "require_expected_gpu")]
+    ns = {"EXPECTED_GPU_NAME": "NVIDIA A10"}
+    exec(compile(_ast.Module(body=code, type_ignores=[]), "modal_app_gpu", "exec"), ns)
+    ns["require_expected_gpu"]("NVIDIA A10", 2)                       # the expected GPU passes
+    with pytest.raises(ns["WrongGPU"], match=r"WRONG_GPU task=2: container has 'NVIDIA A10G'"):
+        ns["require_expected_gpu"]("NVIDIA A10G", 2)

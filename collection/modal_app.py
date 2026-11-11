@@ -26,6 +26,7 @@ from __future__ import annotations
 import calendar
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -47,6 +48,10 @@ import modal  # noqa: E402  (after the builder pin)
 # ----------------------------------------------------------------------------------------------------------------
 APP_NAME = "cs566-vla-collection"
 GPU = "A10"  # the single GPU type for the whole dataset
+# Modal's "A10" request can be served by an A10G (wave 1, 2026-11-11: 1 of 5 containers). Different SM count, so
+# kernels/numerics may differ: every container checks the exact device name before touching any output.
+EXPECTED_GPU_NAME = "NVIDIA A10"
+WRONG_GPU_RETRIES = 6  # re-requests per task when Modal hands out another GPU type (~1 min of container each)
 
 OPENVLA_REPO = "https://github.com/vla-safe/openvla.git"
 OPENVLA_COMMIT = "300dce26d44f407c725695d16cd445755c92cbd1"  # = 300dce2, SAFE's fork as pinned by the kit
@@ -362,6 +367,7 @@ def smoke_remote(task_id: int = 1, episodes: int = 2, full: bool = False, worksp
                  kit_commit: str = "") -> str:
     """Runs collection/smoke_test.sh on one A10 and returns its timing summary. A FULL pass (resume, capture, repeat,
     build) records this image's fingerprint as validated in this workspace's volume (work/smoke_passes/)."""
+    require_expected_gpu(_gpu_name())
     out = f"{SMOKE_ROOT}/{time.strftime('%Y%m%d-%H%M%S')}"
     env = {**OFFLINE, "CKPT": _checkpoint(), "SMOKE_ROOT": out, "SMOKE_TASK": str(task_id),
            "SMOKE_EPISODES": str(episodes), "SMOKE_FULL": "1" if full else "0"}
@@ -455,11 +461,22 @@ def write_sha256sums(tdir: Path) -> int:
     return len(lines)
 
 
+class WrongGPU(RuntimeError):
+    """This container got a GPU other than EXPECTED_GPU_NAME; nothing was written."""
+
+
+def require_expected_gpu(gpu: str, task_id: int | None = None) -> None:
+    if gpu != EXPECTED_GPU_NAME:
+        raise WrongGPU(f"WRONG_GPU task={task_id}: container has {gpu!r}, the dataset requires {EXPECTED_GPU_NAME!r}; "
+                       "nothing was written")
+
+
 DISCARD_REASONS = {
     "running": "previous attempt never finished (container stopped: Modal preemption/restart, timeout, credit limit or kill)",
     "partial": "previous attempt ended with missing episodes",
     "failed": "previous attempt failed",
     "engineering-complete": "engineering (resumed) output is never part of the dataset",
+    "wrong-gpu": f"completed on a GPU other than {EXPECTED_GPU_NAME} (one GPU type for the whole dataset)",
     None: "outputs present without TASK_META",
 }
 
@@ -498,8 +515,12 @@ def rollout_task(task_id: int, workspace_profile: str, kit_commit: str, episodes
     tdir.mkdir(parents=True, exist_ok=True)
     meta_path = tdir / "TASK_META.json"
     meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
-    if meta.get("status") == "complete":
+    if meta.get("status") == "complete" and meta.get("gpu_name") == EXPECTED_GPU_NAME:
         return meta
+    gpu = _gpu_name()
+    require_expected_gpu(gpu, task_id)  # before any output is moved or written
+    if meta.get("status") == "complete":  # complete, but on another GPU type: not part of the dataset
+        meta["status"] = "wrong-gpu"
     if meta and meta.get("workspace_profile") != workspace_profile:
         raise RuntimeError(f"task {task_id} was started in workspace {meta.get('workspace_profile')!r}; "
                            "a partial task is rerun from scratch in a fresh volume, never continued across workspaces")
@@ -511,7 +532,6 @@ def rollout_task(task_id: int, workspace_profile: str, kit_commit: str, episodes
     if engineering_resume and meta.get("image_fingerprint") not in (None, fp):
         raise RuntimeError(f"task {task_id} was started on image {meta['image_fingerprint'][:16]}, now {fp[:16]}")
     _guard_one_environment(run_note)
-    gpu = _gpu_name()
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     if not engineering_resume:
         reason = DISCARD_REASONS.get(meta.get("status"), f"previous status {meta.get('status')!r}")
@@ -699,15 +719,32 @@ def rollouts(confirm_full_run: bool = False, tasks: str = "", sec_per_episode: f
         raise SystemExit(f"Tasks {running} are marked 'running' in workspace {profile}. If `modal app list` shows no app "
                          "still running them, relaunch with --restart-stale: their partial outputs are moved to "
                          "_discarded/ and they restart at episode 0. No GPU was started.")
-    skipped = [t for t in task_ids if states.get(t) == "complete"]
+    gpus = {m["task"]: m.get("gpu_name") for m in task_status.remote(run_note)}
+    skipped = [t for t in task_ids if states.get(t) == "complete" and gpus.get(t) == EXPECTED_GPU_NAME]
+    wrong = [t for t in task_ids if states.get(t) == "complete" and gpus.get(t) != EXPECTED_GPU_NAME]
+    if wrong:
+        print(f"Complete but NOT on {EXPECTED_GPU_NAME}, rerun from episode 0 (old output moved to _discarded/): {wrong}")
     if skipped:
         print(f"Already complete, not relaunched: {skipped}")
         task_ids = [t for t in task_ids if t not in skipped]
-    for res in rollout_task.map(task_ids, kwargs={"run_note": run_note, "workspace_profile": profile,
-                                                  "kit_commit": commit}, return_exceptions=True,
-                                 order_outputs=False):
-        print(res if isinstance(res, Exception) else
-              {k: res.get(k) for k in ("task", "status", "episodes_complete", "episodes_invalid", "episodes_missing")})
+    pending = list(task_ids)
+    for round_ in range(WRONG_GPU_RETRIES + 1):
+        retry = []
+        for res in rollout_task.map(pending, kwargs={"run_note": run_note, "workspace_profile": profile,
+                                                     "kit_commit": commit}, return_exceptions=True, order_outputs=False):
+            m = re.search(r"WRONG_GPU task=(\d+)", str(res)) if isinstance(res, Exception) else None
+            if m:  # reported as each task finishes; a wrong GPU is re-requested
+                print(f"task {m.group(1)}: got another GPU type, re-requesting ({round_ + 1}/{WRONG_GPU_RETRIES}): {res}")
+                retry.append(int(m.group(1)))
+            else:
+                print(res if isinstance(res, Exception) else
+                      {k: res.get(k) for k in ("task", "status", "episodes_complete", "episodes_invalid",
+                                               "episodes_missing", "gpu_name")})
+        if not retry:
+            break
+        pending = retry
+    else:
+        print(f"Tasks {pending} never got an {EXPECTED_GPU_NAME} after {WRONG_GPU_RETRIES} re-requests; not run.")
     print(spend_report(task_status.remote(run_note)))
 
 
