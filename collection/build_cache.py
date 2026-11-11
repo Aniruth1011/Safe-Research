@@ -5,6 +5,7 @@ Input: a rollout folder written by the patched `run_libero_eval.py --save_all_la
     task{T}--ep{E}--succ{S}.csv        (written last; marks the episode complete)
     task{T}--ep{E}--succ{S}.pkl        (SAFE's original last-layer features, unchanged)
     task{T}--ep{E}--succ{S}.layers.pt  ((T, P, 33, D) bfloat16, all layers, P poolings)
+    task{T}--ep{E}--invalid.json       (INSTEAD of the files above when the episode raised; see README "Invalid episodes")
 
 Output (CACHE_ROOT/<version>/):
     manifest.json         everything about the cache, incl. sha256 of every file
@@ -73,6 +74,61 @@ def discover(rollout_dir: Path) -> pd.DataFrame:
     return df
 
 
+INVALID_RE = re.compile(r"^task(\d+)--ep(\d+)--invalid\.json$")
+
+
+def account_invalid_episodes(rollout_dir: Path, df: pd.DataFrame, counts: pd.Series, expect_episodes: int,
+                             max_invalid: int | None, problems: list[str]) -> tuple[list[dict], pd.Series]:
+    """Must-fix 4: discover `task{T}--ep{E}--invalid.json` markers written by the patched run_libero_eval.py.
+
+    Exits (never bypassable) on an unreadable marker, a marker whose content disagrees with its file name, a marker
+    for an episode index outside 0..expect_episodes-1, an episode that has both a marker and data files, or more
+    markers than --max-invalid. Appends to `problems` (bypassable with --allow-incomplete, like any incompleteness)
+    every episode 0..expect_episodes-1 of a task that has neither a completed .csv nor a marker.
+    Returns (one manifest record per invalid episode, `counts` with the invalid episodes added per task)."""
+    errors, invalid = [], []
+    for p in sorted(rollout_dir.glob("task*--ep*--invalid.json")):
+        m = INVALID_RE.match(p.name)
+        if not m:
+            continue
+        t, e = int(m.group(1)), int(m.group(2))
+        try:
+            rec = json.loads(p.read_text())
+        except (OSError, ValueError) as ex:
+            errors.append(f"{p.name}: unreadable marker ({ex})")
+            continue
+        if not isinstance(rec, dict) or rec.get("task_id") != t or rec.get("episode_idx") != e \
+                or not rec.get("exception_type"):
+            errors.append(f"{p.name}: content does not match the file name or has no exception_type")
+            continue
+        if not 0 <= e < expect_episodes:
+            errors.append(f"{p.name}: episode index outside 0..{expect_episodes - 1}")
+        data = sorted(q.name for q in rollout_dir.glob(f"task{t}--ep{e}--succ*"))
+        if data:
+            errors.append(f"{p.name}: episode has both an invalid marker and data files {data}")
+        invalid.append({"trajectory_id": f"libero_10/t{t:02d}/e{e:02d}", "task_id": t, "episode_idx": e,
+                        "exception_type": rec["exception_type"],
+                        "exception_message": str(rec.get("exception_message", ""))[:500],
+                        "step_index": rec.get("step_index"), "timestamp_utc": rec.get("timestamp_utc"),
+                        "marker": p.name})
+    if errors:
+        sys.exit("Inconsistent invalid-episode markers:\n  " + "\n  ".join(errors))
+    if max_invalid is not None and len(invalid) > max_invalid:
+        sys.exit(f"{len(invalid)} invalid episodes exceed --max-invalid {max_invalid}: "
+                 + ", ".join(f"{r['marker']} ({r['exception_type']})" for r in invalid))
+    done = set(zip(df.task_id.astype(int), df.episode_idx.astype(int)))
+    marked = {(r["task_id"], r["episode_idx"]) for r in invalid}
+    tasks = sorted({t for t, _ in done | marked})
+    unexplained = [f"task{t}--ep{e}" for t in tasks for e in range(expect_episodes) if (t, e) not in done | marked]
+    if unexplained:
+        problems.append(f"{len(unexplained)} episodes have neither a .csv nor an invalid marker, e.g. {unexplained[:5]}")
+    if invalid:
+        print(f"{len(invalid)} invalid episodes (excluded from the cache): "
+              + ", ".join(f"t{r['task_id']}/e{r['episode_idx']} {r['exception_type']}" for r in invalid))
+    per_task = pd.Series({t: sum(1 for tt, _ in marked if tt == t) for t, _ in marked}, dtype="int64")
+    return invalid, counts.add(per_task, fill_value=0).astype("int64")
+
+
 def make_splits(df: pd.DataFrame, unseen_tasks: list[int], seen_train_ratio: float, seed: int) -> dict[str, list[str]]:
     """Seen tasks: per task, stratified by outcome, `seen_train_ratio` to train and the rest to seen_val."""
     splits = {s: [] for s in SPLITS}
@@ -112,6 +168,7 @@ def main():
     ap.add_argument("--pools", nargs="+", help="Subset of poolings to export (default: all present)")
     ap.add_argument("--expect-tasks", type=int, default=10)
     ap.add_argument("--expect-episodes", type=int, default=50)
+    ap.add_argument("--max-invalid", type=int, help="Refuse to build if more episodes than this are invalid (default: no limit)")
     ap.add_argument("--allow-incomplete", action="store_true", help="For smoke tests only")
     ap.add_argument("--skip-checksums", action="store_true", help="For smoke tests only")
     ap.add_argument("--provenance-files", type=Path, nargs="*", default=[],
@@ -127,6 +184,7 @@ def main():
     # ---------- completeness ----------
     counts = df.groupby("task_id").size()
     problems = []
+    invalid, counts = account_invalid_episodes(args.rollout_dir, df, counts, args.expect_episodes, args.max_invalid, problems)
     if len(counts) != args.expect_tasks:
         problems.append(f"expected {args.expect_tasks} tasks, found {len(counts)}: {counts.index.tolist()}")
     short = counts[counts != args.expect_episodes]
@@ -317,6 +375,7 @@ def main():
             "label": "failure = 1 - episode_success (per trajectory)",
             "evaluation_horizon": "episodes.csv:task_min_step = SAFE per-task min rollout length (set_task_min_step)",
             "splits": summary,
+            "invalid_episodes": invalid,  # episodes that raised during collection; none of their data is in the cache
             "per_task": per_task,
             "warnings": warnings,
             "files": {k: {"sha256": v, "bytes": (out / k).stat().st_size} for k, v in checksums.items()},
