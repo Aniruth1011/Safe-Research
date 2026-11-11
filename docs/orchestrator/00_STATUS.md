@@ -40,9 +40,24 @@ Last updated: **2026-11-10** (orchestrator). Read this first; the other files in
 
 ## Blocked / waiting on Akash
 
-1. **Wave 1 approved (tasks 0–4, `friend`, hard stop at $28), but the `friend` Modal profile is not configured on
-   this Mac** (`modal profile list` shows only `akashrav`, 2026-11-11). Akash adds it himself; then: download (CPU),
-   image check, launch.
+1. **Task 2 rerun** (it ran on an NVIDIA A10G) and **wave 2** (tasks 5–9): workspace choice and approval.
+
+## Wave 1 result (`friend`, kit `8300892`, 2026-11-11 03:03–05:24 UTC)
+
+| Task | Outcome (success/failure) | Steps | Container h | Cost (measured) | GPU | Fingerprint |
+|---|---|---|---|---|---|---|
+| 0 | 32 / 18 | 19,386 | 1.98 | $2.62 | A10 | match |
+| 1 | 37 / 13 | 17,250 | 1.79 | $2.36 | A10 | match |
+| 2 | 26 / 24 | 19,875 | 2.29 | $3.04 | **A10G** | match |
+| 3 | 23 / 27 | 20,591 | 2.08 | $2.76 | A10 | match |
+| 4 | 17 / 33 | 21,296 | 2.17 | $2.87 | A10 | match |
+
+All 50/50 episodes per task, 0 invalid, 0 discarded, one uninterrupted attempt each. Failures always ran to the 520 cap.
+**Task 2 is not usable** (another GPU type): do not pull it; the puller and build_cache refuse it anyway. Modal served
+`gpu="A10"` with an A10G for 1 of 5 containers; the run-level guard missed it (simultaneous container start).
+Fixed in `6cb1781`: every container requires `NVIDIA A10` before touching outputs; the launcher re-requests.
+
+Spend: `friend` ~$13.9 (function time + start-up), upper bound $14.34 (watchdog). `akashrav` ≤ $0.55.
 
 ## Decisions (Akash, 2026-11-11)
 
@@ -88,7 +103,7 @@ Last updated: **2026-11-10** (orchestrator). Read this first; the other files in
 | Item | Spent | Notes |
 |---|---|---|
 | Modal (`akashrav`) | **≤ $0.54** of $30 | Smoke test, 2026-11-11 (upper bound) |
-| Modal (`friend`) | $0.00 of $30 | Full run planned here |
+| Modal (`friend`) | ~$13.9 (≤ $14.34) of $30 | Wave 1, tasks 0–4, 2026-11-11 |
 | CARC | 0 SU by the orchestrator | No CARC jobs will be submitted |
 
 ## Contradictions and surprises (2026-11-10)
