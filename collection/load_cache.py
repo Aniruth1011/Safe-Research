@@ -32,6 +32,7 @@ class SharedCache:
         self.root = Path(root)
         self.manifest = json.loads((self.root / "manifest.json").read_text())
         self.episodes = pd.read_csv(self.root / "episodes.csv")
+        self.layer_names = manifest_layer_names(self.manifest)  # one name per layer index (33 or 34)
         self._mm: dict = {}
 
     def _array(self, pool: str, split: str, layer: int) -> np.ndarray:
@@ -58,6 +59,9 @@ class SharedCache:
             raise ValueError(f"split must be one of {SPLITS}")
         if split == "unseen_test" and not allow_unseen:
             raise PermissionError("unseen_test is locked until the final benchmark (Exp 37); pass allow_unseen=True only then")
+        bad = [l for l in layers if not 0 <= l < len(self.layer_names)]
+        if bad:
+            raise ValueError(f"layers {bad} not in this cache (indices 0..{len(self.layer_names) - 1}: {self.layer_names[-1]})")
         arrays = [self._array(pool, split, l) for l in layers]
         mean = std = None
         if normalize:
@@ -79,6 +83,15 @@ class SharedCache:
         return out
 
 
+def manifest_layer_names(manifest: dict) -> list[str]:
+    """`layer_names` from the manifest; caches built before that key existed use the legacy 33-layer convention."""
+    if "layer_names" in manifest:
+        return list(manifest["layer_names"])
+    if manifest.get("num_hidden_states", 33) != 33:
+        raise ValueError(f"manifest has no layer_names but {manifest['num_hidden_states']} layers")
+    return ["emb"] + [f"block{i:02d}" for i in range(1, 32)] + ["block32_postnorm"]
+
+
 def export(cache_root: Path, out: Path, layers: list[int], pool: str, splits: list[str], normalize: bool,
            allow_unseen: bool = False):
     try:
@@ -93,7 +106,8 @@ def export(cache_root: Path, out: Path, layers: list[int], pool: str, splits: li
             backbone=m["backbone"], checkpoint=m["checkpoint"], dataset=m["dataset"],
             split_version=f"{m['cache_version']}:{split}", layers=tuple(layers),
             pooling=pool + ("+trainnorm" if normalize else ""), dtype="float32",
-            layer_indexing="hf_hidden_states(0=embeddings,32=final)", num_layers=m["num_hidden_states"],
+            layer_indexing="hf_hidden_states(0=embeddings,32=final)" + (",33=block32_prenorm" if len(cache.layer_names) == 34 else ""),
+            num_layers=len(cache.layer_names),
         )
         FeatureStore(out / split).save(recs, meta)
         print(f"{split}: {len(recs)} trajectories -> {out / split}")
