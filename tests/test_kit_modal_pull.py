@@ -32,7 +32,8 @@ rm -rf "$dst"; mkdir -p "$(dirname "$dst")"; cp -R "$src" "$dst"
 """
 
 
-def make_task(vol: Path, profile: str, t: int, status="complete", gpu="NVIDIA A10", invalid=(), drop=(), meta_profile=None):
+def make_task(vol: Path, profile: str, t: int, status="complete", gpu="NVIDIA A10", invalid=(), drop=(), meta_profile=None,
+              attempts=({"first_episode": 0, "engineering_resume": False},)):
     tdir = vol / profile / "rollouts" / RUN / f"task{t:02d}"
     ep = tdir / "libero_10"
     (ep / "provenance").mkdir(parents=True)
@@ -49,7 +50,8 @@ def make_task(vol: Path, profile: str, t: int, status="complete", gpu="NVIDIA A1
         lines.append(f"{hashlib.sha256(f.read_bytes()).hexdigest()}  {f.relative_to(tdir)}")
     (tdir / "SHA256SUMS").write_text("\n".join(lines) + "\n")
     (tdir / "TASK_META.json").write_text(json.dumps({"task": t, "status": status, "gpu_name": gpu,
-                                                     "workspace_profile": meta_profile or profile}))
+                                                     "workspace_profile": meta_profile or profile,
+                                                     "attempts": list(attempts)}))
     work = vol / profile / "work"
     (work / "image_provenance").mkdir(parents=True, exist_ok=True)
     (work / "image_provenance" / "pip_freeze.txt").write_text("torch==2.2.0+cu121\n")
@@ -91,6 +93,11 @@ def test_complete_tasks_are_verified_and_moved_into_place(env, tmp_path):
     (dict(gpu="NVIDIA L4"), "gpu_name"),
     (dict(drop={(1, "layers.pt")}), "ep1: incomplete"),
     (dict(meta_profile="akashrav"), "written by profile"),
+    # dataset policy 2026-11-11: one uninterrupted attempt from episode 0, never resumed
+    (dict(attempts=({"first_episode": 0}, {"first_episode": 17})), "not one uninterrupted attempt"),
+    (dict(attempts=({"first_episode": 17},)), "not one uninterrupted attempt"),
+    (dict(attempts=({"first_episode": 0, "engineering_resume": True},)), "not one uninterrupted attempt"),
+    (dict(status="engineering-complete"), "status is 'engineering-complete'"),
 ])
 def test_unusable_tasks_are_refused_and_not_moved(env, tmp_path, kw, needle):
     make_task(tmp_path / "vol", "friend", 3, **kw)

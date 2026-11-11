@@ -264,7 +264,7 @@ app = modal.App(APP_NAME, image=image)
 # ----------------------------------------------------------------------------------------------------------------
 # Helpers (run inside containers)
 # ----------------------------------------------------------------------------------------------------------------
-def rollout_args(ckpt: str, task_id: int, episodes: int, save_root: str, run_note: str) -> list[str]:
+def rollout_args(ckpt: str, task_id: int, episodes: int, save_root: str, run_note: str, resume: bool = False) -> list[str]:
     """SAFE's run_libero_eval.py with SAFE's settings + the kit's all-layer capture. Same flags as smoke_test.sh."""
     return [
         "python", "experiments/robot/libero/run_libero_eval.py",
@@ -279,7 +279,7 @@ def rollout_args(ckpt: str, task_id: int, episodes: int, save_root: str, run_not
         "--task_start_index", str(task_id),
         "--task_end_index", str(task_id),
         "--num_trials_per_task", str(episodes),
-        "--resume", "True",
+        "--resume", "True" if resume else "False",  # dataset runs: never (one uninterrupted process per task)
         "--seed", str(SEED),
         "--use_wandb", "False",
         "--save_logs", "True",
@@ -455,16 +455,44 @@ def write_sha256sums(tdir: Path) -> int:
     return len(lines)
 
 
+DISCARD_REASONS = {
+    "running": "previous attempt never finished (container stopped: Modal preemption/restart, timeout, credit limit or kill)",
+    "partial": "previous attempt ended with missing episodes",
+    "failed": "previous attempt failed",
+    "engineering-complete": "engineering (resumed) output is never part of the dataset",
+    None: "outputs present without TASK_META",
+}
+
+
+def discard_partial(tdir: Path, discard_dir: Path, reason: str, utc: str) -> dict | None:
+    """Move a task's partial outputs (libero_10/, SHA256SUMS, a copy of TASK_META.json) to discard_dir. Never deletes.
+    Returns the record for TASK_META["discarded_attempts"], or None if there was nothing to move."""
+    import shutil
+    items = [n for n in ("libero_10", "SHA256SUMS") if (tdir / n).exists()]
+    if not items:
+        return None
+    discard_dir.mkdir(parents=True, exist_ok=False)
+    files = sum(1 for p in (tdir / "libero_10").rglob("*") if p.is_file()) if (tdir / "libero_10").exists() else 0
+    for n in items:
+        shutil.move(str(tdir / n), str(discard_dir / n))
+    if (tdir / "TASK_META.json").exists():
+        shutil.copy2(tdir / "TASK_META.json", discard_dir / "TASK_META.json")
+    return {"discarded_utc": utc, "moved_to": str(discard_dir), "reason": reason, "files_moved": files}
+
+
 @app.function(gpu=GPU, volumes=VOLUMES, timeout=ROLLOUT_TIMEOUT_S, cpu=ROLLOUT_CPU_CORES, memory=ROLLOUT_MEMORY_MIB,
               max_containers=WAVE_SIZE)
 def rollout_task(task_id: int, workspace_profile: str, kit_commit: str, episodes: int = EPISODES_PER_TASK,
-                 run_note: str = RUN_NOTE) -> dict:
-    """One LIBERO-10 task (50 episodes, seed 7, --resume) on one A10, into its own folder rollouts/<run>/taskNN/.
+                 run_note: str = RUN_NOTE, engineering_resume: bool = False) -> dict:
+    """One LIBERO-10 task (50 episodes, seed 7) on one A10, into its own folder rollouts/<run>/taskNN/.
 
-    TASK_META.json is written when the task starts (status "running") and updated when it ends ("complete" when every
-    episode has its files or an invalid marker, else "partial"/"failed"). A container killed by its timeout or by a
-    credit limit leaves "running": such a task is NOT pulled, and is rerun from scratch in the other workspace.
-    Every attempt records workspace, GPU, container and seconds (for spend and provenance)."""
+    Dataset policy (Akash, 2026-11-11): every task runs as ONE uninterrupted process, episodes 0-49 in order, because
+    an episode's trajectory depends on the episodes before it in the same process (smoke test 2026-11-11). So any
+    partial output found at start, from an earlier attempt, a Modal preemption/restart of this same input, a timeout
+    or a credit limit, is moved to rollouts/<run>/_discarded/taskNN-<utc>/ (never deleted) and the task restarts at
+    episode 0 without --resume. TASK_META.json records every discarded attempt and why.
+    `engineering_resume=True` keeps partial output and passes --resume: engineering only. The dataset launcher never
+    sets it, and its output is marked "engineering-complete", which the CARC puller and the cache build refuse."""
     assert 0 <= task_id < N_TASKS, task_id
     tdir = task_dir(run_note, task_id)
     tdir.mkdir(parents=True, exist_ok=True)
@@ -480,15 +508,26 @@ def rollout_task(task_id: int, workspace_profile: str, kit_commit: str, episodes
     if validation is None:
         raise RuntimeError(f"image {fp[:16]} (Modal {image_id}) has not passed a full smoke test; run "
                            "`modal run collection/modal_app.py::smoke --full` in this workspace first")
-    if meta.get("image_fingerprint") not in (None, fp):
-        raise RuntimeError(f"task {task_id} was started on image {meta['image_fingerprint'][:16]}, now {fp[:16]}: "
-                           "a task runs on one image; rerun it from scratch on the validated image")
+    if engineering_resume and meta.get("image_fingerprint") not in (None, fp):
+        raise RuntimeError(f"task {task_id} was started on image {meta['image_fingerprint'][:16]}, now {fp[:16]}")
     _guard_one_environment(run_note)
     gpu = _gpu_name()
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    if not engineering_resume:
+        reason = DISCARD_REASONS.get(meta.get("status"), f"previous status {meta.get('status')!r}")
+        rec = discard_partial(tdir, Path(ROLLOUT_ROOT, run_note, "_discarded", f"task{task_id:02d}-{now.replace(':', '')}"),
+                              reason, now)
+        if rec or meta.get("attempts"):
+            rec = rec or {"discarded_utc": now, "moved_to": None, "reason": reason, "files_moved": 0}
+            meta.setdefault("discarded_attempts", []).append({**rec, "attempts": meta.get("attempts", []),
+                                                              "previous_status": meta.get("status")})
+            meta["attempts"] = []
+            data_volume.commit()
     done_before = episode_accounting(tdir / "libero_10", task_id, episodes)
-    attempt = {"container_id": os.environ.get("MODAL_TASK_ID"), "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-               # episodes from here on ran in a new process (a resume): the smoke test showed that changes trajectories
+    attempt = {"container_id": os.environ.get("MODAL_TASK_ID"), "started_utc": now,
+               # 0 for every dataset attempt; > 0 only for an engineering resume
                "first_episode": done_before["complete"] + len(done_before["invalid"]),
+               "engineering_resume": engineering_resume,
                "workspace_profile": workspace_profile, "gpu_name": gpu, "kit_commit": kit_commit}
     attempt["modal_image_id"] = image_id
     meta.update({"task": task_id, "run_note": run_note, "workspace_profile": workspace_profile, "gpu_name": gpu,
@@ -497,13 +536,16 @@ def rollout_task(task_id: int, workspace_profile: str, kit_commit: str, episodes
                  "smoke_validation": {k: validation.get(k) for k in ("source", "workspace_profile", "passed_utc",
                                                                      "modal_image_id", "kit_commit")},
                  "episodes_expected": episodes, "timeout_s": ROLLOUT_TIMEOUT_S, "cpu_cores": ROLLOUT_CPU_CORES,
-                 "memory_mib": ROLLOUT_MEMORY_MIB, "status": "running"})
+                 "memory_mib": ROLLOUT_MEMORY_MIB, "status": "running",
+                 "dataset_policy": "engineering resume (not dataset)" if engineering_resume
+                 else "uninterrupted: episodes 0-49 in one process, no --resume"})
     meta.setdefault("attempts", []).append(attempt)
     _write_json_atomic(meta_path, meta)
     data_volume.commit()
     t0, error = time.time(), None
     try:
-        _run(rollout_args(_checkpoint(), task_id, episodes, str(tdir.parent), tdir.name), cwd=OPENVLA_DIR, env=OFFLINE)
+        _run(rollout_args(_checkpoint(), task_id, episodes, str(tdir.parent), tdir.name, resume=engineering_resume),
+             cwd=OPENVLA_DIR, env=OFFLINE)
     except subprocess.CalledProcessError as e:
         error = f"run_libero_eval.py exited with {e.returncode}"
     finally:
@@ -511,8 +553,9 @@ def rollout_task(task_id: int, workspace_profile: str, kit_commit: str, episodes
         done = not acct["missing"] and error is None
         attempt.update({"finished_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                         "seconds": round(time.time() - t0), "error": error})
+        status = ("engineering-complete" if engineering_resume else "complete") if done else ("failed" if error else "partial")
         meta.update({"episodes_complete": acct["complete"], "episodes_invalid": acct["invalid"],
-                     "episodes_missing": acct["missing"], "status": "complete" if done else ("failed" if error else "partial")})
+                     "episodes_missing": acct["missing"], "status": status})
         if done:
             meta["sha256sums_files"] = write_sha256sums(tdir)
         _write_json_atomic(meta_path, meta)
@@ -627,7 +670,7 @@ def _launch_context() -> tuple[str, str]:
 
 @app.local_entrypoint()
 def rollouts(confirm_full_run: bool = False, tasks: str = "", sec_per_episode: float = 0.0,
-             run_note: str = RUN_NOTE):
+             run_note: str = RUN_NOTE, restart_stale: bool = False):
     """Launch ONE wave (at most WAVE_SIZE tasks), e.g. MODAL_PROFILE=friend modal run --detach
     collection/modal_app.py::rollouts --tasks 0-4 --sec-per-episode <smoke> --confirm-full-run"""
     if not tasks:
@@ -650,8 +693,19 @@ def rollouts(confirm_full_run: bool = False, tasks: str = "", sec_per_episode: f
                          "first (needs Akash's OK for the spend). No GPU was started.")
     print(f"Image {img['image_fingerprint'][:16]} validated by smoke test: {img['smoke_validation']['source']}, "
           f"{img['smoke_validation'].get('passed_utc')}")
+    states = {m["task"]: m.get("status") for m in task_status.remote(run_note)}
+    running = [t for t in task_ids if states.get(t) == "running"]
+    if running and not restart_stale:
+        raise SystemExit(f"Tasks {running} are marked 'running' in workspace {profile}. If `modal app list` shows no app "
+                         "still running them, relaunch with --restart-stale: their partial outputs are moved to "
+                         "_discarded/ and they restart at episode 0. No GPU was started.")
+    skipped = [t for t in task_ids if states.get(t) == "complete"]
+    if skipped:
+        print(f"Already complete, not relaunched: {skipped}")
+        task_ids = [t for t in task_ids if t not in skipped]
     for res in rollout_task.map(task_ids, kwargs={"run_note": run_note, "workspace_profile": profile,
-                                                  "kit_commit": commit}, return_exceptions=True):
+                                                  "kit_commit": commit}, return_exceptions=True,
+                                 order_outputs=False):
         print(res if isinstance(res, Exception) else
               {k: res.get(k) for k in ("task", "status", "episodes_complete", "episodes_invalid", "episodes_missing")})
     print(spend_report(task_status.remote(run_note)))
@@ -666,7 +720,7 @@ def spend_report(metas: list[dict]) -> str:
     done_hours = []
     for m in metas:
         secs_by_ws: dict[str, float] = {}
-        for a in m.get("attempts", []):
+        for a in m.get("attempts", []) + [x for d in m.get("discarded_attempts", []) for x in d.get("attempts", [])]:
             secs = a.get("seconds")
             if secs is None and a.get("started_utc"):  # still running or killed: count up to now (upper bound)
                 secs = time.time() - calendar.timegm(time.strptime(a["started_utc"], "%Y-%m-%dT%H:%M:%SZ"))

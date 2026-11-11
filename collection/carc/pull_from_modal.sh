@@ -62,6 +62,10 @@ problems = []
 if meta.get("task") != t: problems.append(f"TASK_META task {meta.get('task')} != {t}")
 if meta.get("status") != "complete": problems.append(f"status is {meta.get('status')!r}, not 'complete'")
 if meta.get("gpu_name") != gpu: problems.append(f"gpu_name {meta.get('gpu_name')!r} != {gpu!r}")
+atts = meta.get("attempts", [])
+if len(atts) != 1 or atts[0].get("first_episode") != 0 or atts[0].get("engineering_resume"):
+    problems.append(f"not one uninterrupted attempt from episode 0 (attempts: "
+                    f"{[(a.get('first_episode'), a.get('engineering_resume')) for a in atts]})")
 if meta.get("workspace_profile") != profile:
     problems.append(f"written by profile {meta.get('workspace_profile')!r}, pulled with {profile!r}")
 ep_dir = d / "libero_10"

@@ -217,12 +217,12 @@ def _helpers(**consts):
     import calendar, hashlib, json as _json, os as _os, time as _time  # noqa: F401,E401
     tree = _ast.parse(_src())
     names = {"usd_per_container_hour", "task_dir", "episode_accounting", "write_sha256sums", "spend_report",
-             "image_fingerprint"}
+             "image_fingerprint", "discard_partial", "rollout_args"}
     ns = {"Path": Path, "json": _json, "os": _os, "time": _time, "calendar": calendar,
           "A10_USD_PER_HOUR": 0.000306 * 3600, "CPU_USD_PER_CORE_HOUR": 0.0000131 * 3600,
           "RAM_USD_PER_GIB_HOUR": 0.00000222 * 3600, "ROLLOUT_CPU_CORES": 2.0, "ROLLOUT_MEMORY_MIB": 16384,
           "CONTAINER_OVERHEAD_S": 180, "ROLLOUT_ROOT": "/vol/data/rollouts",
-          "FINGERPRINT_FILE": "image_fingerprint.txt", **consts}
+          "FINGERPRINT_FILE": "image_fingerprint.txt", "POOLING": "mean,first,last", "SEED": 7, **consts}
     code = [n for n in tree.body if isinstance(n, _ast.FunctionDef) and n.name in names]
     exec(compile(_ast.Module(body=code, type_ignores=[]), "modal_app_helpers", "exec"), ns)
     return ns
@@ -294,7 +294,8 @@ def test_full_run_requires_a_smoke_validated_image():
     body = src[src.index("def rollout_task("):src.index("def task_status(")]
     assert "if validation is None:" in body and "raise RuntimeError" in body
     assert '"image_fingerprint": fp, "modal_image_id": image_id' in body
-    assert "a task runs on one image" in body
+    # a task never spans two images: dataset attempts discard any earlier partial output; engineering resumes refuse
+    assert 'if engineering_resume and meta.get("image_fingerprint") not in (None, fp):' in body
     # the launcher checks on CPU before any GPU starts
     launch = src[src.index("def rollouts("):src.index("def spend_report(")]
     assert launch.index("image_check.remote()") < launch.index("rollout_task.map(")
@@ -306,3 +307,44 @@ def test_smoke_validated_image_is_committed():
     (fp, r), = rec.items()
     assert len(fp) == 64 and r["full"] is True and r["gpu_name"] == "NVIDIA A10"
     assert r["modal_image_id"].startswith("im-") and len(r["kit_commit"]) == 40
+
+
+# ---------------------------------------------------------------- dataset policy: uninterrupted tasks (2026-11-11)
+def test_dataset_runs_never_resume():
+    h = _helpers()
+    args = h["rollout_args"]("ckpt", 1, 50, "/r", "task01")
+    assert args[args.index("--resume") + 1] == "False"
+    assert h["rollout_args"]("ckpt", 1, 50, "/r", "task01", resume=True)[args.index("--resume") + 1] == "True"
+    src = _src()
+    launch = src[src.index("def rollouts("):src.index("def spend_report(")]
+    assert "engineering_resume" not in launch                       # the dataset launcher can never set it
+    body = src[src.index("def rollout_task("):src.index("def task_status(")]
+    assert "resume=engineering_resume" in body and "engineering_resume: bool = False" in body
+    assert '"engineering-complete" if engineering_resume else "complete"' in body
+    assert "if not engineering_resume:" in body and "discard_partial(" in body
+    assert "restart_stale" in launch and "order_outputs=False" in launch
+
+
+def test_partial_outputs_are_moved_never_deleted(tmp_path):
+    h = _helpers()
+    tdir = tmp_path / "rollouts" / "run" / "task03"
+    ep = tdir / "libero_10"
+    (ep / "provenance").mkdir(parents=True)
+    for name in ("task3--ep0--succ1.csv", "task3--ep0--succ1.pkl", "task3--ep0--succ1.layers.pt", "task3--ep1--succ0.mp4"):
+        (ep / name).write_text(name)
+    (tdir / "TASK_META.json").write_text('{"status": "running"}')
+    dst = tmp_path / "rollouts" / "run" / "_discarded" / "task03-20261111T030000Z"
+    rec = h["discard_partial"](tdir, dst, "preempted", "2026-11-11T03:00:00Z")
+    assert rec == {"discarded_utc": "2026-11-11T03:00:00Z", "moved_to": str(dst), "reason": "preempted", "files_moved": 4}
+    assert not ep.exists() and sorted(p.name for p in (dst / "libero_10").iterdir()) == [
+        "provenance", "task3--ep0--succ1.csv", "task3--ep0--succ1.layers.pt", "task3--ep0--succ1.pkl", "task3--ep1--succ0.mp4"]
+    assert (dst / "TASK_META.json").exists() and (tdir / "TASK_META.json").exists()   # copied, history kept
+    assert h["discard_partial"](tdir, tmp_path / "again", "x", "t") is None            # nothing left to move
+
+
+def test_spend_counts_discarded_attempts():
+    h = _helpers()
+    metas = [{"task": 0, "status": "complete", "workspace_profile": "friend", "gpu_name": "NVIDIA A10",
+              "episodes_complete": 50, "episodes_invalid": [], "attempts": [{"workspace_profile": "friend", "seconds": 3420}],
+              "discarded_attempts": [{"attempts": [{"workspace_profile": "friend", "seconds": 3420}]}]}]
+    assert "workspace friend: ~$2.65" in h["spend_report"](metas)   # 2 x (3420 + 180) s at $1.3238/h
