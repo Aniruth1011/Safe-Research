@@ -63,6 +63,10 @@ MODAL_PROFILE=friend modal run --detach collection/modal_app.py::rollouts \
   process. Task 1 episode 1 failed at 520 steps when started in a fresh process after a resume, and succeeded in 268
   steps when run right after episode 0. Actions diverged at step 62, identically in both smoke attempts.
 
+- **One exact GPU:** Modal may serve `gpu="A10"` with an NVIDIA A10G (wave 1: 1 of 5 containers). Every container
+  now refuses anything but `NVIDIA A10` before touching outputs, and the launcher re-requests up to 6 times. A task
+  that completed on another GPU is rerun from episode 0; its old output is moved to `_discarded/`.
+
 ## 4. Check spend (after every wave, before asking for the next)
 
 - `MODAL_PROFILE=friend modal run collection/modal_app.py::status` prints per task: status, episodes, invalid,
