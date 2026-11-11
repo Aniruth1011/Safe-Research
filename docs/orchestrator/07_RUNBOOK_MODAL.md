@@ -46,15 +46,22 @@ MODAL_PROFILE=friend modal run --detach collection/modal_app.py::rollouts \
 - The launch refuses without `MODAL_PROFILE` or from a modified tree, and prints the cost estimate first.
 - Each task writes `rollouts/all-layers-v1/taskNN/` in that workspace's Volume: SAFE's files, `.layers.pt`, invalid
   markers, `TASK_META.json` (workspace, GPU, kit commit, every attempt's container and seconds) and, once complete,
-  `SHA256SUMS`. Relaunching the same tasks in the same workspace resumes them (`--resume`).
+  `SHA256SUMS`.
+- **Every task runs as one uninterrupted process, episodes 0–49 in order, never resumed** (Akash, 2026-11-11). At
+  start, any partial output for that task (an earlier attempt, a Modal preemption/restart, a timeout, a credit limit)
+  is moved to `rollouts/all-layers-v1/_discarded/taskNN-<utc>/` (never deleted), and the task restarts at episode 0.
+  `TASK_META.json` lists every discarded attempt, why, and its container time (it counts toward spend). The launcher
+  refuses a task still marked `running` unless you check `modal app list` and pass `--restart-stale`. Resume exists
+  only as the engineering flag `rollout_task(engineering_resume=True)`, which the launcher never sets; that output is
+  `engineering-complete` and is never pulled.
 - Timeout per task = 1.5 × the worst-case task time measured in the smoke test: 1.5 × (30 s + 50 × 191.6 s) =
   14,415 s (4.0 h). Expected per task, from the smoke measurements: 1.4–2.7 container-hours (all-success to
   all-failure), about **$1.80–3.50 per task, $9–18 per wave of 5**; if every container hit the timeout, about $27 per wave.
 - Use `--sec-per-episode 152` for the launch estimate. That figure is an estimate: 0.363 s/step at about 400 steps per
   episode, assuming the published ~54% LIBERO-10 success rate.
-- **Resume changes trajectories** (smoke test, 2026-11-11): an episode run in a fresh process after `--resume` can
-  differ from the same episode run right after the previous one. Each attempt in `TASK_META.json` records its
-  `first_episode`. Report any resumed task to Akash.
+- **Why no resume** (smoke test, 2026-11-11): an episode's trajectory depends on the episodes before it in the same
+  process. Task 1 episode 1 failed at 520 steps when started in a fresh process after a resume, and succeeded in 268
+  steps when run right after episode 0. Actions diverged at step 62, identically in both smoke attempts.
 
 ## 4. Check spend (after every wave, before asking for the next)
 
@@ -88,8 +95,8 @@ checks invalid markers) and `check_cache.py verify`. Then tell Akash; only after
    which. Do not relaunch in that workspace.
 2. Pull the tasks that **are** complete from that workspace (section 5). The puller refuses the unfinished ones.
 3. In the other workspace: run section 2 (download, image check) if not done yet, then launch **only the unfinished
-   tasks**, e.g. `--tasks 7,9`. They start from scratch there (each workspace has its own Volume). A task is never
-   continued across workspaces; `rollout_task` refuses that.
+   tasks**, e.g. `--tasks 7,9`. They start from episode 0 there (each workspace has its own Volume). A task is never
+   continued, in any workspace.
 4. Pull them from the other profile. Each task's `TASK_META.json` records the workspace and GPU that produced it, and
    the cache manifest keeps all of them. The kit's mixing guard still requires A10 everywhere.
 5. Leave the abandoned partial files in the old Volume until Akash confirms the CARC cache verified.
