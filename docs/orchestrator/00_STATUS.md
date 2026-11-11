@@ -126,7 +126,9 @@ Spend: `friend` ~$13.9 (function time + start-up), upper bound $14.34 (watchdog)
 ## Next
 
 1. Team: confirm read access to the cache on CARC (it is under Akash's `/scratch1`; copy to `/project2/<group>` if needed).
-2. After PR #3 merges: delete the fork's `backup/extraction-pre-rebase-2026-11-10`.
+2. Depth sweep R1–R4 is prepared (CPU only, not submitted): [`08_DEPTH_SWEEP.md`](08_DEPTH_SWEEP.md). Its probe and
+   metric are TEMPORARY until B6 (probe spec) and B4 (evaluator) land. Submitting needs Akash's OK.
+3. After PR #3 merges: delete the fork's `backup/extraction-pre-rebase-2026-11-10`.
 
 ## Budget
 
