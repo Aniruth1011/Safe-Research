@@ -8,7 +8,10 @@
 #SBATCH --output=logs/%x-%j.out
 # CPU-only. Pulls finished tasks from a Modal Volume into /scratch1/<user>/rollouts/<run>/taskNN and verifies them
 # (checksums, 50 episodes or listed invalid markers, A10, written by that profile). Never run on a login node.
-#   sbatch --account=<account> --export=ALL,PROFILE=friend,TASKS=0-4 carc/04_pull_from_modal.slurm
+#   export PROFILE=friend TASKS=0,1,3,4 MODAL_BIN=<path to your modal CLI>
+#   sbatch --account=<account> --export=ALL carc/04_pull_from_modal.slurm
+# Set the variables in the shell and pass only --export=ALL: sbatch --export splits its value on commas, so
+# --export=ALL,TASKS=0,1,3,4 would deliver only TASKS=0.
 # Needs the Modal CLI (MODAL_BIN or `modal` on PATH) with the profile configured. Nothing on Modal is deleted.
 set -euo pipefail
 source carc/config.sh
