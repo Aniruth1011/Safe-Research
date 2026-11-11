@@ -8,8 +8,8 @@ Last updated: **2026-11-10** (orchestrator). Read this first; the other files in
 |---|---|---|
 | 0a | Git cleanup (plan row G0) | **Done and pushed 2026-11-10** |
 | 0 | Understanding pack (`01`–`06` in this folder) | **Done 2026-11-10** |
-| 1 | The five kit fixes, as a follow-up PR | **Integrated and tested 2026-11-10; waiting for Akash's OK to open the PR** |
-| 2 | Modal smoke test (≤ $3) | Not started. Needs Phase 1 + Akash's approval |
+| 1 | The five kit fixes, as a follow-up PR | **Draft PR [#3](https://github.com/Aniruth1011/Safe-Research/pull/3) open (2026-11-10).** Ready for review only after the smoke test passes |
+| 2 | Modal smoke test (≤ $3) | Estimate sent to Akash 2026-11-10; waiting for approval |
 | 3 | Full collection (500 episodes) | Out of scope until Akash approves, the team answers the checklist, and the fix PR is merged |
 
 ## Done
@@ -40,23 +40,24 @@ Last updated: **2026-11-10** (orchestrator). Read this first; the other files in
 
 ## Blocked / waiting on Akash
 
-1. **IDs in public git history (found 2026-11-10 by D4).** The CARC account ID and user name are in files that were
-   public on the fork BEFORE today: `docs/env/env_freeze.txt`, the two archived pilot docs (Safe-Research), and
-   `experiments/robot/libero/{slurm/collect_task.sbatch,audit_collection.py}` (OpenVLA `akash/collector` = tag
-   `archive/collector-2026-11`). The tip of `akash/extraction` is scrubbed (`7ef726d`, pushed). Old commits, the fork
-   `backup/extraction-pre-rebase-2026-11-10` branch and the collector branch/tag still contain them. Removing them
-   needs a history rewrite + force-push / delete (Akash's decision). `main` and `akash/kit-fixes` are clean.
-2. **Budget headroom (D4's estimate, not measured).** Top of the A10 range is ~$26–28 for the full run; with the
-   ≤ $3 smoke test this crosses the $25 stop-and-ask line, and the worst case touches the $30 ceiling. Image builds,
-   Volume storage and the CPU cache build are not counted. The smoke test (A5/A6) must settle this before A8.
+1. Approval of the smoke-test spend (estimate sent 2026-11-10).
 
-3. **Gate: open the fix PR** (`akash-ravi:akash/kit-fixes` → `Aniruth1011/Safe-Research:main`). Draft description ready.
+## Decisions (Akash, 2026-11-10)
+
+- **PR #3** stays a draft until the Modal smoke test passes; then add the smoke results to it and mark it ready. Mention
+  only `@Aniruth1011`; do not tag Rhea.
+- **No history rewrite.** The CARC account ID and user name are not credentials; rewriting shared history is riskier.
+  **Delete the fork's `backup/extraction-pre-rebase-2026-11-10` after PR #3 merges.**
+- **Full-run budget plan:** recheck the A10 price (done: $0.000306/s ~ $1.10/h, 2026-11-10); set each task function's
+  timeout to the measured smoke timing x 1.5 (not 4 h); run the collection in **two waves of 5 tasks** and report spend
+  after wave 1; if the projected total exceeds what is left of the $30, stop and ask (Akash will switch to a teammate's
+  workspace for the rest).
 
 ## Next
 
-1. Review and integrate the subagents' work; run every test on Python 3.10.
-2. Gate: all tests pass → ask Akash to approve opening the fix PR (tag Rhea and Aniruth).
-3. Phase 2 estimate and approval request for the Modal smoke test.
+1. On approval: run `download_model`, then the full smoke test (`--full`); report results and actual spend.
+2. Smoke passes → set the rollout timeout from it, add results to PR #3, mark it ready for review.
+3. Full collection (A8) still needs: PR #3 merged, the team's checklist answers, and Akash's approval of wave 1.
 
 ## Budget
 
