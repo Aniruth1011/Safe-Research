@@ -8,8 +8,8 @@ Last updated: **2026-11-10** (orchestrator). Read this first; the other files in
 |---|---|---|
 | 0a | Git cleanup (plan row G0) | **Done and pushed 2026-11-10** |
 | 0 | Understanding pack (`01`–`06` in this folder) | **Done 2026-11-10** |
-| 1 | The five kit fixes, as a follow-up PR | **Draft PR [#3](https://github.com/Aniruth1011/Safe-Research/pull/3) open (2026-11-10).** Ready for review only after the smoke test passes |
-| 2 | Modal smoke test (≤ $3) | Estimate sent to Akash 2026-11-10; waiting for approval |
+| 1 | The five kit fixes, as a follow-up PR | **PR [#3](https://github.com/Aniruth1011/Safe-Research/pull/3) ready for review (2026-11-11)**, head `90f8007` |
+| 2 | Modal smoke test (≤ $3) | **PASSED 2026-11-11** on A10 (`akashrav`), image `0f65545c…` validated. Spend ≤ $0.54 |
 | 3 | Full collection (500 episodes) | Out of scope until Akash approves, the team answers the checklist, and the fix PR is merged |
 
 ## Done
@@ -40,7 +40,21 @@ Last updated: **2026-11-10** (orchestrator). Read this first; the other files in
 
 ## Blocked / waiting on Akash
 
-1. Approval of the smoke-test spend (estimate sent 2026-11-10).
+1. Approval of **wave 1** (tasks 0–4) in the `friend` workspace. Measured range $9–18; about $14 expected.
+2. Whether a task interrupted mid-run should be resumed or rerun from scratch, since resuming changes trajectories
+   (smoke finding). Also asked on PR #3.
+
+## Smoke test result (Modal A10, 2026-11-11, kit `99adba5`, task 1, `--full`)
+
+- Checks: environment (pins, flash-attn, EGL, LIBERO) pass; model load pass (7.9 s, 14.09 GiB, `flash_attention_2`);
+  rollout + resume pass; capture 2/2 pass; repeat + `compare-runs` ran (1 flip, explained by resume); tiny build + verify
+  pass (108 files).
+- **MEASURED (A10):** 0.363 s/step (520-step episode); 98.5–191.6 s per episode (268–520 steps); peak GPU memory
+  16,301 MiB (`nvidia-smi`); `.layers.pt` 0.836 MB/step; ~0.89 MB/step for all files. About 1.2× the A40's s/step.
+- First attempt failed on a kit bug (torch 2.2 `mmap` needs a `str` path); fixed and retried once, as approved.
+- **Spend (akashrav), upper bounds from container lifetimes × published rates:** ≤ $0.54. Compare with the dashboard.
+- Image builder pinned to 2025.06 (2026.10 rejects Python 3.10). Validated image fingerprint
+  `0f65545c78b2372a4765db3ba616b759e5c5529e5daceda31cd2eea05dc9faf7`, committed in `collection/smoke_validated_images.json`.
 
 ## Decisions (Akash, 2026-11-10)
 
@@ -63,7 +77,8 @@ Last updated: **2026-11-10** (orchestrator). Read this first; the other files in
 
 | Item | Spent | Notes |
 |---|---|---|
-| Modal | **$0.00** of $30 | Nothing launched. Stop-and-ask line: $25 |
+| Modal (`akashrav`) | **≤ $0.54** of $30 | Smoke test, 2026-11-11 (upper bound) |
+| Modal (`friend`) | $0.00 of $30 | Full run planned here |
 | CARC | 0 SU by the orchestrator | No CARC jobs will be submitted |
 
 ## Contradictions and surprises (2026-11-10)
