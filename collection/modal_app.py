@@ -319,6 +319,12 @@ def download_model() -> str:
     if old and old != snap:
         raise RuntimeError(f"checkpoint snapshot changed ({old} -> {snap}); one checkpoint for the whole dataset")
     Path(CHECKPOINT_PATH_FILE).write_text(snap + "\n")
+    # This workspace's image provenance (pip freeze, repo commits, builder version) into the volume, so images built
+    # in different workspaces can be compared file by file (`modal volume get ... work/image_provenance`).
+    dst = Path(WORK_DIR, "image_provenance")
+    dst.mkdir(parents=True, exist_ok=True)
+    for f in Path(PROVENANCE_DIR).iterdir():
+        (dst / f.name).write_text(f.read_text())
     hf_volume.commit()
     data_volume.commit()
     print("checkpoint snapshot:", snap)
