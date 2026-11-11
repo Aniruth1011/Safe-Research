@@ -7,11 +7,10 @@
 #SBATCH --time=08:00:00
 #SBATCH --output=logs/%x-%j.out
 # CPU-only. Refuses to run unless all 10 tasks x 50 episodes are complete.
-#   sbatch --account=<acct> --dependency=afterok:<rollout_array_job_id> carc/03_build_cache.slurm
+#   sbatch --account=<account> --dependency=afterok:<rollout_array_job_id> carc/03_build_cache.slurm
 set -euo pipefail
 source carc/config.sh
-module purge; module load conda 2>/dev/null || module load anaconda3 2>/dev/null || true
-eval "$(conda shell.bash hook)"; conda activate "$CONDA_ENV"
+set +u; source carc/activate_env.sh; set -u
 
 mkdir -p "$CACHE_ROOT"
 # Capture check on ALL 500 episodes before packaging (L32 must equal SAFE's own last-layer pkl)
