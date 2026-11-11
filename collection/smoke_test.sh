@@ -114,6 +114,11 @@ mtime () { python -c "import os, sys; print(int(os.path.getmtime(sys.argv[1])))"
 count () { find "$1" -maxdepth 1 -name "task${SMOKE_TASK}--ep*--succ*.csv" | wc -l | tr -d ' '; }
 
 A="$SMOKE_ROOT/rep_a/libero_10"; B="$SMOKE_ROOT/rep_b/libero_10"
+# Peak GPU memory during the rollouts (sampled every second; the rollouts run in their own processes)
+mkdir -p "$SMOKE_ROOT"
+nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -l 1 > "$SMOKE_ROOT/gpu_memory_used_mib.log" 2>/dev/null &
+MEM_PID=$!
+trap 'kill "$MEM_PID" 2>/dev/null || true' EXIT
 echo "=== 3. ROLLOUT (task $SMOKE_TASK, $SMOKE_EPISODES episodes, resume check) ==="
 T0=$(date +%s); T1=$T0
 if [ "$SMOKE_EPISODES" -ge 2 ]; then
@@ -158,6 +163,17 @@ GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)
     echo "run, 1 episode (includes model load): $((T2 - T0)) s"
   fi
   echo "steps in rep_a: $STEPS -> $(python -c "import sys; print(round(int(sys.argv[1]) / max(int(sys.argv[2]), 1), 3))" "$((T2 - T0))" "$STEPS") s/step upper bound (includes model loads)"
+  echo "peak GPU memory used during rollouts (nvidia-smi, 1 s samples): $(sort -n "$SMOKE_ROOT/gpu_memory_used_mib.log" | tail -1) MiB"
+  python - "$A" "$B" <<'PY'
+import glob, os, sys
+import pandas as pd
+for run in sys.argv[1:]:
+    for f in sorted(glob.glob(run + "/task*--ep*--succ*.csv")):
+        lp = f[:-4] + ".layers.pt"
+        size = os.path.getsize(lp) if os.path.exists(lp) else 0
+        n = len(pd.read_csv(f))
+        print(f"episode {os.path.basename(f)[:-4]} ({run.split('/')[-2]}): {n} steps, .layers.pt {size / 1e6:.1f} MB = {size / max(n, 1) / 1e6:.3f} MB/step")
+PY
   echo "raw rollout size per step: ~$(python -c "import sys; print(round(int(sys.argv[1]) * 1024 / max(int(sys.argv[2]), 1) / 1e6, 2))" "$BYTES" "$STEPS") MB"
   echo "Full-run sizing: 500 episodes x (s/step) x avg episode length (failures run to 520 steps)."
 } | tee "$SMOKE_ROOT/timing_summary.txt"

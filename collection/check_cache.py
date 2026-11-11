@@ -112,8 +112,8 @@ def compare_runs(a: Path, b: Path, layer: int, pool: str) -> int:
         feat_diff = None
         la, lb = ca.with_suffix(".layers.pt"), cb.with_suffix(".layers.pt")
         if la.exists() and lb.exists():
-            pa = torch.load(la, map_location="cpu", weights_only=False, mmap=True)
-            pb = torch.load(lb, map_location="cpu", weights_only=False, mmap=True)
+            pa = torch.load(str(la), map_location="cpu", weights_only=False, mmap=True)  # torch 2.2: mmap needs a str
+            pb = torch.load(str(lb), map_location="cpu", weights_only=False, mmap=True)
             k = first_div if first_div is not None else n
             if k > 0:
                 from build_cache import layer_names_of

@@ -149,7 +149,7 @@ def make_splits(df: pd.DataFrame, unseen_tasks: list[int], seen_train_ratio: flo
 
 def load_episode(row, mmap: bool = False) -> tuple[torch.Tensor, dict]:
     # mmap=True only maps the file, so the validation pass doesn't read every byte
-    payload = torch.load(row.layers, map_location="cpu", weights_only=False, mmap=mmap)
+    payload = torch.load(str(row.layers), map_location="cpu", weights_only=False, mmap=mmap)  # torch 2.2: mmap needs a str
     return payload["features"], payload
 
 
