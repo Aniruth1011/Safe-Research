@@ -114,11 +114,13 @@ def test_rollout_settings_are_safes_plus_all_layers():
 
 
 def test_timeouts_are_bounded_and_explained():
-    t = _constant("ROLLOUT_TIMEOUT_S")
-    assert 50 * 157 <= t <= 6 * 3600, t  # covers 50 episodes at the slowest measured A40 speed; bounded
+    # Akash 2026-11-10: task timeout = 1.5 x the worst-case task time MEASURED in the Modal smoke test
+    worst_ep, overhead = _constant("A10_WORST_EPISODE_S"), _constant("A10_PROCESS_OVERHEAD_S")
+    assert (worst_ep, overhead) == (191.6, 30)                       # smoke test 2026-11-11, 520-step episode
+    assert "ROLLOUT_TIMEOUT_S = int(1.5 * (A10_PROCESS_OVERHEAD_S + 50 * A10_WORST_EPISODE_S))" in _src()
+    assert int(1.5 * (overhead + 50 * worst_ep)) == 14415
     assert _constant("SMOKE_TIMEOUT_S") <= 3600
     assert _constant("BUILD_TIMEOUT_S") <= 24 * 3600
-    assert "81-157 s per episode" in _src()
 
 
 def test_full_run_is_opt_in():
@@ -296,3 +298,11 @@ def test_full_run_requires_a_smoke_validated_image():
     # the launcher checks on CPU before any GPU starts
     launch = src[src.index("def rollouts("):src.index("def spend_report(")]
     assert launch.index("image_check.remote()") < launch.index("rollout_task.map(")
+
+
+def test_smoke_validated_image_is_committed():
+    import json as _json
+    rec = _json.loads((MODAL_APP.parent / "smoke_validated_images.json").read_text())
+    (fp, r), = rec.items()
+    assert len(fp) == 64 and r["full"] is True and r["gpu_name"] == "NVIDIA A10"
+    assert r["modal_image_id"].startswith("im-") and len(r["kit_commit"]) == 40

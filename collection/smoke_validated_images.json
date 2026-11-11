@@ -1,0 +1,15 @@
+{
+  "0f65545c78b2372a4765db3ba616b759e5c5529e5daceda31cd2eea05dc9faf7": {
+    "episodes": 2,
+    "full": true,
+    "gpu_name": "NVIDIA A10",
+    "kit_commit": "99adba5817e94e7bfc922c8236a1edff00e270c7",
+    "modal_image_id": "im-poK20zLkVgrcmETw7xs1l5",
+    "note": "Full smoke test passed on Modal (A10). A workspace whose image has this exact fingerprint may run full-run tasks without its own smoke test; any other image needs one.",
+    "passed_utc": "2026-11-11T02:23:59Z",
+    "smoke_dir": "/vol/data/smoke/20261111-021247",
+    "task": 1,
+    "timing_summary": "=== SMOKE SUMMARY (2026-11-11T02:23Z) ===\nGPU: NVIDIA A10   MUJOCO_GL: egl   task: 1   episodes: 2\nopenvla commit: 300dce2\nfirst run, 1 episode(s) (includes model load): 156 s\nresume run, 1 more episode (includes model load): 221 s\nsteps in rep_a: 836 -> 0.451 s/step upper bound (includes model loads)\npeak GPU memory used during rollouts (nvidia-smi, 1 s samples): 16301 MiB\nepisode task1--ep0--succ1 (rep_a): 316 steps, .layers.pt 264.0 MB = 0.836 MB/step\nepisode task1--ep1--succ0 (rep_a): 520 steps, .layers.pt 434.5 MB = 0.836 MB/step\nepisode task1--ep0--succ1 (rep_b): 316 steps, .layers.pt 264.0 MB = 0.836 MB/step\nepisode task1--ep1--succ1 (rep_b): 268 steps, .layers.pt 223.9 MB = 0.836 MB/step\nraw rollout size per step: ~0.89 MB\nFull-run sizing: 500 episodes x (s/step) x avg episode length (failures run to 520 steps).\n",
+    "workspace_profile": "akashrav"
+  }
+}

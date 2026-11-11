@@ -64,11 +64,14 @@ POOLING = "mean,first,last"
 RUN_NOTE = "all-layers-v1"
 CACHE_VERSION = "v1"
 
-# Timeouts. CARC A40 (measured 2026-11-09, openvla@300dce2): 81-157 s per episode, so one task (50 episodes) took
-# an estimated 1.1-2.2 h there. A10 speed is NOT measured yet; the smoke test measures it. 4 h per task leaves ~1.8x
-# headroom over the slowest A40 figure. A task that hits the timeout loses only its in-progress episode: relaunch it
-# and --resume continues. So the timeout bounds the cost of a hang (10 x 4 h) instead of having to fit every task.
-ROLLOUT_TIMEOUT_S = 4 * 3600
+# Timeouts. MEASURED on Modal A10, smoke test 2026-11-11 (kit 99adba5, image 0f65545c): 0.363 s/step on a 520-step
+# (failed, capped) episode = 188.6-191.6 s per worst-case episode; ~30 s per process for imports + model load.
+# Worst-case task = 30 + 50 x 191.6 s = 9,610 s (2.67 h). Timeout = 1.5 x that (Akash, 2026-11-10) = 14,415 s (4.0 h).
+# A task that hits the timeout keeps its finished episodes (TASK_META stays "running"); see the runbook.
+A10_WORST_EPISODE_S = 191.6  # MEASURED, 520 steps (the cap), Modal A10, 2026-11-11
+A10_SEC_PER_EPISODE = (98.5, 191.6)  # MEASURED range, 268-520 steps, Modal A10, 2026-11-11
+A10_PROCESS_OVERHEAD_S = 30  # MEASURED (resume run total 221 s - 191.6 s episode), imports + model load
+ROLLOUT_TIMEOUT_S = int(1.5 * (A10_PROCESS_OVERHEAD_S + 50 * A10_WORST_EPISODE_S))  # = 14,415 s
 SMOKE_TIMEOUT_S = 45 * 60  # 3 model loads + 2 episodes (+2 more with --full) + checks
 BUILD_TIMEOUT_S = 8 * 3600  # same as CARC's 03_build_cache.slurm
 DOWNLOAD_TIMEOUT_S = 60 * 60
@@ -76,7 +79,6 @@ DOWNLOAD_TIMEOUT_S = 60 * 60
 # Prices from https://modal.com/pricing, checked 2026-11-10: A10 $0.000306/s; CPU $0.0000131/core/s; RAM $0.00000222/GiB/s.
 A10_USD_PER_HOUR = 0.000306 * 3600  # ~= $1.10
 A40_SEC_PER_EPISODE = (81, 157)  # measured on CARC A40, 2026-11-09
-A10_GPU_HOURS_ESTIMATE = (12, 24)  # ESTIMATE (not measured) for all 500 episodes, from the compute plan 2026-11-10
 ROLLOUT_CPU_CORES = 2.0  # physical cores (= 4 vCPU), billed in addition to the GPU
 CPU_USD_PER_CORE_HOUR = 0.0000131 * 3600
 RAM_USD_PER_GIB_HOUR = 0.00000222 * 3600
@@ -483,7 +485,10 @@ def rollout_task(task_id: int, workspace_profile: str, kit_commit: str, episodes
                            "a task runs on one image; rerun it from scratch on the validated image")
     _guard_one_environment(run_note)
     gpu = _gpu_name()
+    done_before = episode_accounting(tdir / "libero_10", task_id, episodes)
     attempt = {"container_id": os.environ.get("MODAL_TASK_ID"), "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+               # episodes from here on ran in a new process (a resume): the smoke test showed that changes trajectories
+               "first_episode": done_before["complete"] + len(done_before["invalid"]),
                "workspace_profile": workspace_profile, "gpu_name": gpu, "kit_commit": kit_commit}
     attempt["modal_image_id"] = image_id
     meta.update({"task": task_id, "run_note": run_note, "workspace_profile": workspace_profile, "gpu_name": gpu,
@@ -581,14 +586,16 @@ def cost_estimate(n_tasks: int, sec_per_episode: float = 0.0) -> str:
         h = episodes * sec_per_episode / 3600
         lines.append(f"  {GPU} from your smoke figure ({sec_per_episode:.0f} s/episode): {h:.1f} GPU-h ~ ${h * A10_USD_PER_HOUR:.0f}")
     else:
-        lo, hi = (x * n_tasks / N_TASKS for x in A10_GPU_HOURS_ESTIMATE)
-        lines.append(f"  {GPU} ESTIMATE (not measured; run the smoke test and pass --sec-per-episode): {lo:.0f}-{hi:.0f}"
-                     f" GPU-h ~ ${lo * A10_USD_PER_HOUR:.0f}-{hi * A10_USD_PER_HOUR:.0f} GPU only")
+        lo, hi = (episodes * x / 3600 for x in A10_SEC_PER_EPISODE)
+        lines.append(f"  {GPU} from the MEASURED smoke range ({A10_SEC_PER_EPISODE[0]:.0f}-{A10_SEC_PER_EPISODE[1]:.0f} s/episode)"
+                     f": {lo:.1f}-{hi:.1f} container-h ~ ${lo * usd_per_container_hour():.0f}"
+                     f"-{hi * usd_per_container_hour():.0f}")
     worst = n_tasks * ROLLOUT_TIMEOUT_S / 3600
-    lines.append(f"  Upper bound if every container runs to its {ROLLOUT_TIMEOUT_S // 3600} h timeout: {worst:.0f} GPU-h"
-                 f" ~ ${worst * A10_USD_PER_HOUR:.0f} GPU only.")
-    lines.append(f"  Plus CPU/RAM per container ({ROLLOUT_CPU_CORES} cores, {ROLLOUT_MEMORY_MIB // 1024} GiB) and volume storage."
-                 f" GPU price ${A10_USD_PER_HOUR:.2f}/h (modal.com/pricing, 2026-11-10).")
+    lines.append(f"  Upper bound if every container runs to its {ROLLOUT_TIMEOUT_S / 3600:.1f} h timeout: {worst:.1f} container-h"
+                 f" ~ ${worst * usd_per_container_hour():.0f}.")
+    lines.append(f"  Container rate ${usd_per_container_hour():.3f}/h = A10 ${A10_USD_PER_HOUR:.2f}/h + {ROLLOUT_CPU_CORES} cores"
+                 f" + {ROLLOUT_MEMORY_MIB // 1024} GiB (modal.com/pricing, 2026-11-10); volume storage is free under 1 TiB."
+                 " Episode range = the 4 smoke episodes (268-520 steps); real tasks vary.")
     return "\n".join(lines)
 
 
