@@ -40,9 +40,19 @@ Last updated: **2026-11-10** (orchestrator). Read this first; the other files in
 
 ## Blocked / waiting on Akash
 
-1. Approval of **wave 1** (tasks 0–4) in the `friend` workspace. Measured range $9–18; about $14 expected.
-2. Whether a task interrupted mid-run should be resumed or rerun from scratch, since resuming changes trajectories
-   (smoke finding). Also asked on PR #3.
+1. **Wave 1 approved (tasks 0–4, `friend`, hard stop at $28), but the `friend` Modal profile is not configured on
+   this Mac** (`modal profile list` shows only `akashrav`, 2026-11-11). Akash adds it himself; then: download (CPU),
+   image check, launch.
+
+## Decisions (Akash, 2026-11-11)
+
+- **No resume for the dataset.** Every task runs as one uninterrupted process (episodes 0–49). Implemented in
+  `190a3d5`: partial outputs are moved to `_discarded/`, never deleted, and the task restarts at episode 0;
+  engineering-only resume flag; puller refuses anything else. Tests pass on torch 2.14 and 2.2.0. The image is
+  unchanged (`akashrav` fingerprint still `0f65545c…`), so no new smoke test.
+- Profile name `akashrav` stays (no alias).
+- Wave 1 approved in `friend`, hard stop at $28 spent in that workspace. Report each task as it finishes, then
+  both workspaces' spend and a wave-2 recommendation; wait for OK before wave 2.
 
 ## Smoke test result (Modal A10, 2026-11-11, kit `99adba5`, task 1, `--full`)
 
