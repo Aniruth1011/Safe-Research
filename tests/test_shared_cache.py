@@ -74,7 +74,8 @@ def write_rollouts(root: Path, n_tasks=10, n_eps=4, seed=0, flip=None):
             pickle.dump({"hidden_states": torch.stack(safe_last), "task_id": t}, open(stem.with_suffix(".pkl"), "wb"))
             save_episode_layers(stem.with_suffix(".layers.pt"), steps, POOLS,
                                 {"task_id": t, "episode_idx": e, "episode_success": bool(succ),
-                                 "task_description": f"fake task {t}", "task_suite_name": "libero_10"})
+                                 "task_description": f"fake task {t}", "task_suite_name": "libero_10",
+                                 "run_fingerprint": {"attn_implementation": "flash_attention_2", "gpu_name": "NVIDIA A10", "render_backend": {"MUJOCO_GL": "egl"}}})
             acts = np.zeros((T, 7)) + (0.5 if flip and (t, e) in flip else 0.0) * (np.arange(T)[:, None] >= 2)
             pd.DataFrame(acts, columns=COLS).to_csv(stem.with_suffix(".csv"), index=False)
     (root / "provenance").mkdir(exist_ok=True)
