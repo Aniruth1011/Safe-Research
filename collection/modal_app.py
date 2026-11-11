@@ -30,7 +30,15 @@ import sys
 import time
 from pathlib import Path
 
-import modal
+# Modal's 2026.10 image builder only supports Python >= 3.11 for `add_python`, and this repo needs exactly 3.10
+# (the collection env verified on CARC). Builder 2025.06 still supports 3.10. Pin it here, in the client, so every
+# workspace (each has its own default builder setting) builds the identical image from the same commit.
+IMAGE_BUILDER_VERSION = "2025.06"
+if os.environ.get("MODAL_IMAGE_BUILDER_VERSION", IMAGE_BUILDER_VERSION) != IMAGE_BUILDER_VERSION:
+    raise RuntimeError(f"MODAL_IMAGE_BUILDER_VERSION must be {IMAGE_BUILDER_VERSION} (or unset) for this app")
+os.environ["MODAL_IMAGE_BUILDER_VERSION"] = IMAGE_BUILDER_VERSION
+
+import modal  # noqa: E402  (after the builder pin)
 
 # ----------------------------------------------------------------------------------------------------------------
 # Constants (tests/test_kit_modal.py reads several of these by name)
@@ -155,6 +163,7 @@ def _finish_image() -> None:
     Path(PROVENANCE_DIR).mkdir(parents=True, exist_ok=True)
     freeze = subprocess.run([sys.executable, "-m", "pip", "freeze"], check=True, capture_output=True, text=True).stdout
     Path(PROVENANCE_DIR, "pip_freeze.txt").write_text(freeze)
+    Path(PROVENANCE_DIR, "image_builder_version.txt").write_text(IMAGE_BUILDER_VERSION + "\n")
     for name, repo in (("openvla", OPENVLA_DIR), ("libero", LIBERO_DIR)):
         head = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"], check=True, capture_output=True, text=True)
         Path(PROVENANCE_DIR, f"{name}_commit.txt").write_text(head.stdout)

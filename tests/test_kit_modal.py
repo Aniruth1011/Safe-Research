@@ -196,3 +196,13 @@ def test_no_site_specific_identifiers(path):
         assert m.group(1)[0] in "<$", f"use a placeholder or variable account, got {m.group(0)}"
     assert not re.search(r"/(scratch1|project2?)/(?![<$])[A-Za-z0-9_]+", s), "use /scratch1/<user>, /project2/<group>"
     assert not re.search(r"\b[a-z]+_\d{4}\b", s), "looks like a Slurm account/project ID"
+
+
+def test_image_builder_pinned_for_python_310():
+    # Modal's 2026.10 builder rejects add_python="3.10"; 2025.06 is pinned in the client so every workspace
+    # builds the same image (found 2026-11-10 when the first smoke launch failed locally before any spend).
+    src = _src()
+    assert 'IMAGE_BUILDER_VERSION = "2025.06"' in src
+    assert src.index('os.environ["MODAL_IMAGE_BUILDER_VERSION"] = IMAGE_BUILDER_VERSION') < src.index("import modal  #")
+    assert 'add_python="3.10"' in src
+    assert '"image_builder_version.txt"' in src
