@@ -94,10 +94,13 @@ MODAL_PROFILE=friend modal run --detach collection/modal_app.py::rollouts \
 
 ## 6. Build and verify the cache on CARC (CPU job)
 
-`sbatch --account=<account> carc/05_build_cache_from_modal.slurm` once all 10 tasks are pulled. It refuses if a
+`sbatch --account=<account> carc/05_build_cache_from_modal.slurm` once all 10 tasks are pulled. The cache goes to
+`$CACHE_ROOT/v1`; `CACHE_ROOT` defaults to `/scratch1/<user>/safe_cache` (not backed up), and an exported `CACHE_ROOT`
+(e.g. `/project2/<group>/safe_cache`, passed with `--export=ALL`) overrides it. The job prints where it writes. It refuses if a
 task folder is missing or the image provenance differs between workspaces, links the task folders into one flat
 view, then runs the capture check, `build_cache.py` (which also refuses mixed GPU, attention or render backend, and
-checks invalid markers) and `check_cache.py verify`. Then tell Akash; only after his OK may Volumes be cleaned.
+checks invalid markers) and `check_cache.py verify`. Then tell Akash; only after his OK may Volumes be cleaned. Done 2026-11-11: cache `v1` verified; Akash kept tasks 0–9
+on both Volumes as a backup and deleted only the discarded A10G run of task 2.
 
 ## 7. A credit limit is hit mid-wave
 

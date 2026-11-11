@@ -10,7 +10,7 @@ Last updated: **2026-11-11** (orchestrator). Read this first; the other files in
 | 0 | Understanding pack (`01`–`06` in this folder) | **Done 2026-11-10** |
 | 1 | The five kit fixes, as a follow-up PR | **PR [#3](https://github.com/Aniruth1011/Safe-Research/pull/3) ready for review (2026-11-11)**, head `90f8007` |
 | 2 | Modal smoke test (≤ $3) | **PASSED 2026-11-11** on A10 (`akashrav`), image `0f65545c…` validated. Spend ≤ $0.54 |
-| 3 | Full collection (500 episodes) | **Collected on Modal 2026-11-11**: 10/10 tasks complete on NVIDIA A10 (kit `6cb1781` for wave 2). Pull to CARC and cache build: Akash |
+| 3 | Full collection (500 episodes) | **Done 2026-11-11** (plan rows A5, A6, A8): 10/10 tasks on NVIDIA A10, pulled to CARC, cache `v1` verified |
 
 ## Done
 
@@ -40,8 +40,17 @@ Last updated: **2026-11-11** (orchestrator). Read this first; the other files in
 
 ## Blocked / waiting on Akash
 
-1. **CARC pull and cache build** (Akash runs them; see below and the runbook, sections 5–6).
-2. Nothing may be deleted from either Modal Volume until Akash confirms the CARC cache verified.
+Nothing. Collection is complete (see "Cache v1" below).
+
+## Cache v1 (CARC, built and verified 2026-11-11)
+
+- All 10 tasks pulled and verified (`friend` 0–7, `akashrav` 8, 9), then `05_build_cache_from_modal.slurm`.
+- `check_cache.py verify`: **341 files, 0 corrupted**. Splits: **train 210 / seen_val 140 / unseen_test 150** episodes
+  (unseen tasks 0, 3, 5); **198,600 rows** (one per step).
+- Location: `CACHE_ROOT/v1`, with `CACHE_ROOT` now defaulting to `/scratch1/<user>/safe_cache` (kit `2db85ab`; an
+  exported `CACHE_ROOT` overrides it). `/scratch1` is not backed up.
+- Modal Volumes (Akash, 2026-11-11): tasks 0–9 **kept** on both Volumes as a backup, plus `smoke/`, `work/` and
+  `cs566-hf-cache`. Only wave 1's discarded A10G run of task 2 was deleted from `friend`.
 
 ## Wave 2 result (kit `6cb1781`, 2026-11-11 05:36–09:41 UTC)
 
@@ -116,9 +125,8 @@ Spend: `friend` ~$13.9 (function time + start-up), upper bound $14.34 (watchdog)
 
 ## Next
 
-1. Akash: pull `friend` 0–7 and `akashrav` 8, 9 to CARC (runbook section 5), then build and verify the cache (section 6).
-2. After his OK that the cache verified: decide what to clean from the Modal Volumes.
-3. After PR #3 merges: delete the fork's `backup/extraction-pre-rebase-2026-11-10`.
+1. Team: confirm read access to the cache on CARC (it is under Akash's `/scratch1`; copy to `/project2/<group>` if needed).
+2. After PR #3 merges: delete the fork's `backup/extraction-pre-rebase-2026-11-10`.
 
 ## Budget
 
