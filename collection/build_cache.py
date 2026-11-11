@@ -96,6 +96,54 @@ def load_episode(row, mmap: bool = False) -> tuple[torch.Tensor, dict]:
     return payload["features"], payload
 
 
+FINGERPRINT_KEY = "run_fingerprint"
+FINGERPRINT_MUST_MATCH = ("attn_implementation", "gpu_name", "render_backend")
+REQUIRED_ATTN_IMPLEMENTATION = "flash_attention_2"
+
+
+def check_run_fingerprints(df: pd.DataFrame, allow_missing: bool) -> dict:
+    """E3 dataset-consistency guard. Reads `run_fingerprint` (written by run_libero_eval.py --save_all_layers, see
+    experiments/robot/libero/run_guards.py) from every episode and exits non-zero if attention implementation, GPU name
+    or MuJoCo render backend differ across the dataset, or if any attention implementation is not flash_attention_2.
+    Episodes without a fingerprint are refused unless `allow_missing` (recorded in the manifest).
+    Returns the record stored in manifest.json under `run_fingerprint`."""
+    fps, missing = {}, []
+    for row in df.itertuples():
+        fp = load_episode(row, mmap=True)[1].get(FINGERPRINT_KEY)
+        if fp is None:
+            missing.append(Path(row.layers).name)
+        else:
+            fps[Path(row.layers).name] = fp
+    problems = []
+    if missing and not allow_missing:
+        problems.append(f"{len(missing)}/{len(df)} episodes have no {FINGERPRINT_KEY} (pass --allow-missing-fingerprint "
+                        f"to build anyway; it is recorded in the manifest), e.g. {missing[:3]}")
+    values = {}
+    for key in FINGERPRINT_MUST_MATCH:
+        groups = defaultdict(list)
+        for name, fp in fps.items():
+            groups[json.dumps(fp.get(key), sort_keys=True)].append(name)
+        values[key] = groups
+        if len(groups) > 1:
+            listing = "; ".join(f"{v} x{len(n)} e.g. {n[:3]}" for v, n in sorted(groups.items()))
+            problems.append(f"mixed {key} across the dataset: {listing}")
+    bad_attn = {v: n for v, n in values["attn_implementation"].items()
+                if json.loads(v) != REQUIRED_ATTN_IMPLEMENTATION}
+    for v, n in sorted(bad_attn.items()):
+        problems.append(f"attn_implementation {v} is not {REQUIRED_ATTN_IMPLEMENTATION!r}: x{len(n)} e.g. {n[:3]}")
+    if problems:
+        sys.exit("Inconsistent rollout dataset (run fingerprints):\n  " + "\n  ".join(problems))
+    record = {key: (json.loads(next(iter(values[key]))) if values[key] else None) for key in FINGERPRINT_MUST_MATCH}
+    versions = sorted({json.dumps(fp.get("versions"), sort_keys=True) for fp in fps.values()})
+    record.update({
+        "versions_seen": [json.loads(v) for v in versions],
+        "episodes_with_fingerprint": len(fps),
+        "allow_missing_fingerprint": bool(allow_missing),
+        "episodes_missing_fingerprint": missing,
+    })
+    return record
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--rollout-dir", required=True, type=Path)
@@ -114,6 +162,8 @@ def main():
     ap.add_argument("--expect-episodes", type=int, default=50)
     ap.add_argument("--allow-incomplete", action="store_true", help="For smoke tests only")
     ap.add_argument("--skip-checksums", action="store_true", help="For smoke tests only")
+    ap.add_argument("--allow-missing-fingerprint", action="store_true",
+                    help="Build even if some .layers.pt files have no run_fingerprint (recorded in the manifest)")
     ap.add_argument("--provenance-files", type=Path, nargs="*", default=[],
                     help="Extra files (pip freeze, repo commits) copied into provenance/ BEFORE checksumming")
     args = ap.parse_args()
@@ -139,6 +189,7 @@ def main():
         sys.exit("Rollouts incomplete:\n  " + "\n  ".join(problems))
     if missing:
         sys.exit("Cannot build without every .layers.pt/.pkl file:\n  " + "\n  ".join(missing[:10]))
+    run_fingerprint = check_run_fingerprints(df, args.allow_missing_fingerprint)  # E3: refuse a mixed dataset
 
     # ---------- lengths + per-episode consistency ----------
     lengths, names, suites, pools0, shape0 = [], [], [], None, None
@@ -304,6 +355,7 @@ def main():
                              "preprocessing step the shared evaluator must choose and apply identically for all models",
             "backbone": "OpenVLA-7B",
             "checkpoint": args.checkpoint,
+            "run_fingerprint": run_fingerprint,
             "source_rollout_dir": str(args.rollout_dir.resolve()),
             "layer_convention": LAYER_CONVENTION,
             "num_hidden_states": n_layers,
