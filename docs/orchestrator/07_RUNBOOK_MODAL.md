@@ -80,7 +80,9 @@ MODAL_PROFILE=friend modal run --detach collection/modal_app.py::rollouts \
 
 - Once on CARC: install the Modal CLI for your user (`uv tool install modal`), add **both** profiles with
   `modal token set ... --profile friend` and `... --profile akashrav`, then `chmod 600 ~/.modal.toml`.
-- From `collection/`: `sbatch --account=<account> --export=ALL,PROFILE=friend,TASKS=0-4 carc/04_pull_from_modal.slurm`.
+- From `collection/`, set the variables in the shell and pass only `--export=ALL`. `sbatch --export` splits its value
+  on commas, so `--export=ALL,TASKS=0,1,3,4` would deliver only `TASKS=0`:
+  `export PROFILE=friend TASKS=0,1,3,4 MODAL_BIN=<path to your modal CLI>; sbatch --account=<account> --export=ALL carc/04_pull_from_modal.slurm`
   **Always in a CPU job, never on the login node** (the script refuses outside Slurm).
 - Each task lands in `/scratch1/<user>/rollouts/all-layers-v1/taskNN/` only if its checksums match, `TASK_META` says
   complete on an NVIDIA A10 in that profile, and every episode has its files or an invalid marker. Failures leave
