@@ -84,6 +84,10 @@ MODAL_PROFILE=friend modal run --detach collection/modal_app.py::rollouts \
   on commas, so `--export=ALL,TASKS=0,1,3,4` would deliver only `TASKS=0`:
   `export PROFILE=friend TASKS=0,1,3,4 MODAL_BIN=<path to your modal CLI>; sbatch --account=<account> --export=ALL carc/04_pull_from_modal.slurm`
   **Always in a CPU job, never on the login node** (the script refuses outside Slurm).
+- **One pull job at a time.** Every pull job writes into the same run folder and starts by moving aside any
+  half-finished download it finds there, which would include a concurrent job's. Chain them:
+  `sbatch ... --dependency=afterany:<previous job> carc/04_pull_from_modal.slurm`. Rerunning with tasks that are already
+  pulled is safe: they are re-verified and skipped.
 - Each task lands in `/scratch1/<user>/rollouts/all-layers-v1/taskNN/` only if its checksums match, `TASK_META` says
   complete on an NVIDIA A10 in that profile, and every episode has its files or an invalid marker. Failures leave
   nothing in place and are listed in `pull_log.tsv`.
