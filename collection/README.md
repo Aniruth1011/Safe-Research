@@ -1,24 +1,27 @@
-# Shared feature cache: OpenVLA-7B on LIBERO-10, all 33 hidden-state layers
+# Shared feature cache: OpenVLA-7B on LIBERO-10, every hidden-state layer
 
-This kit runs OpenVLA once on CARC and saves **every** hidden-state layer at every step. It then packages the result into a versioned, checksummed cache with a frozen split, so all five of us train detectors on identical features and labels.
+This kit runs OpenVLA once (on Modal, one A10 per task; the CARC scripts are kept as the verified reference setup) and saves **every** hidden-state layer at every step. It then packages the result into a versioned, checksummed cache with a frozen split, so all five of us train detectors on identical features and labels.
 
 ## What's in the kit
 
 | File | What it does |
 |---|---|
-| `openvla_all_layers.patch` | Patch for `vla-safe/openvla`. Adds `--save_all_layers True`, which writes `task*--ep*--succ*.layers.pt` = (T, pools, 33, 4096) bfloat16 next to SAFE's usual files. SAFE's own `.pkl`/`.csv` outputs are unchanged, so the original SAFE baselines (Exp 1–3) still run on the same rollouts. |
+| `openvla_all_layers.patch` | Patch for `vla-safe/openvla`. Adds `--save_all_layers True`, which writes `task*--ep*--succ*.layers.pt` = (T, pools, 34, 4096) bfloat16 (33 with `--save_raw_block32 False`) next to SAFE's usual files. With the flag it also refuses to run without `flash_attention_2`, records a run fingerprint, and writes invalid-episode markers. SAFE's own `.pkl`/`.csv` outputs are unchanged, so the original SAFE baselines (Exp 1–3) still run on the same rollouts. Regenerated from the openvla fork's `akash/kit-patch` with `git diff 300dce2 akash/kit-patch`; never edit it by hand. |
 | `build_cache.py` | Raw rollouts → immutable cache (`features/<pool>/<split>/L<NN>.npy`, `episodes.csv`, `splits.json`, train-only `norm_stats/`, `manifest.json` + `CHECKSUMS.sha256`). |
 | `load_cache.py` | Read the cache from Python, or `export` chosen layers into the repo's `FeatureStore` format (one store per split) for `scripts/train.py --feature-root`. `unseen_test` is locked unless `--allow-unseen` (Exp 37 only). |
-| `check_cache.py` | `verify` a downloaded copy against checksums; `compare-runs` checks two rollout runs for outcome flips and action divergence. |
-| `carc/` | `config.sh` (edit once) → `00_setup_env.sh` → `01_smoke_test.slurm` → `02_rollouts.slurm` → `03_build_cache.slurm`. |
-| `../tests/test_shared_cache.py` | End-to-end tests on fake rollouts (no GPU needed); `layer_cache.py` is loaded straight from the patch. |
+| `check_cache.py` | `capture` checks rollouts against SAFE's own `.pkl`; `verify` checks a downloaded copy against checksums; `compare-runs` checks two rollout runs for outcome flips and action divergence. |
+| `constraints.txt` | The single source of truth for every package pin of the collection environment. Every install path (CARC setup, Modal image) uses it with `pip install -c`. |
+| `modal_app.py` | The Modal app: image, one A10 function per task, a CPU function that builds the cache. See "Running on Modal (A10)". |
+| `smoke_test.sh` | The smoke sequence (env checks, model load, resume, capture, optional repeat and tiny build). Same script on Modal and CARC. |
+| `carc/` | `config.sh` (edit once) → `00_setup_env.sh` → `01_smoke_test.slurm` → `02_rollouts.slurm` → `03_build_cache.slurm`; jobs source `activate_env.sh` (uv or conda). |
+| `../tests/test_shared_cache.py`, `../tests/test_kit_*.py` | End-to-end tests on fake rollouts and checks of the scripts (no GPU needed); `layer_cache.py` is loaded straight from the patch. The patch carries its own tests (`tests/test_kit_*.py` in the openvla checkout). `../tests/gpu/test_layer_mapping.py` (T6) is the GPU proof of the layer convention. |
 
 ## Conventions frozen by this cache (agree on these before running)
 
 - **Layer index** = HuggingFace `hidden_states` index, **L0 = embeddings, L1–L32 = decoder layers**:
   - `0` is the embeddings.
   - `1…31` are the outputs of decoder layers 1–31, *before* any normalization.
-  - `32` is the output of decoder layer 32 **after the final RMSNorm**. Checked in the source of the pinned `transformers==4.40.1` (`LlamaModel.forward` applies `self.norm` and then appends the last hidden state). This is the same tensor SAFE stores as `s[-1]`, so our final-layer baseline matches SAFE. `check_cache.py capture` confirms it on real data: L32 must equal SAFE's own `.pkl` exactly.
+  - `32` is the output of decoder layer 32 **after the final RMSNorm**. Checked in the source of the pinned `transformers==4.40.1` (`LlamaModel.forward` applies `self.norm` and then appends the last hidden state). This is the same tensor SAFE stores as `s[-1]`, so our final-layer baseline matches SAFE. `check_cache.py capture` confirms it on real data: at L32, the `first`/`last` poolings must equal SAFE's own `.pkl` bit for bit, and `mean` must match up to bf16 rounding.
   - So spreadsheet **L4 = index 4, L32 = index 32**.
   - Because only L32 is normalized, raw scales differ across layers.
 - **Index 33 = raw block 32 (pending team approval, review checklist item 3).** `33` is the output of decoder layer 32 *before* the final RMSNorm. `hidden_states` does not contain it, so the patch captures it with a forward pre-hook on `model.language_model.model.norm`, once per generated token, and pools it like the other layers. The files are then (T, pools, **34**, 4096). Indices 0–32 do not change, and the L32 capture check still uses index 32. It is on by default with `--save_all_layers True`. `--save_raw_block32 False` turns it off and writes the old 33-layer files. Every `.layers.pt` and `manifest.json` lists `layer_names` (`emb`, `block01`…`block31`, `block32_postnorm`, `block32_prenorm`). A file without `layer_names` is read as the old 33-layer convention. `build_cache.py` and `check_cache.py` refuse a dataset that mixes 33- and 34-layer files. GPU proof: `tests/gpu/test_layer_mapping.py` (T6).
@@ -48,6 +51,8 @@ This kit runs OpenVLA once on CARC and saves **every** hidden-state layer at eve
 
 ## Running it on CARC
 
+The team's GPU runs use Modal (next section); CARC GPU queues were days long in November 2026. These steps are the verified reference setup. Never mix A40 (CARC) and A10 (Modal) rollouts in one dataset: `build_cache.py` refuses a mixed GPU type.
+
 0. Clone this repo on CARC and `cd collection`. Edit `carc/config.sh`: set `CARC_ACCOUNT` (scripts refuse to run while anything is still `CHANGE_ME`), check that `CACHE_ROOT` is under your group's project directory (CARC uses `/project2/<group>`, not `/project/<group>`), check the GPU type, and pick `ENV_MODE`:
    - `uv` (default, the mode verified on CARC): a plain Python 3.10 virtualenv at `$VENV_DIR`, built with [uv](https://docs.astral.sh/uv/). No conda and no `module load`. Install uv once if it is missing (goes to `~/.local/bin`, no admin rights): `curl -LsSf https://astral.sh/uv/install.sh | sh`. Set `PYTHON_BIN` to a python3.10 binary, or leave it empty and uv finds or downloads one.
    - `conda`: a conda env named `$CONDA_ENV` with Python 3.10 (the kit's original behaviour). Same packages, same constraints file; the verified CARC build (2026-11-09) used `uv`, not this mode.
@@ -63,22 +68,22 @@ This kit runs OpenVLA once on CARC and saves **every** hidden-state layer at eve
 2. Run the smoke test (debug partition, under an hour) and **don't submit the full run until it passes**:
    `mkdir -p logs && sbatch --account=$CARC_ACCOUNT carc/01_smoke_test.slurm`
    - **Resume:** runs 1 episode, then asks for 2 with `--resume True`. Episode 0 must not be rerun.
-   - **Capture:** L32 must reproduce SAFE's own `.pkl` exactly, every layer must differ from its neighbor, and there must be no NaNs.
+   - **Capture:** L32 must reproduce SAFE's own `.pkl` (first/last bit for bit, mean up to bf16 rounding), every layer must differ from its neighbor, and there must be no NaNs.
    - **Repeat:** an independent second run, compared for outcome flips and action divergence. This is a sanity check, not a reproducibility guarantee.
    - **Build:** builds and verifies a tiny cache, then writes `timing_summary.txt` (seconds per step, MB per step). Share that with the team, and set `--time` in `02_rollouts.slurm` from it.
-3. Run the rollouts, 10 parallel jobs (one per task), all on A40:
+3. Run the rollouts, 10 parallel jobs (one per task), all on A40 (one GPU type for the whole dataset):
    `sbatch --account=$CARC_ACCOUNT carc/02_rollouts.slurm`
    - To rerun only unfinished tasks: `--array=3,7`. Resume is automatic.
 4. Build and verify the cache:
    `sbatch --account=$CARC_ACCOUNT --dependency=afterok:<array_job_id> carc/03_build_cache.slurm`
-   - Refuses to run unless all 500 episodes exist.
+   - Refuses to run unless each of the 500 episodes either exists or is explained by an invalid-episode marker (see "Invalid episodes"), and unless every episode has the same attention implementation, GPU type, render backend and layer names.
    - Runs the capture check on every episode.
    - Copies pip freeze and the OpenVLA, LIBERO and checkpoint versions into `provenance/` *before* checksumming.
    - **Detector training starts only after this job's `verify` passes.**
 
 Each `01`–`03` script reads `carc/config.sh` by relative path, so submit it from inside this folder.
 
-**Storage (rough):** about 0.8 MB per step for 3 poolings × 33 layers. At roughly 350 steps × 500 episodes, that's ~150 GB of raw rollouts, plus about the same again for the cache. Setting `POOLING="mean"` in `config.sh` cuts this ~3×, but drops Exp 14.
+**Storage (rough, computed, not measured):** about 0.84 MB per step for 3 poolings × 34 layers (0.81 MB with 33). At roughly 350 steps × 500 episodes, that's ~155 GB of raw rollouts, plus about the same again for the cache. Setting `POOLING="mean"` in `config.sh` cuts this ~3×, but drops Exp 14.
 
 ## Running on Modal (A10)
 

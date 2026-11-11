@@ -126,9 +126,11 @@ def test_flash_attn_install_hard_fails():
 
 
 def test_no_file_in_the_kit_mentions_sdpa():
+    # The generated openvla_all_layers.patch is excluded: it carries the run-time guard (run_guards.py) and its tests,
+    # which name sdpa only to refuse it; that behaviour is tested on the patch side (tests/test_kit_run_guards.py).
     hits = []
     for path in KIT.rglob("*"):
-        if path.is_file() and "__pycache__" not in path.parts:
+        if path.is_file() and "__pycache__" not in path.parts and path.name != "openvla_all_layers.patch":
             try:
                 text = path.read_text()
             except UnicodeDecodeError:

@@ -70,7 +70,7 @@ assert not bad, f"installed versions violate constraints.txt: {bad}"
 import torch
 assert torch.cuda.is_available(), "CUDA not available"
 print("torch", torch.__version__, "cuda", torch.version.cuda, "gpu", torch.cuda.get_device_name(0))
-import flash_attn, flash_attn_2_cuda  # noqa: F401  hard fail: no silent switch to sdpa
+import flash_attn, flash_attn_2_cuda  # noqa: F401  hard fail: no silent switch to another attention implementation
 from transformers.utils import is_flash_attn_2_available
 assert is_flash_attn_2_available(), "transformers cannot use flash_attention_2"
 print("flash-attn", flash_attn.__version__)
