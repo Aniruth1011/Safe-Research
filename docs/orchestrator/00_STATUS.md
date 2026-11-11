@@ -1,6 +1,6 @@
 # Status board
 
-Last updated: **2026-11-10** (orchestrator). Read this first; the other files in this folder explain the why.
+Last updated: **2026-11-11** (orchestrator). Read this first; the other files in this folder explain the why.
 
 ## Where we are
 
@@ -10,7 +10,7 @@ Last updated: **2026-11-10** (orchestrator). Read this first; the other files in
 | 0 | Understanding pack (`01`–`06` in this folder) | **Done 2026-11-10** |
 | 1 | The five kit fixes, as a follow-up PR | **PR [#3](https://github.com/Aniruth1011/Safe-Research/pull/3) ready for review (2026-11-11)**, head `90f8007` |
 | 2 | Modal smoke test (≤ $3) | **PASSED 2026-11-11** on A10 (`akashrav`), image `0f65545c…` validated. Spend ≤ $0.54 |
-| 3 | Full collection (500 episodes) | Out of scope until Akash approves, the team answers the checklist, and the fix PR is merged |
+| 3 | Full collection (500 episodes) | **Collected on Modal 2026-11-11**: 10/10 tasks complete on NVIDIA A10 (kit `6cb1781` for wave 2). Pull to CARC and cache build: Akash |
 
 ## Done
 
@@ -40,7 +40,29 @@ Last updated: **2026-11-10** (orchestrator). Read this first; the other files in
 
 ## Blocked / waiting on Akash
 
-1. **Task 2 rerun** (it ran on an NVIDIA A10G) and **wave 2** (tasks 5–9): workspace choice and approval.
+1. **CARC pull and cache build** (Akash runs them; see below and the runbook, sections 5–6).
+2. Nothing may be deleted from either Modal Volume until Akash confirms the CARC cache verified.
+
+## Wave 2 result (kit `6cb1781`, 2026-11-11 05:36–09:41 UTC)
+
+Task 2 rerun from episode 0 plus tasks 5, 6 in `friend`; tasks 8, 9 in `akashrav`; then task 7 in `friend` (rule:
+friend only if its headroom under the $28 stop is at least $3.60; it was $28 - $22.03 = $5.97).
+
+| Task | Workspace | Outcome (success/failure) | Steps | Container h | Cost (measured) | GPU | Fingerprint |
+|---|---|---|---|---|---|---|---|
+| 2 | `friend` | 25 / 25 | 20,287 | 2.03 | $2.68 | A10 | match |
+| 5 | `friend` | 37 / 13 | 14,578 | 1.49 | $1.97 | A10 | match |
+| 6 | `friend` | 22 / 28 | 20,413 | 2.09 | $2.76 | A10 | match |
+| 7 | `friend` | 34 / 16 | 19,049 | 1.97 | $2.60 | A10 | match |
+| 8 | `akashrav` | 10 / 40 | 25,348 | 2.54 | $3.37 | A10 | match |
+| 9 | `akashrav` | 26 / 24 | 20,402 | 2.07 | $2.74 | A10 | match |
+
+All 50/50 episodes per task, 0 invalid, one uninterrupted attempt from episode 0 each; failures always ran to the 520
+cap. The per-container GPU check saw only `NVIDIA A10` in wave 2 (no re-requests). Task 2's wave-1 A10G output is in
+`friend`'s Volume under `_discarded/` (recorded in its `TASK_META.json`).
+
+**Whole collection:** 500 episodes, 263 success / 237 failure (52.6%), 198,600 steps, about 166 GB of `.layers.pt`.
+Pull plan: `friend` tasks 0–7, `akashrav` tasks 8, 9 (one pull job at a time), then `05_build_cache_from_modal.slurm`.
 
 ## Wave 1 result (`friend`, kit `8300892`, 2026-11-11 03:03–05:24 UTC)
 
@@ -94,16 +116,16 @@ Spend: `friend` ~$13.9 (function time + start-up), upper bound $14.34 (watchdog)
 
 ## Next
 
-1. On approval: run `download_model`, then the full smoke test (`--full`); report results and actual spend.
-2. Smoke passes → set the rollout timeout from it, add results to PR #3, mark it ready for review.
-3. Full collection (A8) still needs: PR #3 merged, the team's checklist answers, and Akash's approval of wave 1.
+1. Akash: pull `friend` 0–7 and `akashrav` 8, 9 to CARC (runbook section 5), then build and verify the cache (section 6).
+2. After his OK that the cache verified: decide what to clean from the Modal Volumes.
+3. After PR #3 merges: delete the fork's `backup/extraction-pre-rebase-2026-11-10`.
 
 ## Budget
 
 | Item | Spent | Notes |
 |---|---|---|
-| Modal (`akashrav`) | **≤ $0.54** of $30 | Smoke test, 2026-11-11 (upper bound) |
-| Modal (`friend`) | ~$13.9 (≤ $14.34) of $30 | Wave 1, tasks 0–4, 2026-11-11 |
+| Modal (`akashrav`) | ~$6.2 (≤ $6.90) of $30 | Smoke test + tasks 8, 9, 2026-11-11 (watchdog upper bound) |
+| Modal (`friend`) | ~$24.3 (≤ $24.80) of $30 | Tasks 0–7 incl. the discarded A10G run of task 2, 2026-11-11 |
 | CARC | 0 SU by the orchestrator | No CARC jobs will be submitted |
 
 ## Contradictions and surprises (2026-11-10)
