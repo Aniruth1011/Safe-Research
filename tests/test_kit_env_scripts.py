@@ -92,6 +92,15 @@ def test_bash_syntax(path):
     assert r.returncode == 0, r.stderr
 
 
+@pytest.mark.parametrize("path", sorted(CARC.glob("*.slurm")), ids=lambda p: p.name)
+def test_slurm_jobs_never_write_bytecode(path):
+    """Concurrent jobs once hung on a shared __pycache__ file on /scratch1: every job sets PYTHONDONTWRITEBYTECODE
+    right after `set -euo pipefail`, before anything can start Python."""
+    lines = path.read_text().splitlines()
+    start = lines.index("set -euo pipefail")
+    assert "export PYTHONDONTWRITEBYTECODE=1" in lines[start + 1:start + 4]
+
+
 def test_config_pins_and_paths():
     lines = logical_lines(CARC / "config.sh")
     exported = {m.group(1): m.group(2) for ln in lines if (m := re.match(r'export (\w+)=(.*)', ln))}

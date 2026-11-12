@@ -9,6 +9,9 @@
 # CPU-only. Refuses to run unless all 10 tasks x 50 episodes are complete.
 #   sbatch --account=<account> --dependency=afterok:<rollout_array_job_id> carc/03_build_cache.slurm
 set -euo pipefail
+# Never write .pyc files from a job: concurrent jobs once hung on a shared __pycache__ file on /scratch1.
+# Existing .pyc files (the venv's, compiled at install) are still read, so imports stay fast.
+export PYTHONDONTWRITEBYTECODE=1
 source carc/config.sh
 set +u; source carc/activate_env.sh; set -u
 

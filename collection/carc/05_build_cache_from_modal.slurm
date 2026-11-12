@@ -10,6 +10,9 @@
 #   sbatch --account=<account> carc/05_build_cache_from_modal.slurm
 # Refuses unless all 10 task folders are present and the image provenance of every workspace used is identical.
 set -euo pipefail
+# Never write .pyc files from a job: concurrent jobs once hung on a shared __pycache__ file on /scratch1.
+# Existing .pyc files (the venv's, compiled at install) are still read, so imports stay fast.
+export PYTHONDONTWRITEBYTECODE=1
 source carc/config.sh
 set +u; source carc/activate_env.sh; set -u
 echo "cache will be written to $CACHE_ROOT/$CACHE_VERSION"

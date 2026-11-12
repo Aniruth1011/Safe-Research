@@ -14,6 +14,9 @@
 # --export=ALL,TASKS=0,1,3,4 would deliver only TASKS=0.
 # Needs the Modal CLI (MODAL_BIN or `modal` on PATH) with the profile configured. Nothing on Modal is deleted.
 set -euo pipefail
+# Never write .pyc files from a job: concurrent jobs once hung on a shared __pycache__ file on /scratch1.
+# Existing .pyc files (the venv's, compiled at install) are still read, so imports stay fast.
+export PYTHONDONTWRITEBYTECODE=1
 source carc/config.sh
 : "${PROFILE:?set PROFILE (e.g. friend or akashrav) with --export}"
 : "${TASKS:?set TASKS (e.g. 0-4) with --export}"

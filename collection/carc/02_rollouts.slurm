@@ -19,6 +19,9 @@
 #   mkdir -p logs && sbatch --account=<account> carc/02_rollouts.slurm
 # Rerun only failed tasks:  sbatch --account=<account> --array=3,7 carc/02_rollouts.slurm
 set -euo pipefail
+# Never write .pyc files from a job: concurrent jobs once hung on a shared __pycache__ file on /scratch1.
+# Existing .pyc files (the venv's, compiled at install) are still read, so imports stay fast.
+export PYTHONDONTWRITEBYTECODE=1
 source carc/config.sh
 set +u; source carc/activate_env.sh; set -u
 CKPT=$(cat "$WORK/checkpoint_path.txt")
