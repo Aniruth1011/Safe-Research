@@ -7,8 +7,11 @@
 #SBATCH --time=00:10:00
 #SBATCH --output=logs/depth_sweep_aggregate-%j.out
 # CPU only. Collects the depth sweep's rows into results.csv and summary.csv and draws depth_curve.png.
-# Submit from the root of the Safe-Research checkout with the SAME SWEEP_* variables as the sweep itself:
-#   sbatch --account=<account> --export=ALL --dependency=afterok:<array job id> scripts/carc/depth_sweep_aggregate.slurm
+# scripts/carc/submit_depth_sweep.sh submits it after the array (--dependency=afterany, so it runs even when some
+# layers failed). By hand, from the root of the checkout with the SAME SWEEP_* variables as the sweep itself:
+#   sbatch --account=<account> --export=ALL --dependency=afterany:<array job id> scripts/carc/depth_sweep_aggregate.slurm
+# It checks that every layer in SWEEP_EXPECT_LAYERS (default 0-33) has a row for every seed. If some are missing it
+# still writes the (partial) tables, lists the missing layers and how to rerun them, and exits 4.
 # If matplotlib is missing from the environment, the tables are still written and the job exits 3; draw the plot
 # elsewhere with `python scripts/depth_sweep.py aggregate --out <copy of the folder>`.
 set -euo pipefail
@@ -29,4 +32,5 @@ ARGS=(aggregate --pool "${SWEEP_POOL:-mean}" --train-horizon "${SWEEP_TRAIN_HORI
       --probe "${SWEEP_PROBE:-temporary_mlp}" --evaluator "${SWEEP_EVALUATOR:-temporary_max}")
 [ "${SWEEP_NORMALIZE:-0}" = 1 ] && ARGS+=(--normalize)
 [ -n "${SWEEP_OUT:-}" ] && ARGS+=(--out "$SWEEP_OUT")
+ARGS+=(--expect-layers "${SWEEP_EXPECT_LAYERS:-0-33}")
 "$PY" scripts/depth_sweep.py "${ARGS[@]}"
