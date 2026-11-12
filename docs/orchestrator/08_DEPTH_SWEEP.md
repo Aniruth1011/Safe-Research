@@ -52,12 +52,13 @@ plugins never mix.
 - `scripts/carc/submit_depth_sweep.sh`: submits the array (throttled, optional node exclusions) and the aggregate job.
 - `scripts/carc/depth_sweep.slurm`: one array task per layer.
 - `scripts/carc/depth_sweep_aggregate.slurm`: aggregation, after the array.
-- `tests/test_depth_sweep.py` and `tests/synthetic_cache.py`: 29 synthetic tests. They cover:
+- `tests/test_depth_sweep.py` and `tests/synthetic_cache.py`: 38 synthetic tests. They cover:
   - the unseen lock;
   - the sequential reader returning exactly the memmap values, and its stall retries;
   - the watchdog, SIGTERM handling and the copying of the local log;
   - row reuse, temp-file cleanup and file modes;
-  - the submit script and both Slurm scripts with a fake Slurm.
+  - the submit script and both Slurm scripts with a fake Slurm;
+  - bootstrap CIs, reference lines and the plot layout.
 
   They pass under torch 2.14 (`.venv-kit310`) and under torch 2.2.0 with numpy 1.26 (the CARC kit env).
 
@@ -142,6 +143,40 @@ path, commit and write time. A rerun reuses a row only when those fields are pre
 the first test, two array tasks starting together hung on the same `__pycache__` file in the checkout on `/scratch1`.
 The setting stops jobs writing `.pyc` files; they still read the venv's existing ones, so imports stay fast. A
 per-job `PYTHONPYCACHEPREFIX` would recompile torch, pandas and scikit-learn in every job, about 3x slower to import.
+
+## Plot, CIs and reference lines
+
+`depth_curve.png` shows the mean over seeds per layer with a band of ± one seed std, and bootstrap CI bars.
+
+**Index 33 (raw block 32, `block32_prenorm`).** It is the same block as layer 32, read before the final RMSNorm,
+so it is drawn as an orange diamond beside x = 32, not as a 34th layer. It has its own std and CI bars. A layer
+named `<block>_prenorm` always goes next to its `<block>_postnorm` partner; 33-layer caches have none.
+
+**Bootstrap CIs over seen_val episodes.** Each row also saves what its evaluator saw, as
+`rows/L<LL>_seed<S>.scores.npz`: per-step scores, labels, horizons, task and trajectory IDs. At aggregation time,
+for each layer:
+- **Resampling:** episodes are drawn with replacement 1,000 times, separately among failures and successes, so
+  both class counts stay fixed.
+- **Paired seeds:** every seed is re-scored on the same resample by the folder's own evaluator, so B4's evaluator
+  is used once it lands.
+- **The CI:** the metrics are averaged over seeds, and the CI is the 95% percentile interval of that average: the
+  uncertainty of the plotted point that comes from which episodes seen_val happens to contain.
+
+`summary.csv` gets `val_<metric>_ci95_low`/`_high` for every metric, plus `bootstrap_resamples`. Rows written
+before scores were saved, like the TEMPORARY R1 run, get empty CI columns, and the log says which layers.
+Settings: `--bootstrap N` (0 = none) or `SWEEP_BOOTSTRAP`, and `--ci 0.95`.
+
+The aggregate job runs the resampling on 4 CPUs (4 GB, 30 min). With the TEMPORARY evaluator the full sweep is
+about 7 CPU-minutes. A slower B4 evaluator scales that linearly; lower `SWEEP_BOOTSTRAP` or raise `--time` if needed.
+
+**Reference lines.** Use `--ref "label=value"` (repeatable), or `SWEEP_REFS="label=value;label=value"` for the
+aggregate job. For example, SAFE's final-layer baseline from Adarsh's reproduction, and the all-layer average:
+```bash
+export SWEEP_REFS="SAFE final layer (reproduction)=<value>;All-layer average=<value>"
+```
+Values are for the plotted metric (`--metric`, default roc_auc). They are only comparable when computed on
+seen_val, at the same horizon, with the same evaluator. They are stored per metric in `references.json`, so later
+aggregations keep them without the flag.
 
 ## When /scratch1 stalls
 

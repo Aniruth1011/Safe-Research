@@ -9,11 +9,14 @@ Outputs, in one folder per configuration (pool, normalize, train horizon, probe,
     config.json                 the configuration; a second run into the same folder must match it
     rows/L{LL}_seed{S}.json     one row per (layer, seed), written atomically, ending in "completed": true and
                                 the Slurm job / array task that wrote it; reruns reuse such rows and log each reuse
+    rows/L{LL}_seed{S}.scores.npz   what the evaluator saw for that row (per-step scores, labels, horizons, ids);
+                                aggregate resamples seen_val episodes from these for bootstrap CIs
     rows/_discarded/            rows that were not reusable (moved aside, never deleted), then recomputed
+    references.json             reference lines for the plot (e.g. the SAFE final-layer baseline), per metric
     _discarded/tmp/             temp files left by tasks killed mid-write (moved aside at the start of a run)
     results.csv                 all rows (aggregate)
-    summary.csv                 mean / std / n over seeds per layer (aggregate)
-    depth_curve.png             mean +- std per layer (aggregate)
+    summary.csv                 mean / std / n over seeds and bootstrap CI over episodes, per layer (aggregate)
+    depth_curve.png             mean, seed std band, bootstrap CI bars, reference lines (aggregate)
 Rows made with a TEMPORARY probe or evaluator say so in every file and in the plot title.
 Every file and folder written here is made readable by group and others (0644 / 0755), so results can be shared.
 """
@@ -277,8 +280,44 @@ def _write_json_atomic(path: Path, obj) -> None:
         raise
 
 
+def _write_npz_atomic(path: Path, **arrays) -> None:
+    _mkdir_shared(path.parent)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            np.savez_compressed(f, **arrays)
+        os.chmod(tmp, FILE_MODE)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def scores_path(row_path: Path) -> Path:
+    """rows/L10_seed0.json -> rows/L10_seed0.scores.npz"""
+    return row_path.with_name(row_path.stem + ".scores.npz")
+
+
+def _save_eval_input(path: Path, data: EvalInput) -> None:
+    lengths = np.array([len(x) for x in data.step_scores], dtype=np.int64)
+    _write_npz_atomic(path, step_scores=np.concatenate([np.asarray(x, np.float32).reshape(-1) for x in data.step_scores]),
+                      offsets=np.concatenate([[0], np.cumsum(lengths)]), labels=np.asarray(data.labels, np.float32),
+                      horizons=np.asarray(data.horizons, np.int64), task_ids=np.asarray(data.task_ids, np.int64),
+                      trajectory_ids=np.asarray(data.trajectory_ids, dtype=str))
+
+
+def load_eval_input(path: Path) -> EvalInput:
+    with np.load(path) as z:
+        flat, off = z["step_scores"], z["offsets"]
+        return EvalInput([flat[off[i]:off[i + 1]] for i in range(len(off) - 1)], z["labels"], z["horizons"],
+                         z["task_ids"], [str(t) for t in z["trajectory_ids"]])
+
+
 # Temp files of _write_json_atomic (".<name>.<random>") and other hidden 8-character tempfile names (".<random>").
-_TEMP_NAME = re.compile(r"^\.(?:[A-Za-z0-9_]+\.json\.)?[a-z0-9_]{8}$")
+_TEMP_NAME = re.compile(r"^\.(?:[A-Za-z0-9_.]+\.(?:json|npz)\.)?[a-z0-9_]{8}$")
 STALE_TEMP_S = 15 * 60  # far longer than a task's time limit, so a task still writing is never disturbed
 
 
@@ -348,9 +387,12 @@ def check_row(path: Path, layer: int, seed: int) -> tuple[str, dict | None, str]
 
 
 def _discard(path: Path, reason: str, log) -> None:
-    dest = path.parent / "_discarded" / f"{path.stem}.{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json"
+    stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    dest = path.parent / "_discarded" / f"{path.stem}.{stamp}.json"
     _mkdir_shared(dest.parent)
     os.replace(path, dest)
+    if scores_path(path).exists():                     # the row's saved scores go with it
+        os.replace(scores_path(path), path.parent / "_discarded" / f"{path.stem}.{stamp}.scores.npz")
     log(f"{path.name}: {reason}; moved to {dest} and recomputing")
 
 
@@ -436,8 +478,11 @@ def run_layer(cfg: SweepConfig, layer: int, out_dir: Path, loader: Path = DEFAUL
         fit_s = time.time() - t1
         t2 = time.time()
         scores = fitted.step_scores(val)
-        metrics = evaluator(EvalInput(scores, labels, horizons, task_ids, val_ids))
+        eval_input = EvalInput(scores, labels, horizons, task_ids, val_ids)
+        metrics = evaluator(eval_input)
         score_s = time.time() - t2
+        row_path = out_dir / "rows" / f"L{layer:02d}_seed{seed}.json"
+        _save_eval_input(scores_path(row_path), eval_input)  # before the row: a completed row has its scores
         temporary = bool(probe.temporary or evaluator.temporary)
         row = {
             "experiment": "R1-R4_depth_sweep", "layer": layer, "layer_name": names[layer], "seed": seed,
@@ -451,10 +496,11 @@ def run_layer(cfg: SweepConfig, layer: int, out_dir: Path, loader: Path = DEFAUL
             "peak_rss_gb": round(_peak_rss_gb(), 2), "threads": _threads(),
             "cache_version": cfg_doc["cache"]["cache_version"], "cache_manifest_sha256": cfg_doc["cache"]["manifest_sha256"],
             "git_commit": _git_commit(), "python": platform.python_version(), "torch": _torch_version(),
+            "scores_file": scores_path(row_path).name,
             **_job_identity(), "written_utc": _utc_now(),
             "completed": True,  # set only here, after the metrics exist; reruns reuse a row only if it is True
         }
-        _write_json_atomic(out_dir / "rows" / f"L{layer:02d}_seed{seed}.json", row)
+        _write_json_atomic(row_path, row)
         shown = ", ".join(f"{k}={v:.3f}" for k, v in metrics.items())
         log(f"layer {layer} seed {seed}: {shown}  (fit {fit_s:.1f} s, score {score_s:.1f} s, peak RSS {row['peak_rss_gb']} GB)"
             + ("  [TEMPORARY probe/evaluator]" if temporary else ""))
@@ -495,8 +541,113 @@ def missing_rows(out_dir: Path, layers: list[int]) -> dict[int, list[int]]:
     return {l: s for l, s in out.items() if s}
 
 
-def aggregate(out_dir: Path, metric: str = "roc_auc", plot: bool = True, log=print) -> dict:
-    """Collect rows into results.csv and summary.csv, and draw depth_curve.png. Returns the paths written."""
+# ----------------------------------------------------------------------------------------- bootstrap CIs over episodes
+def bootstrap_layer(score_files: list[Path], evaluator_spec: str, n: int = 1000, ci: float = 0.95,
+                    seed: int = 0) -> dict:
+    """Bootstrap CI of the seed-averaged metrics of one layer, resampling seen_val episodes.
+
+    Each resample draws episodes with replacement, separately among failures and successes (so both classes keep
+    their counts and every metric stays defined). The SAME episodes are used for every seed; the evaluator (whatever
+    the folder was run with) scores each seed on them, and the metrics are averaged over seeds. The CI is the
+    percentile interval of that average. Returns {metric: (low, high)} plus "_n_valid".
+    """
+    evaluator = resolve(evaluator_spec, EVALUATORS)
+    inputs = [load_eval_input(f) for f in score_files]
+    ref_ids = inputs[0].trajectory_ids
+    aligned = []
+    for d in inputs:                                   # same episode order for every seed
+        if d.trajectory_ids != ref_ids:
+            pos = {t: i for i, t in enumerate(d.trajectory_ids)}
+            if set(pos) != set(ref_ids):
+                raise ValueError("seeds of one layer were scored on different episodes")
+            order = [pos[t] for t in ref_ids]
+            d = EvalInput([d.step_scores[i] for i in order], d.labels[order], d.horizons[order], d.task_ids[order],
+                          list(ref_ids))
+        aligned.append(d)
+    labels = aligned[0].labels
+    pos_idx, neg_idx = np.flatnonzero(labels == 1), np.flatnonzero(labels != 1)
+    rng = np.random.default_rng(seed)
+    samples: dict[str, list[float]] = {}
+    for _ in range(n):
+        idx = np.concatenate([rng.choice(pos_idx, len(pos_idx)), rng.choice(neg_idx, len(neg_idx))])
+        per_seed = [evaluator(EvalInput([d.step_scores[i] for i in idx], d.labels[idx], d.horizons[idx],
+                                        d.task_ids[idx], [d.trajectory_ids[i] for i in idx])) for d in aligned]
+        for k in per_seed[0]:
+            samples.setdefault(k, []).append(float(np.nanmean([m[k] for m in per_seed])))
+    lo, hi = 100 * (1 - ci) / 2, 100 * (1 + ci) / 2
+    out = {}
+    for k, v in samples.items():
+        v = np.asarray(v)
+        v = v[np.isfinite(v)]
+        out[k] = (float(np.percentile(v, lo)), float(np.percentile(v, hi))) if len(v) else (float("nan"),) * 2
+    out["_n_valid"] = min((int(np.isfinite(np.asarray(v)).sum()) for v in samples.values()), default=0)
+    return out
+
+
+def _bootstrap_job(args):
+    layer, files, spec, n, ci, seed = args
+    return layer, bootstrap_layer(files, spec, n, ci, seed)
+
+
+def bootstrap_cis(out_dir: Path, df, evaluator_spec: str, n: int, ci: float, seed: int = 0, workers: int = 1,
+                  log=print) -> dict[int, dict]:
+    """{layer: bootstrap_layer(...)} for every layer whose rows all have saved scores; others are skipped (logged)."""
+    jobs, skipped = [], []
+    for layer, g in df.groupby("layer"):
+        files = [Path(out_dir) / "rows" / f"L{int(layer):02d}_seed{int(s)}.scores.npz" for s in g.seed]
+        if all(f.exists() for f in files):
+            jobs.append((int(layer), files, evaluator_spec, n, ci, seed + int(layer)))
+        else:
+            skipped.append(int(layer))
+    if skipped:
+        log(f"no bootstrap CI for layers {skipped}: their rows have no saved scores (written before scores were saved)")
+    if not jobs:
+        return {}
+    t0 = time.time()
+    log(f"bootstrap: {n} resamples of seen_val episodes for {len(jobs)} layers, {workers} worker(s)")
+    if workers > 1 and len(jobs) > 1:
+        from concurrent.futures import ProcessPoolExecutor
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            results = dict(pool.map(_bootstrap_job, jobs))
+    else:
+        results = dict(map(_bootstrap_job, jobs))
+    log(f"bootstrap done in {time.time() - t0:.0f} s")
+    return results
+
+
+# ------------------------------------------------------------------------------------------------ reference lines
+def parse_refs(specs) -> dict[str, float]:
+    """["SAFE final layer (reproduction)=0.81", ...] or "a=0.8;b=0.7" -> {label: value}."""
+    if isinstance(specs, str):
+        specs = specs.split(";")
+    out = {}
+    for spec in specs or []:
+        spec = spec.strip()
+        if not spec:
+            continue
+        label, sep, value = spec.rpartition("=")
+        if not sep or not label.strip():
+            raise ValueError(f"reference {spec!r} must look like 'label=value'")
+        out[label.strip()] = float(value)
+    return out
+
+
+def update_references(out_dir: Path, metric: str, refs: dict[str, float]) -> dict[str, float]:
+    """Merge refs for `metric` into out_dir/references.json and return all references stored for it."""
+    path = Path(out_dir) / "references.json"
+    doc = json.loads(path.read_text()) if path.exists() else {}
+    if refs:
+        doc.setdefault(metric, {}).update(refs)
+        _write_json_atomic(path, doc)
+    return dict(doc.get(metric, {}))
+
+
+def aggregate(out_dir: Path, metric: str = "roc_auc", plot: bool = True, log=print, bootstrap: int = 1000,
+              ci: float = 0.95, refs: dict[str, float] | None = None, workers: int = 1) -> dict:
+    """Collect rows into results.csv and summary.csv (with bootstrap CIs over episodes), and draw depth_curve.png.
+
+    refs: reference values of `metric` for the plot (stored in references.json, so later aggregations keep them).
+    Returns the paths written."""
     import pandas as pd
     out_dir = Path(out_dir)
     move_aside_stale_temp_files(out_dir, log)
@@ -516,35 +667,102 @@ def aggregate(out_dir: Path, metric: str = "roc_auc", plot: bool = True, log=pri
     summary = summary.reset_index()
     temporary = bool(df.TEMPORARY.any())
     summary.insert(0, "TEMPORARY", temporary)
+
+    cis = {}
+    if bootstrap > 0:
+        evaluator_spec = json.loads((out_dir / "config.json").read_text())["evaluator"]
+        cis = bootstrap_cis(out_dir, df, evaluator_spec, bootstrap, ci, workers=workers, log=log)
+    pct = f"{round(ci * 100):d}"
+    for col in metric_cols:
+        k = col.removeprefix(METRIC_PREFIX)
+        summary[f"{col}_ci{pct}_low"] = [cis.get(int(l), {}).get(k, (np.nan, np.nan))[0] for l in summary.layer]
+        summary[f"{col}_ci{pct}_high"] = [cis.get(int(l), {}).get(k, (np.nan, np.nan))[1] for l in summary.layer]
+    summary["bootstrap_resamples"] = [cis[int(l)]["_n_valid"] if int(l) in cis else 0 for l in summary.layer]
     summary.to_csv(out_dir / "summary.csv", index=False)
     written = {"results": out_dir / "results.csv", "summary": out_dir / "summary.csv"}
+    references = update_references(out_dir, metric, refs or {})
+    if references:
+        log("reference lines for " + metric + ": " + ", ".join(f"{k} = {v:.3f}" for k, v in references.items()))
     if plot:
-        written["plot"] = _plot(summary, df.iloc[0], METRIC_PREFIX + metric, out_dir / "depth_curve.png", temporary)
+        written["plot"] = _plot(summary, df.iloc[0], METRIC_PREFIX + metric, out_dir / "depth_curve.png", temporary,
+                                references, f"{col_ci(METRIC_PREFIX + metric, ci)}", ci, bootstrap)
     # open up everything here (also rows written before rows were made 0644); others' files are left alone
     for path in [out_dir, out_dir / "rows", *out_dir.glob("*"), *(out_dir / "rows").rglob("*")]:
         _share(path)
     return written
 
 
-def _plot(summary, first_row, col: str, path: Path, temporary: bool) -> Path:
+def col_ci(col: str, ci: float) -> str:
+    return f"{col}_ci{round(ci * 100):d}"
+
+
+PRENORM_OFFSET = 0.35  # x offset of a "_prenorm" layer from its "_postnorm" partner
+
+
+def plot_positions(summary) -> tuple[list[int], dict[int, float]]:
+    """Main-curve layers, and {layer: x} for "<block>_prenorm" layers (raw block 32 = index 33 in cache v1).
+
+    A pre-norm layer is the same block as its "_postnorm" partner, only before the final RMSNorm, so it is drawn
+    next to that partner, not as one layer deeper."""
+    names = dict(zip(summary.layer.astype(int), summary.layer_name.astype(str)))
+    by_name = {n: l for l, n in names.items()}
+    side = {}
+    for layer, name in names.items():
+        if name.endswith("_prenorm"):
+            partner = by_name.get(name[: -len("_prenorm")] + "_postnorm")
+            main = [l for l, n in names.items() if not n.endswith("_prenorm")]
+            side[layer] = (partner if partner is not None else max(main, default=layer)) + PRENORM_OFFSET
+    return [l for l in sorted(names) if l not in side], side
+
+
+def build_figure(summary, first_row, col: str, temporary: bool, references: dict[str, float] | None = None,
+                 ci_col: str | None = None, ci: float = 0.95, n_boot: int = 0):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    fig, ax = plt.subplots(figsize=(10, 4))
-    x, m, s = summary.layer.to_numpy(), summary[f"{col}_mean"].to_numpy(), summary[f"{col}_std"].fillna(0).to_numpy()
-    ax.plot(x, m, marker="o", ms=3, lw=1.5, color="#2563eb")
-    ax.fill_between(x, m - s, m + s, alpha=0.2, color="#2563eb", lw=0)
-    ax.set_xlabel("layer index (0 = embeddings, 32 = final post-norm, 33 = raw block 32 if present)")
-    ax.set_ylabel(f"seen_val {col.removeprefix(METRIC_PREFIX)} (mean ± std over seeds)")
+    blue, orange = "#2563eb", "#d97706"
+    fig, ax = plt.subplots(figsize=(10, 4.2))
+    main, side = plot_positions(summary)
+    s_main = summary.set_index(summary.layer.astype(int)).loc[main]
+    x, m = s_main.index.to_numpy(), s_main[f"{col}_mean"].to_numpy()
+    sd = s_main[f"{col}_std"].fillna(0).to_numpy()
+    ax.plot(x, m, marker="o", ms=3, lw=1.5, color=blue, label="mean over seeds", zorder=3)
+    ax.fill_between(x, m - sd, m + sd, alpha=0.2, color=blue, lw=0, label="± std over seeds")
+    have_ci = ci_col is not None and f"{ci_col}_low" in summary and summary[f"{ci_col}_low"].notna().any()
+    if have_ci:
+        lo, hi = s_main[f"{ci_col}_low"].to_numpy(), s_main[f"{ci_col}_high"].to_numpy()
+        ax.errorbar(x, m, yerr=[m - lo, hi - m], fmt="none", ecolor=blue, elinewidth=0.8, capsize=2, alpha=0.7,
+                    label=f"{round(ci * 100)}% bootstrap CI over seen_val episodes ({n_boot} resamples)")
+    for layer, xs in side.items():
+        r = summary.set_index(summary.layer.astype(int)).loc[layer]
+        mean, std = float(r[f"{col}_mean"]), float(0 if np.isnan(r[f"{col}_std"]) else r[f"{col}_std"])
+        ax.errorbar([xs], [mean], yerr=[[std], [std]], fmt="none", ecolor=orange, elinewidth=5, alpha=0.3)
+        if have_ci and not np.isnan(r[f"{ci_col}_low"]):
+            ax.errorbar([xs], [mean], yerr=[[mean - r[f"{ci_col}_low"]], [r[f"{ci_col}_high"] - mean]], fmt="none",
+                        ecolor=orange, elinewidth=0.8, capsize=2)
+        ax.plot([xs], [mean], marker="D", ms=6, mfc="white", mec=orange, mew=1.5, ls="none", zorder=4,
+                label=f"{r.layer_name} (index {layer}): block before the final norm")
+    for (label, value), color in zip((references or {}).items(), ["#16a34a", "#7c3aed", "#db2777", "#475569"]):
+        ax.axhline(value, ls="--", lw=1.2, color=color, label=f"{label}: {value:.3f}", zorder=2)
+    ax.set_xlabel("layer index (0 = embeddings, 32 = final layer after the norm; diamond = same block before the norm)")
+    ax.set_ylabel(f"seen_val {col.removeprefix(METRIC_PREFIX)}")
     ax.set_xticks(x)
     ax.tick_params(axis="x", labelsize=7)
     ax.grid(alpha=0.3)
+    ax.legend(fontsize=7, loc="best")
     title = (f"Depth sweep: pool={first_row.pool}, {'train-norm' if first_row.normalize else 'raw'}, "
              f"probe={first_row.probe}, eval={first_row.evaluator}")
     if temporary:
         title = "TEMPORARY probe/metric: NOT A RESULT\n" + title
     ax.set_title(title, fontsize=9, color="#b91c1c" if temporary else "black")
     fig.tight_layout()
+    return fig, ax
+
+
+def _plot(summary, first_row, col: str, path: Path, temporary: bool, references=None, ci_col=None, ci=0.95,
+          n_boot=0) -> Path:
+    import matplotlib.pyplot as plt
+    fig, _ = build_figure(summary, first_row, col, temporary, references, ci_col, ci, n_boot)
     fig.savefig(path, dpi=150)
     plt.close(fig)
     return path
