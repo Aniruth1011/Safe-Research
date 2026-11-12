@@ -7,11 +7,14 @@ refuses a cache whose train/seen_val episodes include a task from protocol.UNSEE
 
 Outputs, in one folder per configuration (pool, normalize, train horizon, probe, evaluator, cache):
     config.json                 the configuration; a second run into the same folder must match it
-    rows/L{LL}_seed{S}.json     one row per (layer, seed), written atomically; reruns skip finished rows
+    rows/L{LL}_seed{S}.json     one row per (layer, seed), written atomically, ending in "completed": true and
+                                the Slurm job / array task that wrote it; reruns reuse such rows and log each reuse
+    rows/_discarded/            rows that were not reusable (moved aside, never deleted), then recomputed
     results.csv                 all rows (aggregate)
     summary.csv                 mean / std / n over seeds per layer (aggregate)
     depth_curve.png             mean +- std per layer (aggregate)
 Rows made with a TEMPORARY probe or evaluator say so in every file and in the plot title.
+Every file and folder written here is made readable by group and others (0644 / 0755), so results can be shared.
 """
 from __future__ import annotations
 
@@ -25,6 +28,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime, timezone
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -37,6 +41,10 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_LOADER = REPO_ROOT / "collection" / "load_cache.py"
 ALLOWED_SPLITS = ("train", "seen_val")  # unseen_test is never touched by the sweep
 METRIC_PREFIX = "val_"
+FILE_MODE, DIR_MODE = 0o644, 0o755  # results are shared with the team
+# Who wrote a row. Kept in rows/*.json (on CARC only) but left out of results.csv, which may be shared more widely:
+# job IDs and log paths (they contain the user name) must not reach the public repo.
+JOB_FIELDS = ("slurm_job_id", "slurm_array_job_id", "slurm_array_task_id", "log_path")
 
 
 def load_cache_module(path: Path = DEFAULT_LOADER):
@@ -116,13 +124,75 @@ def _peak_rss_gb() -> float:
     return r / 1e9 if sys.platform == "darwin" else r / 1e6  # bytes on macOS, KiB on Linux
 
 
+def _share(path: Path) -> None:
+    """Make a file 0644 / a folder 0755. Silently skips paths owned by someone else."""
+    try:
+        os.chmod(path, DIR_MODE if Path(path).is_dir() else FILE_MODE)
+    except OSError:
+        pass
+
+
+def _mkdir_shared(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    _share(path)
+
+
 def _write_json_atomic(path: Path, obj) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    _mkdir_shared(path.parent)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")  # mkstemp makes 0600 files ...
     with os.fdopen(fd, "w") as f:
         json.dump(obj, f, indent=2, sort_keys=True)
         f.write("\n")
+    os.chmod(tmp, FILE_MODE)                                               # ... so open it up before the rename
     os.replace(tmp, path)
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _job_identity() -> dict:
+    """The Slurm job (and array task) running this process; all None outside Slurm."""
+    env = os.environ
+    return {"slurm_job_id": env.get("SLURM_JOB_ID"), "slurm_array_job_id": env.get("SLURM_ARRAY_JOB_ID"),
+            "slurm_array_task_id": env.get("SLURM_ARRAY_TASK_ID"), "log_path": env.get("SWEEP_LOG")}
+
+
+def _job_label(row: dict) -> str:
+    """'<array job>_<task>' as sacct shows it, else the job ID, else 'no Slurm job'."""
+    if row.get("slurm_array_job_id") and row.get("slurm_array_task_id") is not None:
+        return f"job {row['slurm_array_job_id']}_{row['slurm_array_task_id']}"
+    return f"job {row['slurm_job_id']}" if row.get("slurm_job_id") else "no Slurm job"
+
+
+def check_row(path: Path, layer: int, seed: int) -> tuple[str, dict | None, str]:
+    """Classify an existing row file: ("reuse" | "legacy" | "invalid", row or None, reason).
+
+    reuse   written by this version: "completed": true and the job fields (the job ID may be None outside Slurm)
+    legacy  written before job IDs were recorded (no "completed" and no job fields at all); reused, as agreed
+    invalid anything else (unreadable, wrong layer/seed, completed missing or false): moved aside and recomputed
+    """
+    try:
+        row = json.loads(path.read_text())
+    except (OSError, ValueError) as e:
+        return "invalid", None, f"unreadable ({type(e).__name__})"
+    if not isinstance(row, dict) or row.get("layer") != layer or row.get("seed") != seed:
+        return "invalid", None, "layer/seed do not match the file name"
+    if not any(k.startswith(METRIC_PREFIX) for k in row):
+        return "invalid", row, "no metrics"
+    has_job = all(k in row for k in JOB_FIELDS[:3])
+    if row.get("completed") is True and has_job:
+        return "reuse", row, ""
+    if "completed" not in row and not any(k in row for k in JOB_FIELDS):
+        return "legacy", row, ""
+    return "invalid", row, "not marked completed by a recorded job"
+
+
+def _discard(path: Path, reason: str, log) -> None:
+    dest = path.parent / "_discarded" / f"{path.stem}.{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json"
+    _mkdir_shared(dest.parent)
+    os.replace(path, dest)
+    log(f"{path.name}: {reason}; moved to {dest} and recomputing")
 
 
 def _check_or_write_config(out_dir: Path, cfg: SweepConfig, cache: SeenOnlyCache, probe, evaluator) -> dict:
@@ -144,15 +214,40 @@ def run_layer(cfg: SweepConfig, layer: int, out_dir: Path, loader: Path = DEFAUL
               log=print) -> list[dict]:
     """Train cfg.seeds probes on one layer and score seen_val. Returns the rows (also written to out_dir/rows/)."""
     out_dir = Path(out_dir)
+    log(f"opening cache {cfg.cache_dir} (loader {loader})")
+    t_open = time.time()
     cache = SeenOnlyCache(Path(cfg.cache_dir), loader)
+    log(f"cache open ({time.time() - t_open:.1f} s): {len(cache.episodes)} episodes, "
+        f"version {cache.manifest.get('cache_version')}")
     names = cache.layer_names()
     if not 0 <= layer < len(names):
         raise ValueError(f"layer {layer} not in this cache (0..{len(names) - 1})")
     probe, evaluator = resolve(cfg.probe, PROBES), resolve(cfg.evaluator, EVALUATORS)
+    _mkdir_shared(out_dir)
     cfg_doc = _check_or_write_config(out_dir, cfg, cache, probe, evaluator)
-    todo = [s for s in cfg.seeds if overwrite or not (out_dir / "rows" / f"L{layer:02d}_seed{s}.json").exists()]
+    todo = []
+    for seed in cfg.seeds:
+        path = out_dir / "rows" / f"L{layer:02d}_seed{seed}.json"
+        if not path.exists():
+            todo.append(seed)
+            continue
+        if overwrite:
+            _discard(path, "--overwrite given", log)
+            todo.append(seed)
+            continue
+        status, row, reason = check_row(path, layer, seed)
+        if status == "reuse":
+            log(f"layer {layer} seed {seed}: reusing row from {_job_label(row)}, commit {row.get('git_commit')}, "
+                f"written {row.get('written_utc')} ({path})")
+        elif status == "legacy":
+            mtime = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            log(f"layer {layer} seed {seed}: reusing legacy row (written before job IDs were recorded), "
+                f"commit {row.get('git_commit')}, file time {mtime} ({path})")
+        else:
+            _discard(path, reason, log)
+            todo.append(seed)
     if not todo:
-        log(f"layer {layer}: all seeds {list(cfg.seeds)} already done; skipped")
+        log(f"layer {layer}: every seed {list(cfg.seeds)} reused; nothing to compute")
         return []
 
     t0 = time.time()
@@ -190,6 +285,8 @@ def run_layer(cfg: SweepConfig, layer: int, out_dir: Path, loader: Path = DEFAUL
             "peak_rss_gb": round(_peak_rss_gb(), 2), "threads": _threads(),
             "cache_version": cfg_doc["cache"]["cache_version"], "cache_manifest_sha256": cfg_doc["cache"]["manifest_sha256"],
             "git_commit": _git_commit(), "python": platform.python_version(), "torch": _torch_version(),
+            **_job_identity(), "written_utc": _utc_now(),
+            "completed": True,  # set only here, after the metrics exist; reruns reuse a row only if it is True
         }
         _write_json_atomic(out_dir / "rows" / f"L{layer:02d}_seed{seed}.json", row)
         shown = ", ".join(f"{k}={v:.3f}" for k, v in metrics.items())
@@ -223,6 +320,7 @@ def aggregate(out_dir: Path, metric: str = "roc_auc", plot: bool = True) -> dict
     if not files:
         raise FileNotFoundError(f"no rows under {out_dir / 'rows'}")
     df = pd.DataFrame([json.loads(f.read_text()) for f in files]).sort_values(["layer", "seed"])
+    df = df.drop(columns=[c for c in JOB_FIELDS if c in df.columns])
     if df.eval_split.ne("seen_val").any():
         raise ValueError("rows scored on something other than seen_val")
     if df[["probe", "evaluator", "pool", "normalize", "train_horizon", "cache_manifest_sha256"]].nunique().max() > 1:
@@ -238,6 +336,9 @@ def aggregate(out_dir: Path, metric: str = "roc_auc", plot: bool = True) -> dict
     written = {"results": out_dir / "results.csv", "summary": out_dir / "summary.csv"}
     if plot:
         written["plot"] = _plot(summary, df.iloc[0], METRIC_PREFIX + metric, out_dir / "depth_curve.png", temporary)
+    # open up everything here (also rows written before rows were made 0644); others' files are left alone
+    for path in [out_dir, out_dir / "rows", *out_dir.glob("*"), *(out_dir / "rows").rglob("*")]:
+        _share(path)
     return written
 
 

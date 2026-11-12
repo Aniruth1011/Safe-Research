@@ -13,15 +13,43 @@ failure_prob/engine/sweep_plugins.py); swap them with --probe/--evaluator 'packa
 """
 from __future__ import annotations
 
+# Only the standard library before the first log line, so a stall while importing shows up in the log.
 import argparse
+import faulthandler
 import os
+import signal
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # run from a checkout without `pip install -e`
+T_START = time.time()
 
+
+def log(msg: str) -> None:
+    print(f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] {msg}", flush=True)
+
+
+def _on_sigterm(signum, frame):
+    """scancel / time limit: show where the process was, then stop before any further row is written."""
+    log(f"received signal {signum} (cancelled or out of time); stack follows; no further rows will be written")
+    faulthandler.dump_traceback(all_threads=True)
+    raise SystemExit(128 + signum)
+
+
+if __name__ == "__main__":                                     # not when a test imports this file
+    faulthandler.enable()                                      # tracebacks on hard crashes
+    if hasattr(signal, "SIGUSR1"):
+        faulthandler.register(signal.SIGUSR1, all_threads=True)  # `scancel --signal=USR1 <job>`: print the stack
+    signal.signal(signal.SIGTERM, _on_sigterm)
+
+log(f"start: pid {os.getpid()}, python {sys.version.split()[0]} ({sys.executable}), cwd {os.getcwd()}, "
+    f"log {os.environ.get('SWEEP_LOG') or 'stdout'}, PYTHONDONTWRITEBYTECODE={os.environ.get('PYTHONDONTWRITEBYTECODE', '')}")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # run from a checkout without `pip install -e`
+log("importing failure_prob (numpy, the cache loader)")
 from failure_prob.engine.depth_sweep import SweepConfig, aggregate, run_layer  # noqa: E402
 from failure_prob.protocol import TRAIN_SEEDS  # noqa: E402
+log(f"imports done ({time.time() - T_START:.1f} s since start)")
 
 USER = os.environ.get("USER", "user")
 DEFAULT_CACHE = os.environ.get("CACHE_DIR", f"/scratch1/{USER}/safe_cache/v1")
@@ -61,15 +89,19 @@ def main(argv=None):
                            probe=args.probe, evaluator=args.evaluator, seeds=tuple(seeds))
 
     if args.cmd == "run":
+        log("importing torch")
+        t = time.time()
+        import torch
+        log(f"torch {torch.__version__} imported ({time.time() - t:.1f} s)")
         if args.threads:
-            import torch
             torch.set_num_threads(args.threads)
         cfg = config(args.cache, args.seeds)
         out = Path(args.out) if args.out else Path(DEFAULT_OUT_ROOT) / cfg.label()
-        print(f"configuration {cfg.label()} -> {out}", flush=True)
+        log(f"configuration {cfg.label()} -> {out}")
         kw = {"loader": args.loader} if args.loader else {}
         for layer in args.layers:
-            run_layer(cfg, layer, out, overwrite=args.overwrite, log=lambda m: print(m, flush=True), **kw)
+            run_layer(cfg, layer, out, overwrite=args.overwrite, log=log, **kw)
+        log(f"done ({time.time() - T_START:.1f} s since start)")
     else:
         plot = not args.no_plot
         if plot:
@@ -80,8 +112,9 @@ def main(argv=None):
                 print("matplotlib is not installed here: writing the tables only. Draw the plot elsewhere with "
                       "`python scripts/depth_sweep.py aggregate --out <copy of this folder>`.", file=sys.stderr)
         out = Path(args.out) if args.out else Path(DEFAULT_OUT_ROOT) / config().label()
+        log(f"aggregating {out}")
         for name, path in aggregate(out, metric=args.metric, plot=plot).items():
-            print(f"{name}: {path}")
+            log(f"{name}: {path}")
         if not args.no_plot and not plot:
             sys.exit(3)
 

@@ -139,15 +139,95 @@ def test_placeholder_evaluator_ignores_steps_after_the_horizon():
     assert TemporaryMaxScoreEvaluator()(data)["roc_auc"] == 1.0   # with the step-3 spike counted it would be 0.75
 
 
-def test_reruns_skip_done_rows_and_refuse_a_different_configuration(cache, tmp_path):
+def test_reruns_reuse_completed_rows_log_each_reuse_and_refuse_a_different_configuration(cache, tmp_path, monkeypatch):
     out = tmp_path / "out"
-    assert len(ds.run_layer(cfg(cache, seeds=(0,)), 1, out, log=lambda m: None)) == 1
-    assert ds.run_layer(cfg(cache, seeds=(0,)), 1, out, log=lambda m: None) == []      # skipped
+    monkeypatch.setenv("SLURM_JOB_ID", "1001")
+    monkeypatch.setenv("SLURM_ARRAY_JOB_ID", "1000")
+    monkeypatch.setenv("SLURM_ARRAY_TASK_ID", "1")
+    (row,) = ds.run_layer(cfg(cache, seeds=(0,)), 1, out, log=lambda m: None)
+    assert row["completed"] is True and row["slurm_job_id"] == "1001" and row["slurm_array_task_id"] == "1"
+    assert row["written_utc"].endswith("Z")
+    msgs = []
+    assert ds.run_layer(cfg(cache, seeds=(0,)), 1, out, log=msgs.append) == []      # reused
+    assert any(m.startswith("layer 1 seed 0: reusing row from job 1000_1, commit ") for m in msgs), msgs
     assert len(ds.run_layer(cfg(cache, seeds=(0, 1)), 1, out, log=lambda m: None)) == 1  # only the new seed
     with pytest.raises(ValueError, match="different configuration"):
         ds.run_layer(cfg(cache, seeds=(0,), pool="first"), 1, out, log=lambda m: None)
     with pytest.raises(ValueError, match="not in this cache"):
         ds.run_layer(cfg(cache, seeds=(0,)), 4, out, log=lambda m: None)
+
+
+def test_legacy_rows_are_reused_and_unfinished_rows_are_moved_aside(cache, tmp_path, monkeypatch):
+    for k in ("SLURM_JOB_ID", "SLURM_ARRAY_JOB_ID", "SLURM_ARRAY_TASK_ID"):
+        monkeypatch.delenv(k, raising=False)
+    out = tmp_path / "out"
+    rows = {r["seed"]: r for r in ds.run_layer(cfg(cache, seeds=(0, 1, 2)), 1, out, log=lambda m: None)}
+    assert rows[0]["slurm_job_id"] is None and rows[0]["completed"] is True       # outside Slurm: still reusable
+    path = lambda s: out / "rows" / f"L01_seed{s}.json"
+    legacy = {k: v for k, v in rows[0].items() if k not in ds.JOB_FIELDS + ("completed", "written_utc")}
+    path(0).write_text(json.dumps(legacy))                                         # a row from before this change
+    path(1).write_text(json.dumps({**rows[1], "completed": False}))                 # never finished
+    path(2).write_text(json.dumps({k: v for k, v in rows[2].items() if k != "slurm_job_id"}))  # job fields missing
+    msgs = []
+    redone = ds.run_layer(cfg(cache, seeds=(0, 1, 2)), 1, out, log=msgs.append)
+    assert sorted(r["seed"] for r in redone) == [1, 2]
+    assert any("seed 0: reusing legacy row (written before job IDs were recorded)" in m for m in msgs), msgs
+    assert sum("moved to" in m and "recomputing" in m for m in msgs) == 2
+    assert sorted(f.name.split(".")[0] for f in (out / "rows" / "_discarded").iterdir()) == ["L01_seed1", "L01_seed2"]
+    assert json.loads(path(0).read_text()) == legacy                               # legacy row left as it was
+    assert all(json.loads(path(s).read_text())["completed"] is True for s in (1, 2))
+
+
+def test_files_are_shared_readable_and_results_csv_has_no_job_fields(cache, tmp_path, monkeypatch):
+    import os, stat
+    monkeypatch.setenv("SLURM_JOB_ID", "1001")
+    monkeypatch.setenv("SWEEP_LOG", "/somewhere/logs/x.out")
+    old = os.umask(0o077)                                                          # a strict umask, as on CARC
+    try:
+        out = tmp_path / "out"
+        ds.run_layer(cfg(cache, seeds=(0,)), 1, out, log=lambda m: None)
+        stale = out / "rows" / "L01_seed0.json"
+        os.chmod(stale, 0o600)                                                     # like the rows written before
+        written = ds.aggregate(out, plot=False)
+    finally:
+        os.umask(old)
+    mode = lambda p: stat.S_IMODE(p.stat().st_mode)
+    assert mode(out) == mode(out / "rows") == 0o755
+    assert {mode(p) for p in [stale, out / "config.json", *written.values()]} == {0o644}
+    results = pd.read_csv(written["results"])
+    assert not set(ds.JOB_FIELDS) & set(results.columns) and results.completed.all()
+
+
+def test_sigterm_stops_the_run_before_a_row_is_written(cache, tmp_path):
+    """A cancelled task (scancel / time limit) dumps its stack and exits without writing the row it was working on."""
+    import os, signal, subprocess, sys, time
+    (tmp_path / "slow_plugins.py").write_text(textwrap.dedent("""
+        import time
+        class SlowProbe:
+            name, temporary = "slow", False
+            def fit(self, train_records, seed):
+                print("FITTING", flush=True)
+                time.sleep(60)
+        def make_probe(): return SlowProbe()
+    """))
+    out = tmp_path / "out"
+    env = {**os.environ, "PYTHONPATH": str(tmp_path), "PYTHONDONTWRITEBYTECODE": "1"}
+    proc = subprocess.Popen([sys.executable, str(ds.REPO_ROOT / "scripts" / "depth_sweep.py"), "run", "--cache",
+                             str(cache), "--out", str(out), "--layers", "1", "--seeds", "0", "--probe",
+                             "slow_plugins:make_probe"], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True)
+    lines, t0 = [], time.time()
+    for line in proc.stdout:
+        lines.append(line)
+        if "FITTING" in line or time.time() - t0 > 120:
+            break
+    proc.send_signal(signal.SIGTERM)
+    rest, _ = proc.communicate(timeout=60)
+    text = "".join(lines) + rest
+    assert proc.returncode == 128 + signal.SIGTERM, text
+    assert "received signal 15" in text and "slow_plugins.py" in text           # the stack shows where it was
+    assert not list((out / "rows").glob("*.json")) if (out / "rows").exists() else True
+    assert any("importing failure_prob" in l for l in lines) and "PYTHONDONTWRITEBYTECODE=1" in lines[0]
 
 
 def test_temporary_probe_is_seeded():
@@ -198,14 +278,18 @@ def test_slurm_scripts_parse_and_refuse_outside_slurm(name, tmp_path):
 def test_slurm_array_task_and_aggregate_end_to_end(cache, tmp_path):
     """Both job scripts with a fake Slurm environment, on the synthetic cache; folders derived the same way."""
     import os, subprocess, sys
-    env = {**os.environ, "SLURM_JOB_ID": "1", "SLURM_SUBMIT_DIR": str(ds.REPO_ROOT), "SLURM_CPUS_PER_TASK": "1",
-           "SWEEP_PYTHON": sys.executable, "CACHE_DIR": str(cache), "SWEEP_OUT_ROOT": str(tmp_path / "sweeps"),
-           "SWEEP_POOL": "first", "SWEEP_NORMALIZE": "1"}
-    for layer in ("0", "2"):
+    env = {**os.environ, "SLURM_JOB_ID": "1", "SLURM_ARRAY_JOB_ID": "7", "SLURM_SUBMIT_DIR": str(ds.REPO_ROOT),
+           "SLURM_CPUS_PER_TASK": "1", "SWEEP_PYTHON": sys.executable, "CACHE_DIR": str(cache),
+           "SWEEP_OUT_ROOT": str(tmp_path / "sweeps"), "SWEEP_POOL": "first", "SWEEP_NORMALIZE": "1"}
+    env.pop("PYTHONDONTWRITEBYTECODE", None)                          # the script must set it itself
+    for layer in ("0", "2", "2"):
         r = subprocess.run([_bash(), str(SLURM_DIR / "depth_sweep.slurm")], env={**env, "SLURM_ARRAY_TASK_ID": layer},
                            capture_output=True, text=True, timeout=600)
         assert r.returncode == 0, r.stdout + r.stderr
-        assert f"layer {layer} seed 2:" in r.stdout
+        assert f"log {ds.REPO_ROOT}/logs/depth_sweep-7_{layer}.out" in r.stdout
+        assert "PYTHONDONTWRITEBYTECODE=1" in r.stdout
+        assert f"layer {layer} seed 2:" in r.stdout                      # computed the first time, reused the second
+    assert "layer 2 seed 2: reusing row from job 7_2" in r.stdout
     r = subprocess.run([_bash(), str(SLURM_DIR / "depth_sweep_aggregate.slurm")], env=env, capture_output=True,
                        text=True, timeout=600)
     assert r.returncode in (0, 3), r.stdout + r.stderr                 # 3 = no matplotlib, tables still written
