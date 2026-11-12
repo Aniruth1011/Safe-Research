@@ -126,8 +126,11 @@ Spend: `friend` ~$13.9 (function time + start-up), upper bound $14.34 (watchdog)
 ## Next
 
 1. Team: confirm read access to the cache on CARC (it is under Akash's `/scratch1`; copy to `/project2/<group>` if needed).
-2. Depth sweep R1–R4 is prepared (CPU only, not submitted): [`08_DEPTH_SWEEP.md`](08_DEPTH_SWEEP.md). Its probe and
-   metric are TEMPORARY until B6 (probe spec) and B4 (evaluator) land. Submitting needs Akash's OK.
+2. Depth sweep R1–R4: [`08_DEPTH_SWEEP.md`](08_DEPTH_SWEEP.md). A TEMPORARY R1 run (placeholder probe and
+   metric, not a result) completed on CARC on 2026-11-11: 34 layers × 3 seeds. The sweep now also has bootstrap CIs,
+   a per-task breakdown and the S5 all-layer average (`--layers avg`; definition for Rhea's review in
+   [`09_S5_ALL_LAYER_AVERAGE.md`](09_S5_ALL_LAYER_AVERAGE.md)). Waiting for B6 (probe spec) and B4 (evaluator).
+   No CARC runs until Akash says. SAFE reference line: only from C4 (Adarsh's SAFE model re-scored by our evaluator).
 3. After PR #3 merges: delete the fork's `backup/extraction-pre-rebase-2026-11-10`.
 
 ## Budget

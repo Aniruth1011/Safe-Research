@@ -20,7 +20,7 @@ def make_synthetic_cache(root: Path, *, n_layers: int = 6, dim: int = 16, episod
                          min_len: int = 12, max_len: int = 30, signal_layer: int = 2, signal: float = 1.5,
                          pools: tuple[str, ...] = ("mean", "first"), layers_to_write: tuple[int, ...] | None = None,
                          splits_to_write: tuple[str, ...] = SPLITS, failure_len: int | None = None,
-                         seed: int = 0) -> Path:
+                         seed: int = 0, layer_names: list[str] | None = None) -> Path:
     rng = np.random.default_rng(seed)
     root = Path(root)
     rows = []
@@ -73,7 +73,8 @@ def make_synthetic_cache(root: Path, *, n_layers: int = 6, dim: int = 16, episod
         np.savez(root / "norm_stats" / f"{p}.npz", layers=np.arange(n_layers), mean=mean.astype(np.float32),
                  std=std.astype(np.float32), n_rows=n_train_rows)
 
-    names = ["emb"] + [f"block{i:02d}" for i in range(1, n_layers)]
+    names = list(layer_names) if layer_names else ["emb"] + [f"block{i:02d}" for i in range(1, n_layers)]
+    assert len(names) == n_layers
     manifest = {"cache_version": "synthetic", "created_utc": "2026-01-01T00:00:00+00:00", "dataset": "synthetic",
                 "backbone": "synthetic", "checkpoint": "synthetic", "num_hidden_states": n_layers,
                 "layer_names": names, "pools_exported": list(pools), "feature_dim": dim,

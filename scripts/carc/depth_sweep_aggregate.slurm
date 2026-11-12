@@ -12,9 +12,10 @@
 #   sbatch --account=<account> --export=ALL --dependency=afterany:<array job id> scripts/carc/depth_sweep_aggregate.slurm
 # Bootstrap CIs (SWEEP_BOOTSTRAP resamples of seen_val episodes, default 1000; 0 = none) use all 4 CPUs. With the
 # TEMPORARY evaluator, 34 layers x 3 seeds x 1000 resamples is about 7 CPU-minutes; a slower real evaluator (B4)
-# scales that. Reference lines: SWEEP_REFS='SAFE final layer (reproduction)=0.81;All-layer average=0.79' (values of
-# the plotted metric, roc_auc by default, on seen_val with the same evaluator); kept in references.json.
-# It checks that every layer in SWEEP_EXPECT_LAYERS (default 0-33) has a row for every seed. If some are missing it
+# scales that. The all-layer average (rows Lavg_*) is drawn as a reference line automatically. Other reference lines:
+# SWEEP_REFS='label=value;...' (values of the plotted metric on seen_val with the same evaluator); the SAFE line only
+# from plan row C4 (Adarsh's SAFE model re-scored by our evaluator). Kept in references.json.
+# It checks that every layer in SWEEP_EXPECT_LAYERS (default 0-33,avg; use 0-33 for runs without the average) has a row for every seed. If some are missing it
 # still writes the (partial) tables, lists the missing layers and how to rerun them, and exits 4.
 # If matplotlib is missing from the environment, the tables are still written and the job exits 3; draw the plot
 # elsewhere with `python scripts/depth_sweep.py aggregate --out <copy of the folder>`.
@@ -36,5 +37,5 @@ ARGS=(aggregate --pool "${SWEEP_POOL:-mean}" --train-horizon "${SWEEP_TRAIN_HORI
       --probe "${SWEEP_PROBE:-temporary_mlp}" --evaluator "${SWEEP_EVALUATOR:-temporary_max}")
 [ "${SWEEP_NORMALIZE:-0}" = 1 ] && ARGS+=(--normalize)
 [ -n "${SWEEP_OUT:-}" ] && ARGS+=(--out "$SWEEP_OUT")
-ARGS+=(--expect-layers "${SWEEP_EXPECT_LAYERS:-0-33}")
+ARGS+=(--expect-layers "${SWEEP_EXPECT_LAYERS:-0-33,avg}")
 "$PY" scripts/depth_sweep.py "${ARGS[@]}"

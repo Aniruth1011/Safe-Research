@@ -368,7 +368,7 @@ def test_startup_watchdog_exits_75_with_a_stack_instead_of_waiting_for_the_time_
              "--loader", str(slow), env={"SWEEP_LOAD_TIMEOUT": "15"})   # long enough for the imports
     assert r.returncode == 75, r.stdout + r.stderr
     assert __import__("time").time() - t0 < 50
-    assert "WATCHDOG: start-up (imports, opening the cache) and loading the first layer did not finish within 15 s" in r.stdout
+    assert "WATCHDOG: start-up (imports, opening the cache) and loading the first layer: no progress for 15 s" in r.stdout
     assert "slow_loader.py" in r.stdout                                 # the stack shows where it was stuck
 
 
@@ -380,7 +380,7 @@ def test_aggregate_lists_missing_layers_and_exits_4(cache, tmp_path):
     r = _cli("aggregate", "--out", str(out), "--no-plot", "--expect-layers", "0-3")
     assert r.returncode == 4, r.stdout + r.stderr
     assert "MISSING: layer 1 seeds [0, 1]" in r.stdout and "MISSING: layer 2 seeds [1]" in r.stdout
-    assert "LAYERS=1,2,3" in r.stdout and (out / "summary.csv").exists()   # partial tables still written
+    assert "--layers 1,2,3" in r.stdout and (out / "summary.csv").exists()   # partial tables still written
     r = _cli("aggregate", "--out", str(out), "--no-plot", "--expect-layers", "0")
     assert r.returncode == 0 and "all expected layers present" in r.stdout
 
@@ -446,7 +446,7 @@ def test_submit_script_throttles_excludes_and_chains_the_aggregate(tmp_path):
     assert "--array=10,16,19-20%6" in sweep and "--exclude=nodeA,nodeB" in sweep and "--account=acct" in sweep
     assert sweep.endswith("scripts/carc/depth_sweep.slurm")
     assert "--dependency=afterany:4001" in agg and "--exclude=nodeA,nodeB" in agg and agg.endswith("_aggregate.slurm")
-    assert "array job 4001" in r.stdout and "aggregate job 4002" in r.stdout
+    assert "job 4001: sbatch" in r.stdout and "aggregate job 4002" in r.stdout
     r = subprocess.run([_bash(), script, "--account", "acct", "--max-parallel", "3", "--dry-run"], env=env,
                        capture_output=True, text=True)
     assert r.returncode == 0 and "--array=0-33%3" in r.stdout
@@ -543,8 +543,8 @@ def test_bootstrap_cis_are_stratified_paired_across_seeds_and_reproducible(cache
         ds.run_layer(c, layer, out, log=lambda m: None)
     stratified_evaluator.CALLS.clear()
     ds.aggregate(out, plot=False, bootstrap=50, log=lambda m: None)
-    calls = stratified_evaluator.CALLS
-    assert len(calls) == 2 * 2 * 50                                   # layers x seeds x resamples
+    calls = stratified_evaluator.CALLS[:2 * 2 * 50]                   # layers x seeds x resamples (then per-task)
+    assert len(stratified_evaluator.CALLS) == 2 * 2 * 50 + 2 * 2 * 7  # + layers x seeds x seen tasks
     assert len({(n, k) for n, k, _ in calls}) == 1                     # class counts never change
     assert all(calls[i][2] == calls[i + 1][2] for i in range(0, len(calls), 2))   # both seeds see the same episodes
     s1 = pd.read_csv(out / "summary.csv")
@@ -641,3 +641,161 @@ def test_cli_aggregate_takes_refs_bootstrap_and_env(cache, tmp_path):
     assert r.returncode == 0, r.stdout + r.stderr
     assert "SAFE final layer = 0.800" in r.stdout and "All-layer average = 0.700" in r.stdout
     assert pd.read_csv(out / "summary.csv").val_roc_auc_ci95_low.notna().all()
+
+
+# ------------------------------------------------------------------- all-layer average (S5), per task, watchdog
+AVG_NAMES = ["emb", "block01", "block02", "block03_postnorm", "block03_prenorm"]   # like v1: 0, 1-31, 32, 33
+
+
+@pytest.fixture(scope="module")
+def cache5(tmp_path_factory):
+    return make_synthetic_cache(tmp_path_factory.mktemp("cache5") / "v1", n_layers=5, dim=16, signal_layer=2,
+                                layer_names=AVG_NAMES)
+
+
+def test_avg_members_leave_out_embeddings_and_the_final_postnorm_layer():
+    v1 = ["emb"] + [f"block{i:02d}" for i in range(1, 32)] + ["block32_postnorm", "block32_prenorm"]
+    assert ds.avg_layer_members(v1) == list(range(1, 32)) + [33]
+    with pytest.raises(ValueError, match="raw last block"):
+        ds.avg_layer_members(v1[:33])                                    # 33-layer caches cannot build it
+    assert ds.parse_layers("0-2,avg") == [ds.AVG_LAYER, 0, 1, 2] and ds.row_stem(ds.AVG_LAYER) == "Lavg"
+
+
+def test_avg_records_are_the_mean_of_train_zscored_member_layers(cache5):
+    c = ds.SeenOnlyCache(cache5, log=lambda m: None)
+    plain = ds.load_cache_module().SharedCache(cache5)
+    for split, horizon in [("train", "full"), ("seen_val", "full"), ("train", "task_min_step")]:
+        got = c.avg_records(split, [1, 2, 4], "mean", horizon)
+        per_layer = [plain.records(split, [l], pool="mean", normalize=True, horizon=horizon) for l in (1, 2, 4)]
+        for i, r in enumerate(got):
+            want = sum(pl[i]["features"] for pl in per_layer) / 3
+            assert r["features"].shape == want.shape and torch_allclose(r["features"], want)
+            assert r["trajectory_ids"] == per_layer[0][i]["trajectory_ids"] and r["labels"].equal(per_layer[0][i]["labels"])
+    with pytest.raises(PermissionError):
+        c.avg_records("unseen_test", [1, 2, 4], "mean", "full")
+
+
+def torch_allclose(a, b):
+    import torch
+    return torch.allclose(a, b, atol=1e-4)
+
+
+def test_avg_pseudo_layer_runs_like_a_layer_and_records_its_definition(cache5, tmp_path):
+    out = tmp_path / "out"
+    rows = ds.run_layer(cfg(cache5, seeds=(0, 1)), "avg", out, log=lambda m: None)
+    assert [r["layer"] for r in rows] == [ds.AVG_LAYER] * 2 and rows[0]["layer_name"] == ds.AVG_NAME
+    d = rows[0]["layer_definition"]
+    assert d["layers"] == [1, 2, 4] and d["excluded"] == [0, 3] and "train-only" in d["zscore"]
+    assert (out / "rows" / "Lavg_seed1.json").exists() and (out / "rows" / "Lavg_seed1.scores.npz").exists()
+    msgs = []
+    assert ds.run_layer(cfg(cache5, seeds=(0, 1)), "avg", out, log=msgs.append) == []    # reused like any row
+    assert any(m.startswith("layer -1 seed 0: reusing row") or "seed 0: reusing row" in m for m in msgs)
+    for layer in (2, 3, 4):
+        ds.run_layer(cfg(cache5, seeds=(0, 1)), layer, out, log=lambda m: None)
+    ds.aggregate(out, plot=False, bootstrap=30, log=lambda m: None)
+    s = pd.read_csv(out / "summary.csv").set_index("layer")
+    assert s.loc[ds.AVG_LAYER, "layer_name"] == ds.AVG_NAME and s.loc[ds.AVG_LAYER, "bootstrap_resamples"] == 30
+    assert ds.missing_rows(out, ds.parse_layers("2-4,avg")) == {}
+    assert ds.missing_rows(out, ds.parse_layers("0-4,avg")) == {0: [0, 1], 1: [0, 1]}
+
+
+def test_avg_is_drawn_as_a_reference_line_with_its_ci_band_not_on_the_curve():
+    pytest.importorskip("matplotlib")
+    import matplotlib.pyplot as plt
+    s = _summary_34()
+    avg = {"layer": ds.AVG_LAYER, "layer_name": ds.AVG_NAME, "val_roc_auc_mean": 0.7, "val_roc_auc_std": 0.01,
+           "val_roc_auc_ci95_low": 0.66, "val_roc_auc_ci95_high": 0.74}
+    s = pd.concat([pd.DataFrame([avg]), s], ignore_index=True)
+    first = pd.Series({"pool": "mean", "normalize": False, "probe": "p", "evaluator": "e"})
+    fig, ax = ds.build_figure(s, first, "val_roc_auc", False, None, "val_roc_auc_ci95", 0.95, 100)
+    lines = {l.get_label(): l for l in ax.get_lines()}
+    assert min(lines["mean over seeds"].get_xdata()) == 0                 # avg (-1) is not a point on the curve
+    assert lines["all-layer average probe (z-scored L1-31 + L33): 0.700"].get_ydata()[0] == 0.7
+    legend = [t.get_text() for t in ax.get_legend().get_texts()]
+    assert "all-layer average, 95% CI" in legend
+    assert not any("SAFE" in t for t in legend)                          # no SAFE line without a C4 value
+    assert any("Layer 32" in t.get_text() and "C4" in t.get_text() for t in fig.texts)   # the caption
+    plt.close(fig)
+
+
+def test_per_task_breakdown_in_per_task_csv_and_summary(cache, tmp_path):
+    out = tmp_path / "out"
+    for layer in (1, 2):
+        ds.run_layer(cfg(cache, seeds=(0, 1)), layer, out, log=lambda m: None)
+    written = ds.aggregate(out, plot=False, bootstrap=0, log=lambda m: None)
+    t = pd.read_csv(written["per_task"])
+    ep = pd.read_csv(cache / "episodes.csv")
+    seen_val = ep[ep.split == "seen_val"]
+    assert set(t.task_id) == set(seen_val.task_id) and not set(t.task_id) & {0, 3, 5}
+    assert t.groupby("layer").n_episodes.sum().tolist() == [len(seen_val)] * 2
+    # one task, by hand: the evaluator on that task's episodes, averaged over the two seeds
+    mixed = t[(t.layer == 2) & (t.n_failures > 0) & (t.n_failures < t.n_episodes)]
+    task = int(mixed.task_id.iloc[0])                                  # a task with both outcomes
+    from failure_prob.engine.sweep_plugins import TemporaryMaxScoreEvaluator
+    by_hand = []
+    for sd in (0, 1):
+        d = ds.load_eval_input(out / "rows" / f"L02_seed{sd}.scores.npz")
+        idx = np.flatnonzero(d.task_ids == task)
+        by_hand.append(TemporaryMaxScoreEvaluator()(ds.EvalInput([d.step_scores[i] for i in idx], d.labels[idx],
+                       d.horizons[idx], d.task_ids[idx], [d.trajectory_ids[i] for i in idx]))["roc_auc"])
+    s = pd.read_csv(out / "summary.csv").set_index("layer")
+    assert np.isfinite(by_hand).all() and np.isclose(s.loc[2, f"val_roc_auc_task{task}"], np.mean(by_hand))
+
+
+@pytest.mark.parametrize("kick, code", [(True, 0), (False, 75)])
+def test_watchdog_waits_while_reading_progresses(kick, code, tmp_path):
+    import subprocess, sys
+    script = tmp_path / "wd.py"
+    script.write_text(textwrap.dedent(f"""
+        import importlib.util, sys, time
+        spec = importlib.util.spec_from_file_location("cli", {str(ds.REPO_ROOT / "scripts" / "depth_sweep.py")!r})
+        cli = importlib.util.module_from_spec(spec); spec.loader.exec_module(cli)
+        cli.WATCHDOG.arm(1.0, "reading")
+        t0 = time.time()
+        while time.time() - t0 < 3:          # three times the limit
+            time.sleep(0.2)
+            if {kick}:
+                cli.WATCHDOG.kick()
+        cli.WATCHDOG.disarm()
+        print("survived")
+    """))
+    r = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, timeout=60)
+    assert r.returncode == code, r.stdout + r.stderr
+    assert ("survived" in r.stdout) == kick and (("WATCHDOG: reading: no progress for 1 s" in r.stdout) != kick)
+
+
+def test_submit_script_runs_avg_as_its_own_task_and_waits_for_both(tmp_path):
+    import os, subprocess
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    (fake / "sbatch").write_text('#!/bin/bash\necho "$*" >> "$SBATCH_LOG"\n'
+                                 'n=$(wc -l < "$SBATCH_LOG"); echo "$((4000 + n))"\n')
+    (fake / "sbatch").chmod(0o755)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("SLURM_")}
+    env.update(PATH=f"{fake}:{env['PATH']}", SBATCH_LOG=str(tmp_path / "calls"))
+    r = subprocess.run([_bash(), str(SLURM_DIR / "submit_depth_sweep.sh"), "--account", "acct"], env=env,
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    sweep, avg, agg = (tmp_path / "calls").read_text().splitlines()
+    assert "--array=0-33%6" in sweep and "--export=ALL " in sweep
+    assert "--export=ALL,SWEEP_LAYER=avg" in avg and "--array=0" in avg and "--mem=8G" in avg and "--time=00:30:00" in avg
+    assert "--dependency=afterany:4001:4002" in agg
+    (tmp_path / "calls").unlink()
+    r = subprocess.run([_bash(), str(SLURM_DIR / "submit_depth_sweep.sh"), "--account", "acct", "--layers", "avg"],
+                       env=env, capture_output=True, text=True)
+    assert r.returncode == 0 and len((tmp_path / "calls").read_text().splitlines()) == 2   # avg + aggregate
+    r = subprocess.run([_bash(), str(SLURM_DIR / "submit_depth_sweep.sh"), "--account", "acct", "--exclude", "a b"],
+                       env=env, capture_output=True, text=True)
+    assert r.returncode != 0 and "without spaces" in r.stderr
+
+
+def test_slurm_job_runs_the_avg_layer_from_sweep_layer(cache5, tmp_path):
+    import os, subprocess, sys
+    env = {**os.environ, "SLURM_JOB_ID": "1", "SLURM_ARRAY_JOB_ID": "9", "SLURM_ARRAY_TASK_ID": "0",
+           "SLURM_SUBMIT_DIR": str(ds.REPO_ROOT), "SLURM_CPUS_PER_TASK": "1", "SWEEP_PYTHON": sys.executable,
+           "CACHE_DIR": str(cache5), "SWEEP_OUT": str(tmp_path / "out"), "SWEEP_LAYER": "avg"}
+    r = subprocess.run([_bash(), str(SLURM_DIR / "depth_sweep.slurm")], env=env, capture_output=True, text=True,
+                       timeout=600)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "layer avg: averaging z-scored layers [1, 2, 4]" in r.stdout
+    assert sorted(p.name for p in (tmp_path / "out" / "rows").glob("*.json")) == [f"Lavg_seed{s}.json" for s in (0, 1, 2)]
