@@ -10,6 +10,7 @@ Outputs, in one folder per configuration (pool, normalize, train horizon, probe,
     rows/L{LL}_seed{S}.json     one row per (layer, seed), written atomically, ending in "completed": true and
                                 the Slurm job / array task that wrote it; reruns reuse such rows and log each reuse
     rows/_discarded/            rows that were not reusable (moved aside, never deleted), then recomputed
+    _discarded/tmp/             temp files left by tasks killed mid-write (moved aside at the start of a run)
     results.csv                 all rows (aggregate)
     summary.csv                 mean / std / n over seeds per layer (aggregate)
     depth_curve.png             mean +- std per layer (aggregate)
@@ -23,10 +24,13 @@ import importlib.util
 import json
 import os
 import platform
+import re
+import queue
 import resource
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 from dataclasses import asdict, dataclass, field
@@ -55,18 +59,134 @@ def load_cache_module(path: Path = DEFAULT_LOADER):
     return mod
 
 
-class SeenOnlyCache:
-    """SharedCache restricted to train and seen_val. Any request for another split raises before a file is opened."""
+# ------------------------------------------------------------------------------------- file-system friendly reads
+class ReadStalled(RuntimeError):
+    """A read from the cache made no progress within the stall limit, retries included."""
 
-    def __init__(self, cache_dir: Path, loader: Path = DEFAULT_LOADER):
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+def read_npy_sequential(path: Path, log=print, chunk_mb: float | None = None, stall_s: float | None = None,
+                        retries: int | None = None, progress_s: float = 5.0) -> np.ndarray:
+    """Read a .npy file into memory in one sequential pass of large chunks.
+
+    This replaces np.load(mmap_mode="r") followed by per-episode slicing, which turns into many small page-fault reads
+    on a shared file system. Every chunk is read by a helper thread. If a chunk makes no progress for `stall_s`
+    seconds, the read is retried on a fresh file handle, up to `retries` times; then ReadStalled is raised. A thread
+    stuck in uninterruptible I/O cannot be stopped, only abandoned, so the caller should end the process.
+    Progress (MB read) is logged every `progress_s` seconds. Defaults: $SWEEP_READ_CHUNK_MB (64),
+    $SWEEP_READ_STALL_S (30), $SWEEP_READ_RETRIES (2).
+    """
+    chunk = int((chunk_mb if chunk_mb is not None else _env_float("SWEEP_READ_CHUNK_MB", 64)) * (1 << 20))
+    stall_s = stall_s if stall_s is not None else _env_float("SWEEP_READ_STALL_S", 30)
+    retries = int(retries if retries is not None else _env_float("SWEEP_READ_RETRIES", 2))
+    path = Path(path)
+    with open(path, "rb") as f:
+        version = np.lib.format.read_magic(f)
+        reader = np.lib.format.read_array_header_1_0 if version == (1, 0) else np.lib.format.read_array_header_2_0
+        shape, fortran, dtype = reader(f)
+        offset = f.tell()
+        size = os.fstat(f.fileno()).st_size
+    nbytes = int(np.prod(shape, dtype=np.int64)) * dtype.itemsize
+    if size != offset + nbytes:
+        raise ValueError(f"{path}: {size} bytes on disk, header says {offset + nbytes}")
+    raw = np.empty(nbytes, dtype=np.uint8)
+    mb = nbytes / 1e6
+    t0 = last = time.time()
+    pos = 0
+    while pos < nbytes:
+        n = min(chunk, nbytes - pos)
+        raw[pos:pos + n] = np.frombuffer(_read_chunk(path, offset + pos, n, stall_s, retries, log, pos), np.uint8)
+        pos += n
+        now = time.time()
+        if now - last >= progress_s and pos < nbytes:
+            log(f"reading {path.name}: {pos / 1e6:.0f}/{mb:.0f} MB ({now - t0:.1f} s)")
+            last = now
+    dt = max(time.time() - t0, 1e-9)
+    log(f"read {'/'.join(path.parts[-3:])}: {mb:.0f} MB in {dt:.1f} s ({mb / dt:.0f} MB/s)")
+    return np.ndarray(shape, dtype=dtype, buffer=raw, order="F" if fortran else "C")
+
+
+def _read_chunk(path: Path, offset: int, size: int, stall_s: float, retries: int, log, pos: int) -> bytes:
+    results: queue.Queue = queue.Queue()
+
+    def worker(attempt: int) -> None:
+        try:
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                parts, got = [], 0
+                while got < size:
+                    b = os.pread(fd, size - got, offset + got)
+                    if not b:
+                        raise EOFError(f"{path}: file ended at byte {offset + got}")
+                    parts.append(b)
+                    got += len(b)
+            finally:
+                os.close(fd)
+            results.put((attempt, b"".join(parts), None))
+        except BaseException as e:  # noqa: BLE001  (reported to the waiting thread)
+            results.put((attempt, None, e))
+
+    def start(attempt: int) -> None:
+        threading.Thread(target=worker, args=(attempt,), daemon=True, name=f"read-{path.name}-{attempt}").start()
+
+    attempt, running, last_error = 0, 1, None
+    start(0)
+    while True:
+        try:
+            _, data, err = results.get(timeout=stall_s)
+        except queue.Empty:
+            if attempt >= retries:
+                raise ReadStalled(f"{path}: no progress for {stall_s:.0f} s at {pos / 1e6:.0f} MB after {retries} "
+                                  f"retries (file system stalled?)") from None
+            attempt += 1
+            running += 1
+            log(f"reading {path.name}: no progress for {stall_s:.0f} s at {pos / 1e6:.0f} MB; "
+                f"retrying on a new file handle ({attempt}/{retries})")
+            start(attempt)
+            continue
+        running -= 1
+        if err is None:
+            return data
+        last_error = err
+        if attempt < retries:
+            attempt += 1
+            running += 1
+            log(f"reading {path.name} at {pos / 1e6:.0f} MB failed ({type(err).__name__}: {err}); "
+                f"retrying ({attempt}/{retries})")
+            time.sleep(1)
+            start(attempt)
+        elif running == 0:
+            raise last_error
+
+
+class SeenOnlyCache:
+    """SharedCache restricted to train and seen_val. Any request for another split raises before a file is opened.
+
+    Feature files are read whole and sequentially (read_npy_sequential), not memory-mapped; the values handed to the
+    loader are identical. They are dropped again once a split's records are built.
+    """
+
+    def __init__(self, cache_dir: Path, loader: Path = DEFAULT_LOADER, log=print):
         self._cache = load_cache_module(loader).SharedCache(cache_dir)
         inner_array = self._cache._array
+        mm = getattr(self._cache, "_mm", None)  # the loader's per-file cache, keyed (pool, split, layer)
+        root = Path(self._cache.root)
 
         def guarded_array(pool, split, layer):
             _check_split(split)
+            path = root / "features" / pool / split / f"L{layer:02d}.npy"
+            if isinstance(mm, dict) and (pool, split, layer) not in mm and path.exists():
+                mm[(pool, split, layer)] = read_npy_sequential(path, log=log)
             return inner_array(pool, split, layer)
 
         self._cache._array = guarded_array  # second line of defence, in case the loader changes
+        self._mm = mm
         self.manifest = self._cache.manifest
         self.episodes = self._cache.episodes
         leaked = sorted(set(self.episodes[self.episodes.split.isin(ALLOWED_SPLITS)].task_id) & set(UNSEEN_TASKS))
@@ -75,7 +195,10 @@ class SeenOnlyCache:
 
     def records(self, split: str, layer: int, pool: str, normalize: bool, horizon: str) -> list[dict]:
         _check_split(split)
-        return self._cache.records(split, [layer], pool=pool, normalize=normalize, horizon=horizon)
+        out = self._cache.records(split, [layer], pool=pool, normalize=normalize, horizon=horizon)
+        if isinstance(self._mm, dict):
+            self._mm.pop((pool, split, layer), None)  # the records hold their own float32 copies
+        return out
 
     def layer_names(self) -> list[str]:
         names = self.manifest.get("layer_names")
@@ -140,11 +263,47 @@ def _mkdir_shared(path: Path) -> None:
 def _write_json_atomic(path: Path, obj) -> None:
     _mkdir_shared(path.parent)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")  # mkstemp makes 0600 files ...
-    with os.fdopen(fd, "w") as f:
-        json.dump(obj, f, indent=2, sort_keys=True)
-        f.write("\n")
-    os.chmod(tmp, FILE_MODE)                                               # ... so open it up before the rename
-    os.replace(tmp, path)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(obj, f, indent=2, sort_keys=True)
+            f.write("\n")
+        os.chmod(tmp, FILE_MODE)                                           # ... so open it up before the rename
+        os.replace(tmp, path)
+    except BaseException:                                                  # incl. SystemExit from SIGTERM
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# Temp files of _write_json_atomic (".<name>.<random>") and other hidden 8-character tempfile names (".<random>").
+_TEMP_NAME = re.compile(r"^\.(?:[A-Za-z0-9_]+\.json\.)?[a-z0-9_]{8}$")
+STALE_TEMP_S = 15 * 60  # far longer than a task's time limit, so a task still writing is never disturbed
+
+
+def move_aside_stale_temp_files(out_dir: Path, log=print, min_age_s: float = STALE_TEMP_S) -> list[Path]:
+    """Move temp files left by tasks killed mid-write into out_dir/_discarded/tmp/. Only files older than min_age_s
+    are touched: a temp file of a task that is running now must stay where it is."""
+    out_dir, moved, now = Path(out_dir), [], time.time()
+    for folder in (out_dir, out_dir / "rows"):
+        if not folder.is_dir():
+            continue
+        for f in sorted(folder.iterdir()):
+            try:
+                stale = f.is_file() and _TEMP_NAME.match(f.name) and now - f.stat().st_mtime >= min_age_s
+            except OSError:  # vanished meanwhile (another task renamed it)
+                continue
+            if stale:
+                dest = out_dir / "_discarded" / "tmp" / (f"rows_{f.name}" if folder.name == "rows" else f.name)
+                _mkdir_shared(dest.parent)
+                try:
+                    os.replace(f, dest)
+                except OSError:
+                    continue
+                log(f"moved leftover temp file {f.relative_to(out_dir)} (from a task killed mid-write) to {dest}")
+                moved.append(dest)
+    return moved
 
 
 def _utc_now() -> str:
@@ -211,12 +370,16 @@ def _check_or_write_config(out_dir: Path, cfg: SweepConfig, cache: SeenOnlyCache
 
 
 def run_layer(cfg: SweepConfig, layer: int, out_dir: Path, loader: Path = DEFAULT_LOADER, overwrite: bool = False,
-              log=print) -> list[dict]:
-    """Train cfg.seeds probes on one layer and score seen_val. Returns the rows (also written to out_dir/rows/)."""
+              log=print, on_loaded=None) -> list[dict]:
+    """Train cfg.seeds probes on one layer and score seen_val. Returns the rows (also written to out_dir/rows/).
+
+    on_loaded() is called once the layer's data is in memory, or once it is clear nothing needs loading
+    (the CLI's start-up watchdog uses it)."""
     out_dir = Path(out_dir)
+    on_loaded = on_loaded or (lambda: None)
     log(f"opening cache {cfg.cache_dir} (loader {loader})")
     t_open = time.time()
-    cache = SeenOnlyCache(Path(cfg.cache_dir), loader)
+    cache = SeenOnlyCache(Path(cfg.cache_dir), loader, log=log)
     log(f"cache open ({time.time() - t_open:.1f} s): {len(cache.episodes)} episodes, "
         f"version {cache.manifest.get('cache_version')}")
     names = cache.layer_names()
@@ -224,6 +387,7 @@ def run_layer(cfg: SweepConfig, layer: int, out_dir: Path, loader: Path = DEFAUL
         raise ValueError(f"layer {layer} not in this cache (0..{len(names) - 1})")
     probe, evaluator = resolve(cfg.probe, PROBES), resolve(cfg.evaluator, EVALUATORS)
     _mkdir_shared(out_dir)
+    move_aside_stale_temp_files(out_dir, log)
     cfg_doc = _check_or_write_config(out_dir, cfg, cache, probe, evaluator)
     todo = []
     for seed in cfg.seeds:
@@ -248,12 +412,14 @@ def run_layer(cfg: SweepConfig, layer: int, out_dir: Path, loader: Path = DEFAUL
             todo.append(seed)
     if not todo:
         log(f"layer {layer}: every seed {list(cfg.seeds)} reused; nothing to compute")
+        on_loaded()
         return []
 
     t0 = time.time()
     train = cache.records("train", layer, cfg.pool, cfg.normalize, cfg.train_horizon)
     val = cache.records("seen_val", layer, cfg.pool, cfg.normalize, "full")
     load_s = time.time() - t0
+    on_loaded()
     ep = cache.episodes.set_index("trajectory_id")
     val_ids = [r["trajectory_ids"][0] for r in val]
     horizons = np.array([min(int(ep.at[t, "length"]), int(ep.at[t, "task_min_step"])) for t in val_ids])
@@ -312,10 +478,28 @@ def _torch_version() -> str:
         return "none"
 
 
-def aggregate(out_dir: Path, metric: str = "roc_auc", plot: bool = True) -> dict:
+def parse_layers(spec: str) -> list[int]:
+    """'0-33' or '2,5,10-12' -> sorted layer list."""
+    out: set[int] = set()
+    for part in filter(None, (p.strip() for p in spec.split(","))):
+        lo, _, hi = part.partition("-")
+        out.update(range(int(lo), int(hi or lo) + 1))
+    return sorted(out)
+
+
+def missing_rows(out_dir: Path, layers: list[int]) -> dict[int, list[int]]:
+    """{layer: [seeds]} for every expected (layer, seed) row that does not exist yet (seeds from config.json)."""
+    seeds = json.loads((Path(out_dir) / "config.json").read_text())["seeds"]
+    rows = Path(out_dir) / "rows"
+    out = {l: [s for s in seeds if not (rows / f"L{l:02d}_seed{s}.json").exists()] for l in layers}
+    return {l: s for l, s in out.items() if s}
+
+
+def aggregate(out_dir: Path, metric: str = "roc_auc", plot: bool = True, log=print) -> dict:
     """Collect rows into results.csv and summary.csv, and draw depth_curve.png. Returns the paths written."""
     import pandas as pd
     out_dir = Path(out_dir)
+    move_aside_stale_temp_files(out_dir, log)
     files = sorted((out_dir / "rows").glob("L*_seed*.json"))
     if not files:
         raise FileNotFoundError(f"no rows under {out_dir / 'rows'}")

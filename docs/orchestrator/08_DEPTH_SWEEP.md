@@ -1,7 +1,9 @@
 # Depth sweep (plan rows R1–R4): how to run it
 
 Written 2026-11-11 for Akash, who runs the CARC jobs. This sweep is CPU only, and every submission needs Akash's OK.
-The 2-layer test (layers 0-1) ran on CARC on 2026-11-11; the full run is next.
+R1 (mean pooling, raw features) ran on CARC on 2026-11-11 with the TEMPORARY probe and evaluator: all 34 layers ×
+3 seeds, 102 rows. Ten layers stalled reading `/scratch1` on the first attempt and were rerun throttled, with the
+stalling nodes excluded. The fixes below come from that run.
 
 **What it does.** For each cache layer (0–33: 0 = embeddings, 32 = final post-norm, 33 = raw block 32) and each
 training seed in `failure_prob/protocol.py` (0, 1, 2), it:
@@ -44,42 +46,48 @@ plugins never mix.
 
 ## Files
 
-- `failure_prob/engine/depth_sweep.py`: the sweep, the unseen lock, and aggregation (tables and plot).
+- `failure_prob/engine/depth_sweep.py`: the sweep, the unseen lock, the sequential file reader, and aggregation.
 - `failure_prob/engine/sweep_plugins.py`: the contracts, the TEMPORARY placeholders, and name resolution.
-- `scripts/depth_sweep.py`: the command-line tool, with `run` and `aggregate`.
+- `scripts/depth_sweep.py`: the command-line tool, with `run` and `aggregate`, and the start-up watchdog.
+- `scripts/carc/submit_depth_sweep.sh`: submits the array (throttled, optional node exclusions) and the aggregate job.
 - `scripts/carc/depth_sweep.slurm`: one array task per layer.
-- `scripts/carc/depth_sweep_aggregate.slurm`: aggregation, run after the array.
-- `tests/test_depth_sweep.py` and `tests/synthetic_cache.py`: synthetic tests (14) covering:
-  - the planted-signal layer is found;
-  - unseen files are never opened;
-  - horizon and full-length scores reach the evaluator;
-  - plugins can be swapped by name;
-  - normalization uses train statistics;
-  - reruns skip finished rows and refuse a different configuration;
-  - both Slurm scripts run end to end with a fake Slurm environment.
+- `scripts/carc/depth_sweep_aggregate.slurm`: aggregation, after the array.
+- `tests/test_depth_sweep.py` and `tests/synthetic_cache.py`: 29 synthetic tests. They cover:
+  - the unseen lock;
+  - the sequential reader returning exactly the memmap values, and its stall retries;
+  - the watchdog, SIGTERM handling and the copying of the local log;
+  - row reuse, temp-file cleanup and file modes;
+  - the submit script and both Slurm scripts with a fake Slurm.
 
-  They pass under torch 2.14 (`.venv-kit310`) and under torch 2.2.0 with numpy 1.26 (what the CARC kit env uses).
+  They pass under torch 2.14 (`.venv-kit310`) and under torch 2.2.0 with numpy 1.26 (the CARC kit env).
 
 ## On CARC (CPU jobs; Akash submits)
 
-Run everything from the root of a Safe-Research checkout of `akash/extraction`. A separate clone is fine: the sweep
-needs nothing from the collection kit's clone or its `config.sh`. It uses the clone's own
-`collection/load_cache.py` and puts the clone's root first on `sys.path`, so `failure_prob` imports without an
-install or `PYTHONPATH`.
+Run everything from a Safe-Research checkout of `akash/extraction`. A separate clone is fine: the sweep needs nothing
+from the collection kit's clone or its `config.sh`. It uses the clone's own `collection/load_cache.py` and puts the
+clone's root first on `sys.path`, so `failure_prob` imports without an install or `PYTHONPATH`. If you can, keep the
+clone off `/scratch1` (for example in your home folder); then only the cache is read from `/scratch1`.
 
 The job runs the interpreter at `SWEEP_PYTHON` directly; no environment is activated. It needs torch, numpy, pandas
 and scikit-learn (the collection kit's venv has them), plus matplotlib for the plot only. The default is the kit's
 default venv (`/scratch1/<user>/safe_cache_work/venv310`); if yours lives elsewhere, export `SWEEP_PYTHON`.
 
 ```bash
-mkdir -p logs                                    # in git, but Slurm needs it to exist before the job starts
 export SWEEP_PYTHON=<path to venv310>/bin/python
 export SWEEP_POOL=mean SWEEP_NORMALIZE=0         # CACHE_DIR defaults to /scratch1/<user>/safe_cache/v1
-sbatch --account=<account> --export=ALL --array=0-1 scripts/carc/depth_sweep.slurm     # tiny test
-sbatch --account=<account> --export=ALL --array=2-33 scripts/carc/depth_sweep.slurm    # the rest
-sbatch --account=<account> --export=ALL --dependency=afterok:<array job id> scripts/carc/depth_sweep_aggregate.slurm
-#   check:  sacct -j <job id> --format=JobID,Elapsed,MaxRSS,State
+scripts/carc/submit_depth_sweep.sh --account <account> --dry-run         # shows the two sbatch commands
+scripts/carc/submit_depth_sweep.sh --account <account>                   # layers 0-33, 6 at a time
+#   rerun some layers, avoiding bad nodes:
+scripts/carc/submit_depth_sweep.sh --account <account> --layers 10,16 --max-parallel 3 --exclude <node>,<node>
+#   check:  sacct -j <array job id> --format=JobID,Elapsed,MaxRSS,State,ExitCode,NodeList
 ```
+
+- **Aggregation:** the aggregate job runs after the array whatever its outcome (`afterany`). It writes the tables and
+  the plot from the rows that exist. If any (layer, seed) row is missing, it lists the missing ones with a ready
+  `--layers` value and exits 4.
+- **Exclusions:** `EXCLUDE_NODES` sets a default for `--exclude`.
+- **Plain sbatch:** it works too. Give the limit yourself, as `--array=<layers>%6`, because a command-line `--array`
+  replaces the script's default of `0-33%6`.
 
 Output goes to `/scratch1/<user>/depth_sweep/<pool>-<raw|trainnorm>-train_<horizon>-<probe>-<evaluator>/`:
 
@@ -91,42 +99,82 @@ To put it somewhere else, set `SWEEP_OUT` (one folder) or `SWEEP_OUT_ROOT`. Ever
 is 0644 / 0755, and the aggregate job also opens up rows written before that rule existed. The team also needs
 execute permission on each parent folder, starting with `/scratch1/<user>`.
 
-**Logs.** Each task writes `logs/depth_sweep-<array job>_<task>.out` in the checkout and prints that path first.
-Every line is timestamped, including lines before and after the imports and before and after the cache opens, so a
-stall shows where it happened. To see where a running task is stuck, run `scancel --signal=USR1 <job>_<task>`,
-which prints its Python stack into the log. A task that is cancelled or runs out of time also prints its stack, and
-writes no further rows.
+**Reading the cache.** Each layer file (about 0.7 GB for train and 0.5 GB for seen_val with mean pooling) is read
+into memory in one sequential pass of 64 MB chunks. It is no longer memory-mapped and sliced rollout by rollout,
+which turned into many small reads. The values are identical, and a test checks that.
+- **Progress:** MB read is logged every 5 s, then the total and MB/s.
+- **Stalls:** if a chunk makes no progress for 30 s, it is retried on a new file handle, up to 2 times. After that
+  the task exits with code 75.
+- **Settings:** `SWEEP_READ_STALL_S`, `SWEEP_READ_RETRIES`, `SWEEP_READ_CHUNK_MB`.
+
+**Start-up watchdog.** Start-up and loading must finish within `SWEEP_LOAD_TIMEOUT` (default 120 s). Start-up means
+the imports and opening the cache; loading means reading the layer's data. A normal task needs 5-15 s for this. If
+it isn't done in time, the task logs `WATCHDOG: ...` and the Python stack of every thread, then exits with code 75,
+instead of waiting for the 4-minute limit. A second thread prints that stack, so it works even while the main thread
+is stuck in uninterruptible I/O.
+
+**Logs.** Each task logs to a file on the node's local disk and copies it into the Slurm log at
+`logs/depth_sweep-<array job>_<task>.out` when it ends, also when cancelled or out of time. A stalled `/scratch1`
+cannot leave the log half-written, and the first line of the Slurm log names the local file. If the checkout itself
+is on `/scratch1`, the Slurm log is too, so a stall at the very start can still leave it empty. Keep the clone
+elsewhere to avoid that.
+- **Format:** every line is timestamped.
+- **Stack of a running task:** `scancel --signal=USR1 <job>_<task>` prints it into the log.
+- **Commits:** `logs/` is in git only through `logs/.gitkeep`; everything else in it is ignored, because logs contain
+  job IDs and node names.
 
 **Reruns reuse rows, and say so.** Each row ends with `"completed": true` and records the Slurm job, array task, log
 path, commit and write time. A rerun reuses a row only when those fields are present, and logs each reuse:
-`layer L seed S: reusing row from job J_T, commit C, written ...`. Rows from the first CARC test, written before
-these fields existed, are reused and logged as legacy rows. Any other row is moved to `rows/_discarded/` and
-recomputed. `--overwrite` moves rows aside the same way and never deletes them. Job IDs and log paths stay in
-`rows/*.json` and are dropped from `results.csv`, so the tables can be shared without them.
+`layer L seed S: reusing row from job J_T, commit C, written ...`.
+- **Legacy rows:** rows from the first CARC test, written before these fields existed, are reused and logged as
+  legacy rows.
+- **Other rows:** moved to `rows/_discarded/` and recomputed. `--overwrite` moves rows aside the same way and never
+  deletes them.
+- **Temp files:** temp files left by tasks killed mid-write (`.config.json.<random>`, `.<random>`) are moved to
+  `_discarded/tmp/` at the start of every run and aggregation, but only once they are 15 minutes old. A task that is
+  writing one now is never disturbed.
+- **Job IDs:** job IDs and log paths stay in `rows/*.json` and are dropped from `results.csv`, so the tables can be
+  shared without them.
+- **Compatibility:** `config.json` is unchanged by these fixes, and a test pins its keys. The finished rows are
+  reused.
 
 **No bytecode writes.** Every CARC job sets `PYTHONDONTWRITEBYTECODE=1`, in this sweep and in the collection kit. In
 the first test, two array tasks starting together hung on the same `__pycache__` file in the checkout on `/scratch1`.
 The setting stops jobs writing `.pyc` files; they still read the venv's existing ones, so imports stay fast. A
 per-job `PYTHONPYCACHEPREFIX` would recompile torch, pandas and scikit-learn in every job, about 3x slower to import.
 
+## When /scratch1 stalls
+
+See also runbook section 8 (`07_RUNBOOK_MODAL.md`). In the full run, about 30 tasks started together. Each read about
+1 GB from `/scratch1`, and ten tasks stalled. A stalled task is in uninterruptible I/O (state D): its log stops after
+`cache open`, or stays empty, and Slurm reports `JOB NOT ENDING WITH SIGNALS`. Such a process ignores every signal,
+SIGKILL included, so it cannot print its own stack. The watchdog's stack and the node-local log are the evidence.
+Stalls clustered on some nodes, where every task stalled, but load mattered too.
+
+1. Find the stalled tasks and their nodes: `sacct -j <array job id> --format=JobID,State,ExitCode,NodeList`. Exit
+   code 75 or TIMEOUT means a stall.
+2. Rerun only those layers, throttled harder and avoiding those nodes:
+   `submit_depth_sweep.sh --account <account> --layers <list> --max-parallel 3 --exclude <nodes>`. Finished rows are
+   reused, and the new aggregate job runs afterwards.
+3. If a node stalls again, tell CARC support (node name and time).
+
 ## Sizing (TEMPORARY probe)
 
-Measured on CARC on 2026-11-11 with the real cache, layers 0 and 1, 3 seeds each, 4 CPUs:
+Measured on CARC on 2026-11-11 with the real cache, 4 CPUs, before the sequential reader:
 
 | Per task (one layer) | CARC, measured |
 |---|---|
-| Total | 39-46 s |
+| Total | 39-50 s |
 | Load train + seen_val (one layer, one pooling) | 2.4-13.5 s |
 | Train, per seed | 4.3-9.6 s |
 | Score seen_val, per seed | 0.2-1.2 s |
 | Peak memory | about 4.1 GB |
 
-Each array task requests 4 CPUs, 6 GB and 4 min: 1.5x the memory and about 5x the time. The time margin is there
-because all 32 tasks of the full run start together and read `/scratch1` at once, so loading may be slower than with
-2 tasks. A stuck task still ends within minutes. If a task runs out of time, rerun that layer alone, for example
-`--array=17`; the finished layers are not touched.
+Each array task requests 4 CPUs, 6 GB and 4 min. The sequential reader keeps one layer file (at most 0.7 GB) in
+memory only until that split's rollouts are built, so peak memory should stay about the same. Check MaxRSS on the
+next run.
 
 Seeds are deterministic: on CARC, layer 0 seed 0 run twice gave identical metrics.
 
-The real probe (B6) may cost much more, for example with a hyperparameter budget. When it lands, re-run the tiny
-test and adjust `--mem` and `--time`.
+The real probe (B6) may cost much more, for example with a hyperparameter budget. When it lands, run 2 layers first
+(`--layers 0-1`) and adjust `--mem` and `--time`.

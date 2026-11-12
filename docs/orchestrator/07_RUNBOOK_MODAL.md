@@ -113,3 +113,26 @@ on both Volumes as a backup and deleted only the discarded A10G run of task 2.
 4. Pull them from the other profile. Each task's `TASK_META.json` records the workspace and GPU that produced it, and
    the cache manifest keeps all of them. The kit's mixing guard still requires A10 everywhere.
 5. Leave the abandoned partial files in the old Volume until Akash confirms the CARC cache verified.
+
+## 8. CARC jobs and /scratch1 stalls (any CPU job, e.g. the depth sweep)
+
+**Symptoms.** These can come from many jobs reading `/scratch1` at once, or from a bad node:
+- a task's log stops in the middle of reading, or stays empty;
+- the task hits its time limit;
+- Slurm says `JOB NOT ENDING WITH SIGNALS`.
+
+The process is in uninterruptible I/O (state D). It ignores every signal, SIGKILL included, so it cannot print its
+own stack, and `scancel --signal=USR1` shows nothing.
+
+- **Throttle.** Limit concurrent array tasks with `--array=<indices>%N`. For the depth sweep, `submit_depth_sweep.sh
+  --max-parallel N` does this (default 6; use 3 after a stall).
+- **Exclude.** Pass the nodes of the stalled tasks (`sacct ... --format=JobID,State,NodeList`) to `--exclude`. They
+  are named in chat only, never in the repo.
+- **Fail fast.** The depth sweep exits with code 75 when start-up or loading takes longer than `SWEEP_LOAD_TIMEOUT`
+  (120 s). Its watchdog prints the stuck stack from a second thread, and the task logs to node-local disk and copies
+  the log back at the end.
+- **Don't chain with afterok.** A chained `afterok` job never starts once one task fails; cancel it, or use
+  `afterany` with a completeness check, as `depth_sweep_aggregate.slurm` does.
+- **Code on /scratch1.** Keep checkouts that jobs import code from off `/scratch1` when you can. Never let jobs write
+  `.pyc` files into a shared checkout (`PYTHONDONTWRITEBYTECODE=1`, set in every CARC script).
+

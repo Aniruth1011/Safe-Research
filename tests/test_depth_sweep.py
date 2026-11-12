@@ -46,10 +46,17 @@ def test_plot_is_written_and_marked_temporary(cache, tmp_path):
 
 
 def test_unseen_test_is_never_opened(cache, tmp_path, monkeypatch):
+    import builtins, os
     opened = []
-    real_load = np.load
+    real_load, real_open, real_os_open = np.load, builtins.open, os.open
+    # every way a file gets opened: np.load (the loader), open() (headers), os.open (the sequential reader)
     monkeypatch.setattr(np, "load", lambda p, *a, **k: (opened.append(str(p)), real_load(p, *a, **k))[1])
+    monkeypatch.setattr(builtins, "open", lambda p, *a, **k: (opened.append(str(p)), real_open(p, *a, **k))[1])
+    monkeypatch.setattr(os, "open", lambda p, *a, **k: (opened.append(str(p)), real_os_open(p, *a, **k))[1])
     ds.run_layer(cfg(cache, seeds=(0,)), 2, tmp_path / "out", log=lambda m: None)
+    monkeypatch.undo()
+    opened = [p for p in opened if p.startswith(str(cache))]               # cache files only (not the out folder)
+    assert sum(p.endswith("/train/L02.npy") for p in opened) >= 2           # header + data
     assert any("/train/" in p for p in opened) and any("/seen_val/" in p for p in opened)
     assert not [p for p in opened if "unseen_test" in p]
     c = ds.SeenOnlyCache(cache)
@@ -125,10 +132,12 @@ def test_normalize_uses_train_split_statistics(cache, tmp_path, plugin_module):
 
 
 def test_pool_flag_reads_that_pool(cache, tmp_path, monkeypatch):
+    import os
     opened = []
-    real_load = np.load
-    monkeypatch.setattr(np, "load", lambda p, *a, **k: (opened.append(str(p)), real_load(p, *a, **k))[1])
+    real_os_open = os.open
+    monkeypatch.setattr(os, "open", lambda p, *a, **k: (opened.append(str(p)), real_os_open(p, *a, **k))[1])
     ds.run_layer(cfg(cache, seeds=(0,), pool="first"), 0, tmp_path / "out", log=lambda m: None)
+    monkeypatch.undo()
     feats = [p for p in opened if "/features/" in p]
     assert feats and all("/features/first/" in p for p in feats)
 
@@ -280,7 +289,8 @@ def test_slurm_array_task_and_aggregate_end_to_end(cache, tmp_path):
     import os, subprocess, sys
     env = {**os.environ, "SLURM_JOB_ID": "1", "SLURM_ARRAY_JOB_ID": "7", "SLURM_SUBMIT_DIR": str(ds.REPO_ROOT),
            "SLURM_CPUS_PER_TASK": "1", "SWEEP_PYTHON": sys.executable, "CACHE_DIR": str(cache),
-           "SWEEP_OUT_ROOT": str(tmp_path / "sweeps"), "SWEEP_POOL": "first", "SWEEP_NORMALIZE": "1"}
+           "SWEEP_OUT_ROOT": str(tmp_path / "sweeps"), "SWEEP_POOL": "first", "SWEEP_NORMALIZE": "1",
+           "SWEEP_EXPECT_LAYERS": "0,2"}
     env.pop("PYTHONDONTWRITEBYTECODE", None)                          # the script must set it itself
     for layer in ("0", "2", "2"):
         r = subprocess.run([_bash(), str(SLURM_DIR / "depth_sweep.slurm")], env={**env, "SLURM_ARRAY_TASK_ID": layer},
@@ -289,6 +299,7 @@ def test_slurm_array_task_and_aggregate_end_to_end(cache, tmp_path):
         assert f"log {ds.REPO_ROOT}/logs/depth_sweep-7_{layer}.out" in r.stdout
         assert "PYTHONDONTWRITEBYTECODE=1" in r.stdout
         assert f"layer {layer} seed 2:" in r.stdout                      # computed the first time, reused the second
+        assert "logging to node-local" in r.stdout and f"layer {layer} done" in r.stdout   # local log copied back
     assert "layer 2 seed 2: reusing row from job 7_2" in r.stdout
     r = subprocess.run([_bash(), str(SLURM_DIR / "depth_sweep_aggregate.slurm")], env=env, capture_output=True,
                        text=True, timeout=600)
@@ -296,3 +307,198 @@ def test_slurm_array_task_and_aggregate_end_to_end(cache, tmp_path):
     out = tmp_path / "sweeps" / ds.SweepConfig(cache_dir="", pool="first", normalize=True).label()
     summary = pd.read_csv(out / "summary.csv")
     assert list(summary.layer) == [0, 2] and set(summary.n_seeds) == {3}   # seeds 0, 1, 2 from protocol.TRAIN_SEEDS
+
+
+# ------------------------------------------------------------------------------------- file-system friendly loading
+def test_sequential_reader_gives_exactly_the_memmap_values(cache, monkeypatch):
+    monkeypatch.setenv("SWEEP_READ_CHUNK_MB", "0.003")                 # many small chunks
+    msgs = []
+    seen_only = ds.SeenOnlyCache(cache, log=msgs.append)
+    plain = ds.load_cache_module().SharedCache(cache)                 # np.load(mmap_mode="r") + per-episode slices
+    for split, norm, horizon in [("train", False, "full"), ("seen_val", True, "full"), ("train", False, "task_min_step")]:
+        a = seen_only.records(split, 2, "mean", norm, horizon)
+        b = plain.records(split, [2], pool="mean", normalize=norm, horizon=horizon)
+        assert len(a) == len(b) and all(x["features"].equal(y["features"]) for x, y in zip(a, b))
+        assert [x["trajectory_ids"] for x in a] == [y["trajectory_ids"] for y in b]
+    assert any(m.startswith("read mean/train/L02.npy:") and "MB/s" in m for m in msgs), msgs
+    assert seen_only._mm == {}                                         # arrays dropped once records exist
+
+
+def test_reader_retries_a_stalled_chunk_on_a_new_handle(tmp_path, monkeypatch):
+    import os, time
+    arr = np.arange(10_000, dtype=np.float16).reshape(100, 100)
+    np.save(tmp_path / "L00.npy", arr)
+    real, calls = os.pread, []
+
+    def flaky(fd, n, off):
+        calls.append(off)
+        if len(calls) == 1:
+            time.sleep(1.5)                                            # the first read hangs
+        return real(fd, n, off)
+
+    monkeypatch.setattr(os, "pread", flaky)
+    msgs = []
+    out = ds.read_npy_sequential(tmp_path / "L00.npy", log=msgs.append, chunk_mb=0.01, stall_s=0.3, retries=2)
+    assert np.array_equal(out, arr)
+    assert any("no progress for 0 s at 0 MB; retrying on a new file handle (1/2)" in m for m in msgs), msgs
+
+
+def test_reader_gives_up_after_the_retries(tmp_path, monkeypatch):
+    import os, time
+    np.save(tmp_path / "L00.npy", np.zeros((10, 10), np.float16))
+    monkeypatch.setattr(os, "pread", lambda fd, n, off: time.sleep(3) or b"")
+    with pytest.raises(ds.ReadStalled, match="after 1 retries"):
+        ds.read_npy_sequential(tmp_path / "L00.npy", log=lambda m: None, stall_s=0.2, retries=1)
+
+
+def _cli(*args, env=None, timeout=120):
+    import os, subprocess, sys
+    return subprocess.run([sys.executable, str(ds.REPO_ROOT / "scripts" / "depth_sweep.py"), *args],
+                          env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1", **(env or {})}, capture_output=True,
+                          text=True, timeout=timeout)
+
+
+def test_startup_watchdog_exits_75_with_a_stack_instead_of_waiting_for_the_time_limit(cache, tmp_path):
+    slow = tmp_path / "slow_loader.py"
+    slow.write_text("import time\nclass SharedCache:\n    def __init__(self, root):\n        time.sleep(60)\n")
+    t0 = __import__("time").time()
+    r = _cli("run", "--cache", str(cache), "--out", str(tmp_path / "out"), "--layers", "1", "--seeds", "0",
+             "--loader", str(slow), env={"SWEEP_LOAD_TIMEOUT": "15"})   # long enough for the imports
+    assert r.returncode == 75, r.stdout + r.stderr
+    assert __import__("time").time() - t0 < 50
+    assert "WATCHDOG: start-up (imports, opening the cache) and loading the first layer did not finish within 15 s" in r.stdout
+    assert "slow_loader.py" in r.stdout                                 # the stack shows where it was stuck
+
+
+def test_aggregate_lists_missing_layers_and_exits_4(cache, tmp_path):
+    out = tmp_path / "out"
+    for layer in (0, 2):
+        ds.run_layer(cfg(cache, seeds=(0, 1)), layer, out, log=lambda m: None)
+    (out / "rows" / "L02_seed1.json").unlink()
+    r = _cli("aggregate", "--out", str(out), "--no-plot", "--expect-layers", "0-3")
+    assert r.returncode == 4, r.stdout + r.stderr
+    assert "MISSING: layer 1 seeds [0, 1]" in r.stdout and "MISSING: layer 2 seeds [1]" in r.stdout
+    assert "LAYERS=1,2,3" in r.stdout and (out / "summary.csv").exists()   # partial tables still written
+    r = _cli("aggregate", "--out", str(out), "--no-plot", "--expect-layers", "0")
+    assert r.returncode == 0 and "all expected layers present" in r.stdout
+
+
+def test_config_json_is_unchanged_so_finished_rows_stay_reusable(cache, tmp_path):
+    """config.json must keep exactly these keys: a different config.json makes the sweep refuse the folder and its rows."""
+    ds.run_layer(cfg(cache, seeds=(0,)), 0, tmp_path / "out", log=lambda m: None)
+    doc = json.loads((tmp_path / "out" / "config.json").read_text())
+    assert sorted(doc) == ["cache", "evaluator", "evaluator_name", "evaluator_temporary", "normalize", "pool", "probe",
+                           "probe_name", "probe_temporary", "seeds", "train_horizon"]
+    assert sorted(doc["cache"]) == ["cache_version", "created_utc", "manifest_sha256"]
+
+
+def test_slurm_task_copies_its_log_and_stops_python_on_sigterm(cache, tmp_path):
+    import os, signal, subprocess, sys, time
+    (tmp_path / "slow_plugins.py").write_text(textwrap.dedent("""
+        import time
+        class SlowProbe:
+            name, temporary = "slow", False
+            def fit(self, train_records, seed):
+                print("FITTING", flush=True)
+                time.sleep(60)
+        def make_probe(): return SlowProbe()
+    """))
+    log_dir = tmp_path / "local"
+    log_dir.mkdir()
+    env = {**os.environ, "SLURM_JOB_ID": "1", "SLURM_ARRAY_JOB_ID": "7", "SLURM_ARRAY_TASK_ID": "1",
+           "SLURM_SUBMIT_DIR": str(ds.REPO_ROOT), "SLURM_CPUS_PER_TASK": "1", "SWEEP_PYTHON": sys.executable,
+           "CACHE_DIR": str(cache), "SWEEP_OUT": str(tmp_path / "out"), "SWEEP_PROBE": "slow_plugins:make_probe",
+           "PYTHONPATH": str(tmp_path), "TMPDIR": str(log_dir)}
+    slurm_log = tmp_path / "slurm.out"
+    with open(slurm_log, "w") as f:
+        proc = subprocess.Popen([_bash(), str(SLURM_DIR / "depth_sweep.slurm")], env=env, stdout=f, stderr=f)
+        t0 = time.time()
+        while time.time() - t0 < 120:                                   # the local log fills; the Slurm log does not
+            local = list(log_dir.glob("depth_sweep-7_1.*.log"))
+            if local and "FITTING" in local[0].read_text():
+                break
+            time.sleep(0.2)
+        assert "FITTING" not in slurm_log.read_text()
+        proc.send_signal(signal.SIGTERM)
+        assert proc.wait(timeout=60) == 143
+    text = slurm_log.read_text()
+    assert "got SIGTERM" in text and "received signal 15" in text and "FITTING" in text, text
+    assert not list(log_dir.glob("*.log"))                              # local copy removed after copying
+    assert not list((tmp_path / "out" / "rows").glob("*.json"))
+
+
+def test_submit_script_throttles_excludes_and_chains_the_aggregate(tmp_path):
+    import os, subprocess
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    (fake / "sbatch").write_text('#!/bin/bash\necho "$*" >> "$SBATCH_LOG"\n'
+                                 'n=$(wc -l < "$SBATCH_LOG"); echo "$((4000 + n));cluster"\n')
+    (fake / "sbatch").chmod(0o755)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("SLURM_")}
+    env.update(PATH=f"{fake}:{env['PATH']}", SBATCH_LOG=str(tmp_path / "calls"), EXCLUDE_NODES="nodeA,nodeB")
+    script = str(SLURM_DIR / "submit_depth_sweep.sh")
+    r = subprocess.run([_bash(), script, "--account", "acct", "--layers", "10,16,19-20"], env=env, capture_output=True,
+                       text=True, cwd=tmp_path)
+    assert r.returncode == 0, r.stderr
+    sweep, agg = (tmp_path / "calls").read_text().splitlines()
+    assert "--array=10,16,19-20%6" in sweep and "--exclude=nodeA,nodeB" in sweep and "--account=acct" in sweep
+    assert sweep.endswith("scripts/carc/depth_sweep.slurm")
+    assert "--dependency=afterany:4001" in agg and "--exclude=nodeA,nodeB" in agg and agg.endswith("_aggregate.slurm")
+    assert "array job 4001" in r.stdout and "aggregate job 4002" in r.stdout
+    r = subprocess.run([_bash(), script, "--account", "acct", "--max-parallel", "3", "--dry-run"], env=env,
+                       capture_output=True, text=True)
+    assert r.returncode == 0 and "--array=0-33%3" in r.stdout
+    assert len((tmp_path / "calls").read_text().splitlines()) == 2    # dry run submitted nothing
+    r = subprocess.run([_bash(), script, "--layers", "0-1"], env=env, capture_output=True, text=True)
+    assert r.returncode != 0 and "--account is required" in r.stderr
+
+
+def test_slurm_default_array_is_throttled():
+    assert "#SBATCH --array=0-33%6" in (SLURM_DIR / "depth_sweep.slurm").read_text().splitlines()
+
+
+def test_job_logs_cannot_be_committed():
+    import shutil, subprocess
+    if shutil.which("git") is None or not (ds.REPO_ROOT / ".git").exists():
+        pytest.skip("not a git checkout")
+    git = lambda *a: subprocess.run(["git", "-C", str(ds.REPO_ROOT), *a], capture_output=True, text=True)
+    for name in ("logs/depth_sweep-1_2.out", "logs/depth_sweep_aggregate-3.out", "logs/anything.log"):
+        assert git("check-ignore", "-q", name).returncode == 0, name
+    assert git("check-ignore", "-q", "logs/.gitkeep").returncode == 1
+    assert git("ls-files", "logs").stdout.split() == ["logs/.gitkeep"]
+
+
+def test_leftover_temp_files_are_moved_aside_only_when_stale(cache, tmp_path):
+    import os, time
+    out = tmp_path / "out"
+    ds.run_layer(cfg(cache, seeds=(0,)), 1, out, log=lambda m: None)
+    old = time.time() - 3600
+    names = {out / ".config.json.3g3gs9sb": old, out / ".fhnuqgyg": old, out / "rows" / ".L01_seed1.json.ab_c1234": old,
+             out / ".zy7kq697": time.time()}                        # the last one: a task may be writing it now
+    for f, mtime in names.items():
+        f.write_text("partial")
+        os.utime(f, (mtime, mtime))
+    keep = [out / "notes.txt", out / ".hidden_but_not_temp_file"]
+    for f in keep:
+        f.write_text("x")
+        os.utime(f, (old, old))
+    msgs = []
+    ds.run_layer(cfg(cache, seeds=(0,)), 1, out, log=msgs.append)  # every seed reused; the cleanup still runs
+    moved = sorted(p.name for p in (out / "_discarded" / "tmp").iterdir())
+    assert moved == [".config.json.3g3gs9sb", ".fhnuqgyg", "rows_.L01_seed1.json.ab_c1234"]
+    assert (out / ".zy7kq697").exists() and all(f.exists() for f in keep)
+    assert sum("moved leftover temp file" in m for m in msgs) == 3
+    (out / ".zy7kq697").unlink()
+    ds.aggregate(out, plot=False)                                   # results ignore _discarded/
+    assert len(pd.read_csv(out / "results.csv")) == 1
+
+
+def test_a_failed_write_leaves_no_temp_file(tmp_path, monkeypatch):
+    import os
+    def boom(*a):
+        raise SystemExit(143)                                       # as if SIGTERM arrived mid-write
+    monkeypatch.setattr(os, "replace", boom)
+    with pytest.raises(SystemExit):
+        ds._write_json_atomic(tmp_path / "rows" / "L00_seed0.json", {"a": 1})
+    monkeypatch.undo()
+    assert list((tmp_path / "rows").iterdir()) == []
