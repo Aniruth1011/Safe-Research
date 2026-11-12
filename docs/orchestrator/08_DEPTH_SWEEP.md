@@ -52,13 +52,15 @@ plugins never mix.
 - `scripts/carc/submit_depth_sweep.sh`: submits the array (throttled, optional node exclusions) and the aggregate job.
 - `scripts/carc/depth_sweep.slurm`: one array task per layer.
 - `scripts/carc/depth_sweep_aggregate.slurm`: aggregation, after the array.
-- `tests/test_depth_sweep.py` and `tests/synthetic_cache.py`: 38 synthetic tests. They cover:
+- `tests/test_depth_sweep.py` and `tests/synthetic_cache.py`: 47 synthetic tests. They cover:
   - the unseen lock;
   - the sequential reader returning exactly the memmap values, and its stall retries;
   - the watchdog, SIGTERM handling and the copying of the local log;
   - row reuse, temp-file cleanup and file modes;
   - the submit script and both Slurm scripts with a fake Slurm;
-  - bootstrap CIs, reference lines and the plot layout.
+  - bootstrap CIs, reference lines and the plot layout;
+  - the all-layer average (equal to averaging train-z-scored layers by hand), the per-task table and the
+    progress-based watchdog.
 
   They pass under torch 2.14 (`.venv-kit310`) and under torch 2.2.0 with numpy 1.26 (the CARC kit env).
 
@@ -169,14 +171,44 @@ Settings: `--bootstrap N` (0 = none) or `SWEEP_BOOTSTRAP`, and `--ci 0.95`.
 The aggregate job runs the resampling on 4 CPUs (4 GB, 30 min). With the TEMPORARY evaluator the full sweep is
 about 7 CPU-minutes. A slower B4 evaluator scales that linearly; lower `SWEEP_BOOTSTRAP` or raise `--time` if needed.
 
-**Reference lines.** Use `--ref "label=value"` (repeatable), or `SWEEP_REFS="label=value;label=value"` for the
-aggregate job. For example, SAFE's final-layer baseline from Adarsh's reproduction, and the all-layer average:
+**All-layer average (plan row S5).** This is a Hide-and-Seek-style baseline: a probe trained on averaged
+features, not the mean of the curve. The pseudo-layer `avg` builds the features as follows:
+- **Z-scoring:** each of layers 1–31 and 33 (raw block 32) is z-scored with the cache's train-only statistics
+  (`norm_stats/<pool>.npz`, the same ones `--normalize` uses).
+- **Averaging:** the z-scored layers are averaged. Layer 0 (embeddings) and layer 32 (the final post-norm output)
+  are left out.
+
+It then goes through the same probe, evaluator, seeds, saved scores, bootstrap and per-task breakdown as any layer.
+- **Rows:** `rows/Lavg_seed<S>.json`, with `"layer": -1`, `"layer_name": "avg_z(L1-31,L33)"` and a
+  `layer_definition` block listing the member and excluded layers and the statistics used.
+- **`--normalize`:** not applied to it, because the definition already z-scores.
+- **Plot:** a purple dash-dot line with its CI band (seed std if there is no CI).
+- **Submitting:** `--layers` accepts `avg`, and the submit script's default is `0-33,avg`. `avg` reads all 32
+  member files (about 37 GB), so it runs as its own task: `SWEEP_LAYER=avg`, `AVG_TIME` 30 min, `AVG_MEM` 8 GB.
+- **Memory:** one float32 sum per split, 1.4 GB train and 0.9 GB seen_val, plus one file being read; the rollouts
+  are views into those sums. Estimated peak about 4–5 GB. It is not measured yet, because the laptop has no room
+  for a full-size 34-layer synthetic cache.
+- **Watchdog:** it now fires after `SWEEP_LOAD_TIMEOUT` seconds without progress (every 64 MB chunk counts), not
+  after that many seconds in total. A long but moving read is fine.
+- **Older caches:** a 33-layer cache has no raw block 32, so `avg` refuses it.
+- **Aggregation:** it expects `0-33,avg` by default; use `SWEEP_EXPECT_LAYERS=0-33` for folders without `avg`.
+
+The definition and open questions for Rhea's review are in `09_S5_ALL_LAYER_AVERAGE.md`.
+
+**SAFE reference line.** The only allowed value is Adarsh's SAFE model re-scored by our evaluator on seen_val at
+task_min_step (plan row C4). Until then there is no SAFE line. The plot caption says that layer 32 (final layer,
+after the norm) is SAFE's feature with our probe. When the C4 value exists:
 ```bash
-export SWEEP_REFS="SAFE final layer (reproduction)=<value>;All-layer average=<value>"
+export SWEEP_REFS="SAFE (C4: re-scored by our evaluator)=<value>"
 ```
-Values are for the plotted metric (`--metric`, default roc_auc). They are only comparable when computed on
-seen_val, at the same horizon, with the same evaluator. They are stored per metric in `references.json`, so later
-aggregations keep them without the flag.
+`--ref "label=value"` (repeatable) does the same. Values are for the plotted metric (`--metric`, default roc_auc).
+They are stored per metric in `references.json`, so later aggregations keep them.
+
+**Per-task breakdown.** `per_task.csv` has, for every layer and seen_val task, the folder's evaluator on that
+task's episodes only: mean and std over seeds, with `n_episodes` and `n_failures`. `summary.csv` adds one column
+per task for the plotted metric, `val_roc_auc_task<T>`, which shows whether a few tasks drive the differences
+between layers. A task whose seen_val episodes are all successes or all failures gets NaN for ranking metrics.
+With about 20 episodes per task, these are noisy; read them as a diagnostic, not as results.
 
 ## When /scratch1 stalls
 

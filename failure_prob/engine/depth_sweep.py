@@ -18,6 +18,10 @@ Outputs, in one folder per configuration (pool, normalize, train horizon, probe,
     summary.csv                 mean / std / n over seeds and bootstrap CI over episodes, per layer (aggregate)
     depth_curve.png             mean, seed std band, bootstrap CI bars, reference lines (aggregate)
 Rows made with a TEMPORARY probe or evaluator say so in every file and in the plot title.
+Besides the cache layers, the pseudo-layer "avg" (files Lavg_*) is the all-layer average baseline (plan row S5,
+Hide-and-Seek style): layers 1-31 and 33 (raw block 32), each z-scored with the cache's train-only statistics,
+averaged; 0 (embeddings) and 32 (final post-norm) are left out. It goes through the same probe, evaluator, seeds and
+bootstrap, and is drawn as a reference line. Internally its layer number is AVG_LAYER (-1).
 Every file and folder written here is made readable by group and others (0644 / 0755), so results can be shared.
 """
 from __future__ import annotations
@@ -48,6 +52,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_LOADER = REPO_ROOT / "collection" / "load_cache.py"
 ALLOWED_SPLITS = ("train", "seen_val")  # unseen_test is never touched by the sweep
 METRIC_PREFIX = "val_"
+AVG_LAYER = -1                       # the "avg" pseudo-layer (plan row S5); see avg_layer_members()
+AVG_NAME = "avg_z(L1-31,L33)"
 FILE_MODE, DIR_MODE = 0o644, 0o755  # results are shared with the team
 # Who wrote a row. Kept in rows/*.json (on CARC only) but left out of results.csv, which may be shared more widely:
 # job IDs and log paths (they contain the user name) must not reach the public repo.
@@ -75,7 +81,7 @@ def _env_float(name: str, default: float) -> float:
 
 
 def read_npy_sequential(path: Path, log=print, chunk_mb: float | None = None, stall_s: float | None = None,
-                        retries: int | None = None, progress_s: float = 5.0) -> np.ndarray:
+                        retries: int | None = None, progress_s: float = 5.0, on_progress=None) -> np.ndarray:
     """Read a .npy file into memory in one sequential pass of large chunks.
 
     This replaces np.load(mmap_mode="r") followed by per-episode slicing, which turns into many small page-fault reads
@@ -106,6 +112,8 @@ def read_npy_sequential(path: Path, log=print, chunk_mb: float | None = None, st
         n = min(chunk, nbytes - pos)
         raw[pos:pos + n] = np.frombuffer(_read_chunk(path, offset + pos, n, stall_s, retries, log, pos), np.uint8)
         pos += n
+        if on_progress is not None:
+            on_progress()                              # e.g. the CLI watchdog: reading is still moving
         now = time.time()
         if now - last >= progress_s and pos < nbytes:
             log(f"reading {path.name}: {pos / 1e6:.0f}/{mb:.0f} MB ({now - t0:.1f} s)")
@@ -168,6 +176,27 @@ def _read_chunk(path: Path, offset: int, size: int, stall_s: float, retries: int
             raise last_error
 
 
+def row_stem(layer: int) -> str:
+    """File stem of a layer's rows: L07, ..., L33, and Lavg for the all-layer average."""
+    return "Lavg" if layer == AVG_LAYER else f"L{layer:02d}"
+
+
+def parse_layer(token) -> int:
+    """'7' -> 7, 'avg' -> AVG_LAYER."""
+    return AVG_LAYER if str(token).strip().lower() == "avg" else int(token)
+
+
+def avg_layer_members(names: list[str]) -> list[int]:
+    """Layers averaged by the "avg" pseudo-layer: every block before the final norm, i.e. all but the embeddings
+    ("emb", index 0) and the final post-norm output ("*_postnorm", index 32 in cache v1). In cache v1 that is 1-31 and
+    33 (raw block 32, "*_prenorm"). Needs a pre-norm layer, so 33-layer caches cannot build it."""
+    members = [l for l, n in enumerate(names) if n != "emb" and not n.endswith("_postnorm")]
+    if not any(names[l].endswith("_prenorm") for l in members):
+        raise ValueError("the avg pseudo-layer needs the raw last block (a '*_prenorm' layer); this cache has "
+                         f"layers {names[0]}..{names[-1]} only")
+    return members
+
+
 class SeenOnlyCache:
     """SharedCache restricted to train and seen_val. Any request for another split raises before a file is opened.
 
@@ -175,8 +204,9 @@ class SeenOnlyCache:
     loader are identical. They are dropped again once a split's records are built.
     """
 
-    def __init__(self, cache_dir: Path, loader: Path = DEFAULT_LOADER, log=print):
+    def __init__(self, cache_dir: Path, loader: Path = DEFAULT_LOADER, log=print, on_progress=None):
         self._cache = load_cache_module(loader).SharedCache(cache_dir)
+        self._log, self._on_progress = log, on_progress
         inner_array = self._cache._array
         mm = getattr(self._cache, "_mm", None)  # the loader's per-file cache, keyed (pool, split, layer)
         root = Path(self._cache.root)
@@ -185,7 +215,7 @@ class SeenOnlyCache:
             _check_split(split)
             path = root / "features" / pool / split / f"L{layer:02d}.npy"
             if isinstance(mm, dict) and (pool, split, layer) not in mm and path.exists():
-                mm[(pool, split, layer)] = read_npy_sequential(path, log=log)
+                mm[(pool, split, layer)] = read_npy_sequential(path, log=log, on_progress=self._on_progress)
             return inner_array(pool, split, layer)
 
         self._cache._array = guarded_array  # second line of defence, in case the loader changes
@@ -201,6 +231,44 @@ class SeenOnlyCache:
         out = self._cache.records(split, [layer], pool=pool, normalize=normalize, horizon=horizon)
         if isinstance(self._mm, dict):
             self._mm.pop((pool, split, layer), None)  # the records hold their own float32 copies
+        return out
+
+    def avg_records(self, split: str, layers: list[int], pool: str, horizon: str, chunk_rows: int = 8192) -> list[dict]:
+        """Records of the all-layer average: mean over `layers` of (x - train mean) / train std, per layer.
+
+        The statistics are the cache's train-only norm_stats (the same ones --normalize uses). Each layer file is read
+        once, sequentially, and added into one float32 array; the records are views into it (no extra copy)."""
+        import torch
+        _check_split(split)
+        root = Path(self._cache.root)
+        try:
+            mean, std = self._cache.norm_stats(pool, layers)
+        except KeyError as e:
+            raise ValueError(f"norm_stats/{pool}.npz has no statistics for layer {e}") from None
+        acc = None
+        for i, layer in enumerate(layers):
+            x = read_npy_sequential(root / "features" / pool / split / f"L{layer:02d}.npy", log=self._log,
+                                    on_progress=self._on_progress)
+            if acc is None:
+                acc = np.zeros(x.shape, dtype=np.float32)
+            elif x.shape != acc.shape:
+                raise ValueError(f"layer {layer} has shape {x.shape}, earlier layers {acc.shape}")
+            m, sd = mean[i].astype(np.float32), std[i].astype(np.float32)
+            for a in range(0, x.shape[0], chunk_rows):
+                acc[a:a + chunk_rows] += (x[a:a + chunk_rows].astype(np.float32) - m) / sd
+            del x
+        acc /= len(layers)
+        out = []
+        for ep in self.episodes[self.episodes.split == split].itertuples():
+            stop = ep.row_end if horizon == "full" else ep.row_start + min(ep.length, ep.task_min_step)
+            t = stop - ep.row_start
+            out.append({
+                "features": torch.from_numpy(acc[ep.row_start:stop]).view(1, t, 1, acc.shape[1]),
+                "mask": torch.ones(1, t, dtype=torch.bool),
+                "labels": torch.tensor([float(ep.failure)]),
+                "task_ids": [int(ep.task_id)],
+                "trajectory_ids": [ep.trajectory_id],
+            })
         return out
 
     def layer_names(self) -> list[str]:
@@ -412,28 +480,31 @@ def _check_or_write_config(out_dir: Path, cfg: SweepConfig, cache: SeenOnlyCache
 
 
 def run_layer(cfg: SweepConfig, layer: int, out_dir: Path, loader: Path = DEFAULT_LOADER, overwrite: bool = False,
-              log=print, on_loaded=None) -> list[dict]:
-    """Train cfg.seeds probes on one layer and score seen_val. Returns the rows (also written to out_dir/rows/).
+              log=print, on_loaded=None, on_progress=None) -> list[dict]:
+    """Train cfg.seeds probes on one layer (or AVG_LAYER) and score seen_val. Returns the rows (also in out_dir/rows/).
 
-    on_loaded() is called once the layer's data is in memory, or once it is clear nothing needs loading
-    (the CLI's start-up watchdog uses it)."""
+    on_loaded() is called once the layer's data is in memory, or once it is clear nothing needs loading;
+    on_progress() after every chunk read from the cache (the CLI's watchdog uses both)."""
     out_dir = Path(out_dir)
+    layer = parse_layer(layer)
     on_loaded = on_loaded or (lambda: None)
     log(f"opening cache {cfg.cache_dir} (loader {loader})")
     t_open = time.time()
-    cache = SeenOnlyCache(Path(cfg.cache_dir), loader, log=log)
+    cache = SeenOnlyCache(Path(cfg.cache_dir), loader, log=log, on_progress=on_progress)
     log(f"cache open ({time.time() - t_open:.1f} s): {len(cache.episodes)} episodes, "
         f"version {cache.manifest.get('cache_version')}")
     names = cache.layer_names()
-    if not 0 <= layer < len(names):
-        raise ValueError(f"layer {layer} not in this cache (0..{len(names) - 1})")
+    members = avg_layer_members(names) if layer == AVG_LAYER else None
+    if layer != AVG_LAYER and not 0 <= layer < len(names):
+        raise ValueError(f"layer {layer} not in this cache (0..{len(names) - 1}, or 'avg')")
+    layer_name = AVG_NAME if layer == AVG_LAYER else names[layer]
     probe, evaluator = resolve(cfg.probe, PROBES), resolve(cfg.evaluator, EVALUATORS)
     _mkdir_shared(out_dir)
     move_aside_stale_temp_files(out_dir, log)
     cfg_doc = _check_or_write_config(out_dir, cfg, cache, probe, evaluator)
     todo = []
     for seed in cfg.seeds:
-        path = out_dir / "rows" / f"L{layer:02d}_seed{seed}.json"
+        path = out_dir / "rows" / f"{row_stem(layer)}_seed{seed}.json"
         if not path.exists():
             todo.append(seed)
             continue
@@ -458,8 +529,13 @@ def run_layer(cfg: SweepConfig, layer: int, out_dir: Path, loader: Path = DEFAUL
         return []
 
     t0 = time.time()
-    train = cache.records("train", layer, cfg.pool, cfg.normalize, cfg.train_horizon)
-    val = cache.records("seen_val", layer, cfg.pool, cfg.normalize, "full")
+    if layer == AVG_LAYER:
+        log(f"layer avg: averaging z-scored layers {members} (train-only statistics; --normalize does not apply)")
+        train = cache.avg_records("train", members, cfg.pool, cfg.train_horizon)
+        val = cache.avg_records("seen_val", members, cfg.pool, "full")
+    else:
+        train = cache.records("train", layer, cfg.pool, cfg.normalize, cfg.train_horizon)
+        val = cache.records("seen_val", layer, cfg.pool, cfg.normalize, "full")
     load_s = time.time() - t0
     on_loaded()
     ep = cache.episodes.set_index("trajectory_id")
@@ -469,7 +545,7 @@ def run_layer(cfg: SweepConfig, layer: int, out_dir: Path, loader: Path = DEFAUL
     task_ids = np.array([int(r["task_ids"][0]) for r in val])
     if set(task_ids) & set(UNSEEN_TASKS):
         raise ValueError("seen_val contains an unseen task")  # cannot happen after SeenOnlyCache's check
-    log(f"layer {layer} ({names[layer]}): loaded {len(train)} train / {len(val)} seen_val rollouts in {load_s:.1f} s")
+    log(f"layer {row_stem(layer)[1:]} ({layer_name}): loaded {len(train)} train / {len(val)} seen_val rollouts in {load_s:.1f} s")
 
     rows = []
     for seed in todo:
@@ -481,11 +557,17 @@ def run_layer(cfg: SweepConfig, layer: int, out_dir: Path, loader: Path = DEFAUL
         eval_input = EvalInput(scores, labels, horizons, task_ids, val_ids)
         metrics = evaluator(eval_input)
         score_s = time.time() - t2
-        row_path = out_dir / "rows" / f"L{layer:02d}_seed{seed}.json"
+        row_path = out_dir / "rows" / f"{row_stem(layer)}_seed{seed}.json"
         _save_eval_input(scores_path(row_path), eval_input)  # before the row: a completed row has its scores
         temporary = bool(probe.temporary or evaluator.temporary)
         row = {
-            "experiment": "R1-R4_depth_sweep", "layer": layer, "layer_name": names[layer], "seed": seed,
+            "experiment": "R1-R4_depth_sweep", "layer": layer, "layer_name": layer_name, "seed": seed,
+            **({"layer_definition": {"kind": "mean of z-scored layers (plan row S5, Hide-and-Seek style)",
+                                     "layers": members, "layer_names": [names[l] for l in members],
+                                     "excluded": [l for l in range(len(names)) if l not in members],
+                                     "zscore": f"train-only statistics, norm_stats/{cfg.pool}.npz",
+                                     "normalize_flag": "not applied (z-scored by definition)"}}
+               if layer == AVG_LAYER else {}),
             "pool": cfg.pool, "normalize": cfg.normalize, "train_horizon": cfg.train_horizon,
             "eval_split": "seen_val", "eval_horizon": "task_min_step",
             "probe": probe.name, "evaluator": evaluator.name, "TEMPORARY": temporary,
@@ -525,9 +607,12 @@ def _torch_version() -> str:
 
 
 def parse_layers(spec: str) -> list[int]:
-    """'0-33' or '2,5,10-12' -> sorted layer list."""
+    """'0-33', '2,5,10-12' or '0-33,avg' -> sorted layer list ('avg' = AVG_LAYER)."""
     out: set[int] = set()
     for part in filter(None, (p.strip() for p in spec.split(","))):
+        if part.lower() == "avg":
+            out.add(AVG_LAYER)
+            continue
         lo, _, hi = part.partition("-")
         out.update(range(int(lo), int(hi or lo) + 1))
     return sorted(out)
@@ -537,7 +622,7 @@ def missing_rows(out_dir: Path, layers: list[int]) -> dict[int, list[int]]:
     """{layer: [seeds]} for every expected (layer, seed) row that does not exist yet (seeds from config.json)."""
     seeds = json.loads((Path(out_dir) / "config.json").read_text())["seeds"]
     rows = Path(out_dir) / "rows"
-    out = {l: [s for s in seeds if not (rows / f"L{l:02d}_seed{s}.json").exists()] for l in layers}
+    out = {l: [s for s in seeds if not (rows / f"{row_stem(l)}_seed{s}.json").exists()] for l in layers}
     return {l: s for l, s in out.items() if s}
 
 
@@ -594,9 +679,9 @@ def bootstrap_cis(out_dir: Path, df, evaluator_spec: str, n: int, ci: float, see
     """{layer: bootstrap_layer(...)} for every layer whose rows all have saved scores; others are skipped (logged)."""
     jobs, skipped = [], []
     for layer, g in df.groupby("layer"):
-        files = [Path(out_dir) / "rows" / f"L{int(layer):02d}_seed{int(s)}.scores.npz" for s in g.seed]
+        files = [Path(out_dir) / "rows" / f"{row_stem(int(layer))}_seed{int(s)}.scores.npz" for s in g.seed]
         if all(f.exists() for f in files):
-            jobs.append((int(layer), files, evaluator_spec, n, ci, seed + int(layer)))
+            jobs.append((int(layer), files, evaluator_spec, n, ci, seed + int(layer) % 1000))
         else:
             skipped.append(int(layer))
     if skipped:
@@ -613,6 +698,44 @@ def bootstrap_cis(out_dir: Path, df, evaluator_spec: str, n: int, ci: float, see
         results = dict(map(_bootstrap_job, jobs))
     log(f"bootstrap done in {time.time() - t0:.0f} s")
     return results
+
+
+# ----------------------------------------------------------------------------------------------- per-task breakdown
+def per_task_metrics(out_dir: Path, df, evaluator_spec: str, log=print):
+    """Long table: for each layer and seen_val task, the folder's evaluator on that task's episodes only, per seed,
+    then mean / std over seeds. Built from the saved scores; layers without them are skipped. A task whose episodes
+    are all successes or all failures gets NaN for ranking metrics."""
+    import pandas as pd
+    evaluator = resolve(evaluator_spec, EVALUATORS)
+    out, skipped = [], []
+    for (layer, name), g in df.groupby(["layer", "layer_name"]):
+        files = [Path(out_dir) / "rows" / f"{row_stem(int(layer))}_seed{int(sd)}.scores.npz" for sd in g.seed]
+        if not all(f.exists() for f in files):
+            skipped.append(int(layer))
+            continue
+        per_seed = []
+        for f in files:
+            d = load_eval_input(f)
+            for task in np.unique(d.task_ids):
+                idx = np.flatnonzero(d.task_ids == task)
+                try:
+                    m = evaluator(EvalInput([d.step_scores[i] for i in idx], d.labels[idx], d.horizons[idx],
+                                            d.task_ids[idx], [d.trajectory_ids[i] for i in idx]))
+                except Exception as e:  # noqa: BLE001  (e.g. an evaluator that refuses a one-class subset)
+                    log(f"per-task: layer {layer} task {task}: evaluator failed ({type(e).__name__}: {e}); NaN")
+                    m = {}
+                per_seed.append({"task_id": int(task), "n_episodes": len(idx), "n_failures": int(d.labels[idx].sum()),
+                                 **{METRIC_PREFIX + k: v for k, v in m.items()}})
+        t = pd.DataFrame(per_seed)
+        mcols = [c for c in t.columns if c.startswith(METRIC_PREFIX)]
+        agg = t.groupby(["task_id", "n_episodes", "n_failures"])[mcols]
+        t = agg.mean().add_suffix("_mean").join(agg.std(ddof=1).add_suffix("_std")).reset_index()
+        t.insert(0, "layer_name", name)
+        t.insert(0, "layer", int(layer))
+        out.append(t)
+    if skipped:
+        log(f"no per-task breakdown for layers {skipped}: no saved scores")
+    return pd.concat(out, ignore_index=True) if out else None
 
 
 # ------------------------------------------------------------------------------------------------ reference lines
@@ -678,8 +801,17 @@ def aggregate(out_dir: Path, metric: str = "roc_auc", plot: bool = True, log=pri
         summary[f"{col}_ci{pct}_low"] = [cis.get(int(l), {}).get(k, (np.nan, np.nan))[0] for l in summary.layer]
         summary[f"{col}_ci{pct}_high"] = [cis.get(int(l), {}).get(k, (np.nan, np.nan))[1] for l in summary.layer]
     summary["bootstrap_resamples"] = [cis[int(l)]["_n_valid"] if int(l) in cis else 0 for l in summary.layer]
-    summary.to_csv(out_dir / "summary.csv", index=False)
     written = {"results": out_dir / "results.csv", "summary": out_dir / "summary.csv"}
+    tasks = per_task_metrics(out_dir, df, json.loads((out_dir / "config.json").read_text())["evaluator"], log)
+    if tasks is not None:
+        tasks.to_csv(out_dir / "per_task.csv", index=False)
+        written["per_task"] = out_dir / "per_task.csv"
+        col = f"{METRIC_PREFIX}{metric}_mean"
+        if col in tasks:                               # wide: one column per seen task, for the plotted metric
+            wide = tasks.pivot(index="layer", columns="task_id", values=col)
+            for task in wide.columns:
+                summary[f"{METRIC_PREFIX}{metric}_task{task}"] = summary.layer.map(wide[task])
+    summary.to_csv(out_dir / "summary.csv", index=False)
     references = update_references(out_dir, metric, refs or {})
     if references:
         log("reference lines for " + metric + ": " + ", ".join(f"{k} = {v:.3f}" for k, v in references.items()))
@@ -704,7 +836,7 @@ def plot_positions(summary) -> tuple[list[int], dict[int, float]]:
 
     A pre-norm layer is the same block as its "_postnorm" partner, only before the final RMSNorm, so it is drawn
     next to that partner, not as one layer deeper."""
-    names = dict(zip(summary.layer.astype(int), summary.layer_name.astype(str)))
+    names = {l: n for l, n in zip(summary.layer.astype(int), summary.layer_name.astype(str)) if l != AVG_LAYER}
     by_name = {n: l for l, n in names.items()}
     side = {}
     for layer, name in names.items():
@@ -721,7 +853,7 @@ def build_figure(summary, first_row, col: str, temporary: bool, references: dict
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     blue, orange = "#2563eb", "#d97706"
-    fig, ax = plt.subplots(figsize=(10, 4.2))
+    fig, ax = plt.subplots(figsize=(10, 4.6))
     main, side = plot_positions(summary)
     s_main = summary.set_index(summary.layer.astype(int)).loc[main]
     x, m = s_main.index.to_numpy(), s_main[f"{col}_mean"].to_numpy()
@@ -742,7 +874,19 @@ def build_figure(summary, first_row, col: str, temporary: bool, references: dict
                         ecolor=orange, elinewidth=0.8, capsize=2)
         ax.plot([xs], [mean], marker="D", ms=6, mfc="white", mec=orange, mew=1.5, ls="none", zorder=4,
                 label=f"{r.layer_name} (index {layer}): block before the final norm")
-    for (label, value), color in zip((references or {}).items(), ["#16a34a", "#7c3aed", "#db2777", "#475569"]):
+    by_layer = summary.set_index(summary.layer.astype(int))
+    if AVG_LAYER in by_layer.index:                    # the all-layer average probe (S5), same probe/evaluator/seeds
+        r, purple = by_layer.loc[AVG_LAYER], "#7c3aed"
+        mean = float(r[f"{col}_mean"])
+        if have_ci and not np.isnan(r[f"{ci_col}_low"]):
+            lo, hi, band = float(r[f"{ci_col}_low"]), float(r[f"{ci_col}_high"]), f"{round(ci * 100)}% CI"
+        else:
+            sd_avg = float(0 if np.isnan(r[f"{col}_std"]) else r[f"{col}_std"])
+            lo, hi, band = mean - sd_avg, mean + sd_avg, "± seed std"
+        ax.axhline(mean, ls="-.", lw=1.3, color=purple, zorder=2,
+                   label=f"all-layer average probe (z-scored L1-31 + L33): {mean:.3f}")
+        ax.axhspan(lo, hi, color=purple, alpha=0.08, lw=0, label=f"all-layer average, {band}")
+    for (label, value), color in zip((references or {}).items(), ["#16a34a", "#db2777", "#475569", "#0891b2"]):
         ax.axhline(value, ls="--", lw=1.2, color=color, label=f"{label}: {value:.3f}", zorder=2)
     ax.set_xlabel("layer index (0 = embeddings, 32 = final layer after the norm; diamond = same block before the norm)")
     ax.set_ylabel(f"seen_val {col.removeprefix(METRIC_PREFIX)}")
@@ -755,8 +899,14 @@ def build_figure(summary, first_row, col: str, temporary: bool, references: dict
     if temporary:
         title = "TEMPORARY probe/metric: NOT A RESULT\n" + title
     ax.set_title(title, fontsize=9, color="#b91c1c" if temporary else "black")
-    fig.tight_layout()
+    fig.text(0.01, 0.01, CAPTION, fontsize=7, color="#475569", ha="left", va="bottom")
+    fig.tight_layout(rect=(0, 0.07, 1, 1))
     return fig, ax
+
+
+CAPTION = ("Layer 32 (final layer, after the norm) is the feature SAFE uses, here with our probe.\n"
+           "A SAFE line is drawn only for Adarsh's SAFE model re-scored by our evaluator on seen_val at task_min_step "
+           "(plan row C4).")
 
 
 def _plot(summary, first_row, col: str, path: Path, temporary: bool, references=None, ci_col=None, ci=0.95,

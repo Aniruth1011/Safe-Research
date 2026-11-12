@@ -18,7 +18,8 @@
 # Optional settings (export them and submit with --export=ALL): SWEEP_POOL, SWEEP_NORMALIZE, SWEEP_TRAIN_HORIZON,
 # SWEEP_PROBE, SWEEP_EVALUATOR, SWEEP_OUT, SWEEP_OUT_ROOT, CACHE_DIR (default /scratch1/$USER/safe_cache/v1),
 # SWEEP_PYTHON (default /scratch1/$USER/safe_cache_work/venv310/bin/python),
-# SWEEP_LOAD_TIMEOUT (default 120 s: start-up and loading must finish by then, or the task exits with code 75),
+# SWEEP_LAYER (run this layer, e.g. avg, instead of the array index),
+# SWEEP_LOAD_TIMEOUT (default 120 s without progress during start-up and loading, then the task exits with code 75),
 # SWEEP_READ_STALL_S / SWEEP_READ_RETRIES / SWEEP_READ_CHUNK_MB (default 30 s / 2 / 64 MB, see read_npy_sequential).
 #
 # Logging: the task logs to a file on the node's local disk ($TMPDIR or /tmp) and copies it into the Slurm log
@@ -78,7 +79,8 @@ echo "[$(ts)] imports ok"
 
 export CUDA_VISIBLE_DEVICES=""                               # CPU job: never touch a GPU
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}" MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}"
-LAYER="${SLURM_ARRAY_TASK_ID:?submit as an array job (see scripts/carc/submit_depth_sweep.sh)}"
+# The layer is the array index, or SWEEP_LAYER (e.g. "avg", the all-layer average baseline, plan row S5)
+LAYER="${SWEEP_LAYER:-${SLURM_ARRAY_TASK_ID:?submit as an array job (see scripts/carc/submit_depth_sweep.sh)}}"
 ARGS=(run --layers "$LAYER" --pool "${SWEEP_POOL:-mean}" --train-horizon "${SWEEP_TRAIN_HORIZON:-full}"
       --probe "${SWEEP_PROBE:-temporary_mlp}" --evaluator "${SWEEP_EVALUATOR:-temporary_max}"
       --threads "${SLURM_CPUS_PER_TASK:-4}")
