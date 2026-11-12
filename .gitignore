@@ -159,5 +159,7 @@ slurm_logs
 /multirun
 /results
 /logs
+# Slurm logs of the collection kit (carc/*.slurm write to collection/logs/): they contain job IDs and node names
+collection/logs/
 /artifacts
 /setup_envs.bash

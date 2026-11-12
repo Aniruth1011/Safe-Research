@@ -4,7 +4,8 @@
 Input: a rollout folder written by the patched `run_libero_eval.py --save_all_layers True`, containing per episode
     task{T}--ep{E}--succ{S}.csv        (written last; marks the episode complete)
     task{T}--ep{E}--succ{S}.pkl        (SAFE's original last-layer features, unchanged)
-    task{T}--ep{E}--succ{S}.layers.pt  ((T, P, 33, D) bfloat16, all layers, P poolings)
+    task{T}--ep{E}--succ{S}.layers.pt  ((T, P, L, D) bfloat16, all layers, P poolings; L=34 with raw block 32, else 33)
+    task{T}--ep{E}--invalid.json       (INSTEAD of the files above when the episode raised; see README "Invalid episodes")
 
 Output (CACHE_ROOT/<version>/):
     manifest.json         everything about the cache, incl. sha256 of every file
@@ -39,6 +40,7 @@ FP16_MAX = 65504.0
 LAYER_CONVENTION = (
     "hf_hidden_states: 0=embeddings, i(1..31)=output of decoder layer i (pre-norm), "
     "32=output of decoder layer 32 after final RMSNorm (SAFE's last layer). Spreadsheet L<i> == index i."
+    " 33 (only in 34-layer datasets, see layer_names)=output of decoder layer 32 BEFORE the final RMSNorm."
 )
 
 
@@ -73,6 +75,61 @@ def discover(rollout_dir: Path) -> pd.DataFrame:
     return df
 
 
+INVALID_RE = re.compile(r"^task(\d+)--ep(\d+)--invalid\.json$")
+
+
+def account_invalid_episodes(rollout_dir: Path, df: pd.DataFrame, counts: pd.Series, expect_episodes: int,
+                             max_invalid: int | None, problems: list[str]) -> tuple[list[dict], pd.Series]:
+    """Must-fix 4: discover `task{T}--ep{E}--invalid.json` markers written by the patched run_libero_eval.py.
+
+    Exits (never bypassable) on an unreadable marker, a marker whose content disagrees with its file name, a marker
+    for an episode index outside 0..expect_episodes-1, an episode that has both a marker and data files, or more
+    markers than --max-invalid. Appends to `problems` (bypassable with --allow-incomplete, like any incompleteness)
+    every episode 0..expect_episodes-1 of a task that has neither a completed .csv nor a marker.
+    Returns (one manifest record per invalid episode, `counts` with the invalid episodes added per task)."""
+    errors, invalid = [], []
+    for p in sorted(rollout_dir.glob("task*--ep*--invalid.json")):
+        m = INVALID_RE.match(p.name)
+        if not m:
+            continue
+        t, e = int(m.group(1)), int(m.group(2))
+        try:
+            rec = json.loads(p.read_text())
+        except (OSError, ValueError) as ex:
+            errors.append(f"{p.name}: unreadable marker ({ex})")
+            continue
+        if not isinstance(rec, dict) or rec.get("task_id") != t or rec.get("episode_idx") != e \
+                or not rec.get("exception_type"):
+            errors.append(f"{p.name}: content does not match the file name or has no exception_type")
+            continue
+        if not 0 <= e < expect_episodes:
+            errors.append(f"{p.name}: episode index outside 0..{expect_episodes - 1}")
+        data = sorted(q.name for q in rollout_dir.glob(f"task{t}--ep{e}--succ*"))
+        if data:
+            errors.append(f"{p.name}: episode has both an invalid marker and data files {data}")
+        invalid.append({"trajectory_id": f"libero_10/t{t:02d}/e{e:02d}", "task_id": t, "episode_idx": e,
+                        "exception_type": rec["exception_type"],
+                        "exception_message": str(rec.get("exception_message", ""))[:500],
+                        "step_index": rec.get("step_index"), "timestamp_utc": rec.get("timestamp_utc"),
+                        "marker": p.name})
+    if errors:
+        sys.exit("Inconsistent invalid-episode markers:\n  " + "\n  ".join(errors))
+    if max_invalid is not None and len(invalid) > max_invalid:
+        sys.exit(f"{len(invalid)} invalid episodes exceed --max-invalid {max_invalid}: "
+                 + ", ".join(f"{r['marker']} ({r['exception_type']})" for r in invalid))
+    done = set(zip(df.task_id.astype(int), df.episode_idx.astype(int)))
+    marked = {(r["task_id"], r["episode_idx"]) for r in invalid}
+    tasks = sorted({t for t, _ in done | marked})
+    unexplained = [f"task{t}--ep{e}" for t in tasks for e in range(expect_episodes) if (t, e) not in done | marked]
+    if unexplained:
+        problems.append(f"{len(unexplained)} episodes have neither a .csv nor an invalid marker, e.g. {unexplained[:5]}")
+    if invalid:
+        print(f"{len(invalid)} invalid episodes (excluded from the cache): "
+              + ", ".join(f"t{r['task_id']}/e{r['episode_idx']} {r['exception_type']}" for r in invalid))
+    per_task = pd.Series({t: sum(1 for tt, _ in marked if tt == t) for t, _ in marked}, dtype="int64")
+    return invalid, counts.add(per_task, fill_value=0).astype("int64")
+
+
 def make_splits(df: pd.DataFrame, unseen_tasks: list[int], seen_train_ratio: float, seed: int) -> dict[str, list[str]]:
     """Seen tasks: per task, stratified by outcome, `seen_train_ratio` to train and the rest to seen_val."""
     splits = {s: [] for s in SPLITS}
@@ -92,8 +149,84 @@ def make_splits(df: pd.DataFrame, unseen_tasks: list[int], seen_train_ratio: flo
 
 def load_episode(row, mmap: bool = False) -> tuple[torch.Tensor, dict]:
     # mmap=True only maps the file, so the validation pass doesn't read every byte
-    payload = torch.load(row.layers, map_location="cpu", weights_only=False, mmap=mmap)
+    payload = torch.load(str(row.layers), map_location="cpu", weights_only=False, mmap=mmap)  # torch 2.2: mmap needs a str
     return payload["features"], payload
+
+
+FINGERPRINT_KEY = "run_fingerprint"
+FINGERPRINT_MUST_MATCH = ("attn_implementation", "gpu_name", "render_backend")
+REQUIRED_ATTN_IMPLEMENTATION = "flash_attention_2"
+
+
+def check_run_fingerprints(df: pd.DataFrame, allow_missing: bool) -> dict:
+    """E3 dataset-consistency guard. Reads `run_fingerprint` (written by run_libero_eval.py --save_all_layers, see
+    experiments/robot/libero/run_guards.py) from every episode and exits non-zero if attention implementation, GPU name
+    or MuJoCo render backend differ across the dataset, or if any attention implementation is not flash_attention_2.
+    Episodes without a fingerprint are refused unless `allow_missing` (recorded in the manifest).
+    Returns the record stored in manifest.json under `run_fingerprint`."""
+    fps, missing = {}, []
+    for row in df.itertuples():
+        fp = load_episode(row, mmap=True)[1].get(FINGERPRINT_KEY)
+        if fp is None:
+            missing.append(Path(row.layers).name)
+        else:
+            fps[Path(row.layers).name] = fp
+    problems = []
+    if missing and not allow_missing:
+        problems.append(f"{len(missing)}/{len(df)} episodes have no {FINGERPRINT_KEY} (pass --allow-missing-fingerprint "
+                        f"to build anyway; it is recorded in the manifest), e.g. {missing[:3]}")
+    values = {}
+    for key in FINGERPRINT_MUST_MATCH:
+        groups = defaultdict(list)
+        for name, fp in fps.items():
+            groups[json.dumps(fp.get(key), sort_keys=True)].append(name)
+        values[key] = groups
+        if len(groups) > 1:
+            listing = "; ".join(f"{v} x{len(n)} e.g. {n[:3]}" for v, n in sorted(groups.items()))
+            problems.append(f"mixed {key} across the dataset: {listing}")
+    bad_attn = {v: n for v, n in values["attn_implementation"].items()
+                if json.loads(v) != REQUIRED_ATTN_IMPLEMENTATION}
+    for v, n in sorted(bad_attn.items()):
+        problems.append(f"attn_implementation {v} is not {REQUIRED_ATTN_IMPLEMENTATION!r}: x{len(n)} e.g. {n[:3]}")
+    if problems:
+        sys.exit("Inconsistent rollout dataset (run fingerprints):\n  " + "\n  ".join(problems))
+    record = {key: (json.loads(next(iter(values[key]))) if values[key] else None) for key in FINGERPRINT_MUST_MATCH}
+    versions = sorted({json.dumps(fp.get("versions"), sort_keys=True) for fp in fps.values()})
+    record.update({
+        "versions_seen": [json.loads(v) for v in versions],
+        "episodes_with_fingerprint": len(fps),
+        "allow_missing_fingerprint": bool(allow_missing),
+        "episodes_missing_fingerprint": missing,
+    })
+    return record
+
+
+# Files without `layer_names` (written before raw block 32 was added) follow this 33-layer convention.
+LEGACY_LAYER_NAMES = ["emb"] + [f"block{i:02d}" for i in range(1, 32)] + ["block32_postnorm"]
+
+
+def layer_names_of(payload: dict, n_layers: int) -> list[str]:
+    """Layer names of one .layers.pt (`layer_names` key; absent = legacy 33-layer convention)."""
+    names = payload.get("layer_names")
+    if names is None:
+        if n_layers != len(LEGACY_LAYER_NAMES):
+            raise ValueError(f"no layer_names and {n_layers} layers (only 33-layer files may omit layer_names)")
+        return list(LEGACY_LAYER_NAMES)
+    if len(names) != n_layers:
+        raise ValueError(f"{len(names)} layer_names for {n_layers} saved layers")
+    return list(names)
+
+
+def check_layer_names(path, payload: dict, n_layers: int, expected: list[str] | None) -> list[str]:
+    """This file's layer names; exits if they are unreadable or differ from `expected` (mixed 33/34-layer dataset)."""
+    try:
+        names = layer_names_of(payload, n_layers)
+    except ValueError as e:
+        sys.exit(f"{path}: {e}")
+    if expected is not None and names != expected:
+        sys.exit(f"{path}: mixed layer conventions in one dataset ({len(names)} layers, last {names[-1]!r} vs "
+                 f"{len(expected)} layers, last {expected[-1]!r}); use rollouts from one --save_raw_block32 setting")
+    return names
 
 
 def main():
@@ -112,8 +245,11 @@ def main():
     ap.add_argument("--pools", nargs="+", help="Subset of poolings to export (default: all present)")
     ap.add_argument("--expect-tasks", type=int, default=10)
     ap.add_argument("--expect-episodes", type=int, default=50)
+    ap.add_argument("--max-invalid", type=int, help="Refuse to build if more episodes than this are invalid (default: no limit)")
     ap.add_argument("--allow-incomplete", action="store_true", help="For smoke tests only")
     ap.add_argument("--skip-checksums", action="store_true", help="For smoke tests only")
+    ap.add_argument("--allow-missing-fingerprint", action="store_true",
+                    help="Build even if some .layers.pt files have no run_fingerprint (recorded in the manifest)")
     ap.add_argument("--provenance-files", type=Path, nargs="*", default=[],
                     help="Extra files (pip freeze, repo commits) copied into provenance/ BEFORE checksumming")
     args = ap.parse_args()
@@ -127,6 +263,7 @@ def main():
     # ---------- completeness ----------
     counts = df.groupby("task_id").size()
     problems = []
+    invalid, counts = account_invalid_episodes(args.rollout_dir, df, counts, args.expect_episodes, args.max_invalid, problems)
     if len(counts) != args.expect_tasks:
         problems.append(f"expected {args.expect_tasks} tasks, found {len(counts)}: {counts.index.tolist()}")
     short = counts[counts != args.expect_episodes]
@@ -139,9 +276,11 @@ def main():
         sys.exit("Rollouts incomplete:\n  " + "\n  ".join(problems))
     if missing:
         sys.exit("Cannot build without every .layers.pt/.pkl file:\n  " + "\n  ".join(missing[:10]))
+    run_fingerprint = check_run_fingerprints(df, args.allow_missing_fingerprint)  # E3: refuse a mixed dataset
 
     # ---------- lengths + per-episode consistency ----------
     lengths, names, suites, pools0, shape0 = [], [], [], None, None
+    layer_names0 = None
     for row in df.itertuples():
         feats, payload = load_episode(row, mmap=True)
         n_csv = len(pd.read_csv(row.csv))
@@ -149,6 +288,7 @@ def main():
             sys.exit(f"{row.layers}: {feats.shape[0]} feature steps but {n_csv} csv rows")
         if bool(payload.get("episode_success")) != bool(row.success):
             sys.exit(f"{row.layers}: success flag disagrees with filename")
+        layer_names0 = check_layer_names(row.layers, payload, feats.shape[2], layer_names0)
         if pools0 is None:
             pools0, shape0 = list(payload["pools"]), tuple(feats.shape[1:])
         elif list(payload["pools"]) != pools0 or tuple(feats.shape[1:]) != shape0:
@@ -304,9 +444,11 @@ def main():
                              "preprocessing step the shared evaluator must choose and apply identically for all models",
             "backbone": "OpenVLA-7B",
             "checkpoint": args.checkpoint,
+            "run_fingerprint": run_fingerprint,
             "source_rollout_dir": str(args.rollout_dir.resolve()),
             "layer_convention": LAYER_CONVENTION,
             "num_hidden_states": n_layers,
+            "layer_names": layer_names0,
             "layers_exported": layers,
             "pools_exported": pools,
             "pool_meaning": {"mean": "mean over the 7 action tokens (SAFE token_idx_rel=mean)",
@@ -317,6 +459,7 @@ def main():
             "label": "failure = 1 - episode_success (per trajectory)",
             "evaluation_horizon": "episodes.csv:task_min_step = SAFE per-task min rollout length (set_task_min_step)",
             "splits": summary,
+            "invalid_episodes": invalid,  # episodes that raised during collection; none of their data is in the cache
             "per_task": per_task,
             "warnings": warnings,
             "files": {k: {"sha256": v, "bytes": (out / k).stat().st_size} for k, v in checksums.items()},

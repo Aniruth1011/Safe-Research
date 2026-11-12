@@ -75,9 +75,27 @@ def index(d: Path) -> dict[tuple[int, int], Path]:
     return out
 
 
+def report_invalid(d: Path, label: str = "") -> dict[tuple[int, int], str]:
+    """Print the invalid-episode markers (task{T}--ep{E}--invalid.json, must-fix 4) of a rollout folder."""
+    out = {}
+    for p in sorted(d.glob("task*--ep*--invalid.json")):
+        m = re.match(r"^task(\d+)--ep(\d+)--invalid\.json$", p.name)
+        if m:
+            try:
+                out[(int(m.group(1)), int(m.group(2)))] = json.loads(p.read_text()).get("exception_type", "?")
+            except (OSError, ValueError):
+                out[(int(m.group(1)), int(m.group(2)))] = "UNREADABLE MARKER"
+    if out:
+        print(f"{label}{len(out)} invalid episodes (no data, skipped): "
+              + ", ".join(f"task{t}--ep{e} ({x})" for (t, e), x in sorted(out.items())))
+    return out
+
+
 def compare_runs(a: Path, b: Path, layer: int, pool: str) -> int:
     import torch
     ia, ib = index(a), index(b)
+    report_invalid(a, "run a: ")
+    report_invalid(b, "run b: ")
     common = sorted(set(ia) & set(ib))
     if not common:
         print("No episodes in common")
@@ -94,10 +112,14 @@ def compare_runs(a: Path, b: Path, layer: int, pool: str) -> int:
         feat_diff = None
         la, lb = ca.with_suffix(".layers.pt"), cb.with_suffix(".layers.pt")
         if la.exists() and lb.exists():
-            pa = torch.load(la, map_location="cpu", weights_only=False, mmap=True)
-            pb = torch.load(lb, map_location="cpu", weights_only=False, mmap=True)
+            pa = torch.load(str(la), map_location="cpu", weights_only=False, mmap=True)  # torch 2.2: mmap needs a str
+            pb = torch.load(str(lb), map_location="cpu", weights_only=False, mmap=True)
             k = first_div if first_div is not None else n
             if k > 0:
+                from build_cache import layer_names_of
+                if layer_names_of(pa, pa["features"].shape[2]) != layer_names_of(pb, pb["features"].shape[2]):
+                    print(f"refusing to compare {la.name}: runs use different layer conventions (33 vs 34 layers?)")
+                    return 1
                 pi = pa["pools"].index(pool)
                 xa = pa["features"][:k, pi, layer].float()
                 xb = pb["features"][:k, pi, layer].float()
@@ -120,11 +142,15 @@ def capture(rollout_dir: Path) -> int:
 
     SAFE's pkl holds hidden_states[-1][0,-1,:] for each of the 7 action tokens: (T, 7, D).
     Our layer index 32 must reproduce it: first == pkl[:,0], last == pkl[:,6] exactly, mean == pkl.mean(1)
-    up to bfloat16 rounding. Also checks that layers are not accidentally duplicated.
+    up to bfloat16 rounding. Also checks that layers are not accidentally duplicated, and that all episodes share
+    one layer convention (`layer_names`; 34-layer files add raw block 32 at index 33, which this check skips).
     """
     import pickle
     import torch
+    from build_cache import layer_names_of
+    names0 = None
     eps = sorted(rollout_dir.glob("task*--ep*--succ*.csv"))
+    report_invalid(rollout_dir)
     if not eps:
         print(f"no completed episodes in {rollout_dir}")
         return 1
@@ -137,13 +163,21 @@ def capture(rollout_dir: Path) -> int:
             continue
         lay = torch.load(lp, map_location="cpu", weights_only=False)
         ref = pickle.load(open(pp, "rb"))["hidden_states"]  # (T, 7, D)
-        f, pools = lay["features"], lay["pools"]          # (T, P, 33, D)
+        f, pools = lay["features"], lay["pools"]          # (T, P, 33 or 34, D)
         n_rows = len(pd.read_csv(csv))
         msgs = []
+        try:
+            names = layer_names_of(lay, f.shape[2])
+        except ValueError as e:
+            names = None
+            msgs.append(str(e))
+        names0 = names0 or names
+        if names is not None and names != names0:
+            msgs.append(f"mixed layer conventions: {len(names)} layers vs {len(names0)} in an earlier episode")
         if not (f.shape[0] == ref.shape[0] == n_rows):
             msgs.append(f"length mismatch layers={f.shape[0]} pkl={ref.shape[0]} csv={n_rows}")
         else:
-            last_layer = f.shape[2] - 1
+            last_layer = 32  # SAFE's s[-1] = block 32 after the final norm ("block32_postnorm"), also in 34-layer files
             if "first" in pools and not torch.equal(f[:, pools.index("first"), last_layer], ref[:, 0].to(f.dtype)):
                 msgs.append("first-token L32 != SAFE pkl token 0")
             if "last" in pools and not torch.equal(f[:, pools.index("last"), last_layer], ref[:, -1].to(f.dtype)):

@@ -1,0 +1,32 @@
+# Single source of truth for the collection environment's versions (pip / uv constraints file).
+# Every install in the kit passes this file: `pip install -c collection/constraints.txt ...`
+# (`uv pip install -c ...` in uv mode; any other install path, such as a container image, must pass the
+# same file). Scripts and tests read the versions from here; do not repeat them elsewhere. Do not change a
+# version without telling the team: these are the versions verified together on CARC (NVIDIA A40,
+# 2026-11-09, Python 3.10.16, vla-safe/openvla@300dce2), and they define the dataset.
+# Each range below names the version that was actually installed ("verified X"); the tests read it.
+#
+# Python 3.10 only (the repo fails on >= 3.11). A constraints file cannot select the interpreter.
+#
+# CUDA 12.1 builds of torch/torchvision/torchaudio: a constraints file cannot carry an index URL, so
+# pass the PyTorch index on the command line of the install that pulls torch (versions come from here):
+#   pip install -c collection/constraints.txt torch torchvision torchaudio \
+#       --index-url https://download.pytorch.org/whl/cu121
+# An exact pin such as `==2.2.0` also matches the local build `2.2.0+cu121` (PEP 440 ignores the local
+# label when the pin has none). carc/00_setup_env.sh additionally checks that all three are `+cu121`.
+
+# --- pinned by vla-safe/openvla@300dce2 (pyproject.toml) and the OpenVLA LIBERO instructions ---
+torch==2.2.0               # OpenVLA's pin; CUDA 12.1 wheel (index above); verified 2.2.0+cu121
+torchvision==0.17.0        # pairs with torch 2.2.0; OpenVLA's pin; verified 0.17.0+cu121
+torchaudio==2.2.0          # pairs with torch 2.2.0; OpenVLA's pin (installed with torch, not used directly); verified 2.2.0+cu121
+transformers==4.40.1       # OpenVLA's pin; its remote modeling/processor code targets this version
+tokenizers==0.19.1         # OpenVLA's pin; the range transformers 4.40.1 accepts
+tensorflow==2.15.0         # OpenVLA's pin; imported by openvla_utils via tensorflow_datasets
+flash-attn==2.5.5          # OpenVLA's pin; SAFE runs attn_implementation="flash_attention_2" (required, no fallback). Install after the editable install, with --no-build-isolation and CUDA_HOME set
+robosuite==1.4.0           # LIBERO's pin (openvla experiments/robot/libero/libero_requirements.txt)
+
+# --- extra caps on UNPINNED transitive dependencies, each one found by a failure on CARC ---
+numpy<2                    # TensorFlow 2.15 fails on numpy 2.x ("numpy.core.umath failed to import"); verified 1.26.4
+protobuf>=4.25,<5          # TensorFlow 2.15 requires protobuf < 5; verified 4.25.9
+tensorflow-metadata<1.16   # newer releases ship protos needing protobuf >= 5.26 ("cannot import name 'runtime_version'"); verified 1.13.1
+mujoco<3                   # robosuite 1.4.0 + mujoco 3.x fails with an AssertionError in get_joint_qpos_addr; verified 2.3.7
