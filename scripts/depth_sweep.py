@@ -137,6 +137,14 @@ def main(argv=None):
     a.add_argument("--evaluator", default="temporary_max")
     a.add_argument("--metric", default="roc_auc", help="metric drawn in the plot (any key the evaluator returns)")
     a.add_argument("--no-plot", action="store_true")
+    a.add_argument("--bootstrap", type=int, default=int(os.environ.get("SWEEP_BOOTSTRAP", "1000")),
+                   help="resamples of seen_val episodes for the CIs (0 = none; default $SWEEP_BOOTSTRAP or 1000)")
+    a.add_argument("--ci", type=float, default=0.95, help="CI level (default 0.95)")
+    a.add_argument("--ref", action="append", default=[], metavar="LABEL=VALUE",
+                   help="horizontal reference line for --metric, e.g. 'SAFE final layer (reproduction)=0.81'; "
+                        "repeatable; also $SWEEP_REFS ('a=0.8;b=0.7'); kept in references.json for later runs")
+    a.add_argument("--workers", type=int, default=int(os.environ.get("SLURM_CPUS_PER_TASK", "1") or 1),
+                   help="processes for the bootstrap (default: $SLURM_CPUS_PER_TASK or 1)")
     a.add_argument("--expect-layers", default=None,
                    help="e.g. 0-33: list missing (layer, seed) rows, still write the tables, and exit 4 if any")
     args = ap.parse_args(argv)
@@ -179,7 +187,10 @@ def main(argv=None):
                       "`python scripts/depth_sweep.py aggregate --out <copy of this folder>`.", file=sys.stderr)
         out = Path(args.out) if args.out else Path(DEFAULT_OUT_ROOT) / config().label()
         log(f"aggregating {out}")
-        for name, path in aggregate(out, metric=args.metric, plot=plot, log=log).items():
+        from failure_prob.engine.depth_sweep import parse_refs
+        refs = {**parse_refs(os.environ.get("SWEEP_REFS", "")), **parse_refs(args.ref)}
+        for name, path in aggregate(out, metric=args.metric, plot=plot, log=log, bootstrap=args.bootstrap, ci=args.ci,
+                                    refs=refs, workers=args.workers).items():
             log(f"{name}: {path}")
         if args.expect_layers:
             missing = missing_rows(out, parse_layers(args.expect_layers))

@@ -182,7 +182,9 @@ def test_legacy_rows_are_reused_and_unfinished_rows_are_moved_aside(cache, tmp_p
     assert sorted(r["seed"] for r in redone) == [1, 2]
     assert any("seed 0: reusing legacy row (written before job IDs were recorded)" in m for m in msgs), msgs
     assert sum("moved to" in m and "recomputing" in m for m in msgs) == 2
-    assert sorted(f.name.split(".")[0] for f in (out / "rows" / "_discarded").iterdir()) == ["L01_seed1", "L01_seed2"]
+    discarded = sorted(f.name for f in (out / "rows" / "_discarded").iterdir())
+    assert [n.split(".")[0] for n in discarded if n.endswith(".json")] == ["L01_seed1", "L01_seed2"]
+    assert [n.split(".")[0] for n in discarded if n.endswith(".scores.npz")] == ["L01_seed1", "L01_seed2"]
     assert json.loads(path(0).read_text()) == legacy                               # legacy row left as it was
     assert all(json.loads(path(s).read_text())["completed"] is True for s in (1, 2))
 
@@ -502,3 +504,140 @@ def test_a_failed_write_leaves_no_temp_file(tmp_path, monkeypatch):
         ds._write_json_atomic(tmp_path / "rows" / "L00_seed0.json", {"a": 1})
     monkeypatch.undo()
     assert list((tmp_path / "rows").iterdir()) == []
+
+
+# ------------------------------------------------------------------------- saved scores, bootstrap CIs, plot layout
+def test_rows_save_what_the_evaluator_saw(cache, tmp_path, plugin_module):
+    c = cfg(cache, seeds=(0,), probe="my_plugins:make_probe", evaluator="my_plugins:make_evaluator")
+    (row,) = ds.run_layer(c, 2, tmp_path / "out", log=lambda m: None)
+    saved = ds.load_eval_input(tmp_path / "out" / "rows" / row["scores_file"])
+    seen = plugin_module.SEEN["eval"]
+    assert row["scores_file"] == "L02_seed0.scores.npz" and saved.trajectory_ids == list(seen.trajectory_ids)
+    assert all(np.allclose(a, b) for a, b in zip(saved.step_scores, seen.step_scores))
+    assert np.array_equal(saved.labels, seen.labels) and np.array_equal(saved.horizons, seen.horizons)
+
+
+@pytest.fixture
+def stratified_evaluator(tmp_path, monkeypatch):
+    (tmp_path / "strat_eval.py").write_text(textwrap.dedent("""
+        import numpy as np
+        from failure_prob.engine.sweep_plugins import TemporaryMaxScoreEvaluator
+        CALLS = []
+        class Recording(TemporaryMaxScoreEvaluator):
+            name, temporary = "recording", False
+            def __call__(self, data):
+                CALLS.append((len(data.labels), float(np.sum(data.labels)), tuple(data.trajectory_ids)))
+                return super().__call__(data)
+        def make(): return Recording()
+    """))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    import importlib, strat_eval
+    importlib.reload(strat_eval)
+    return strat_eval
+
+
+def test_bootstrap_cis_are_stratified_paired_across_seeds_and_reproducible(cache, tmp_path, stratified_evaluator):
+    out = tmp_path / "out"
+    c = cfg(cache, seeds=(0, 1), evaluator="strat_eval:make")
+    for layer in (1, 2):
+        ds.run_layer(c, layer, out, log=lambda m: None)
+    stratified_evaluator.CALLS.clear()
+    ds.aggregate(out, plot=False, bootstrap=50, log=lambda m: None)
+    calls = stratified_evaluator.CALLS
+    assert len(calls) == 2 * 2 * 50                                   # layers x seeds x resamples
+    assert len({(n, k) for n, k, _ in calls}) == 1                     # class counts never change
+    assert all(calls[i][2] == calls[i + 1][2] for i in range(0, len(calls), 2))   # both seeds see the same episodes
+    s1 = pd.read_csv(out / "summary.csv")
+    assert (s1.val_roc_auc_ci95_low <= s1.val_roc_auc_mean + 1e-9).all()
+    assert (s1.val_roc_auc_mean <= s1.val_roc_auc_ci95_high + 1e-9).all()
+    assert (s1.val_roc_auc_ci95_low < s1.val_roc_auc_ci95_high).all() and set(s1.bootstrap_resamples) == {50}
+    ds.aggregate(out, plot=False, bootstrap=50, log=lambda m: None, workers=2)   # parallel: same numbers
+    pd.testing.assert_frame_equal(s1, pd.read_csv(out / "summary.csv"))
+
+
+def test_rows_without_saved_scores_get_no_ci_and_say_so(cache, tmp_path):
+    out = tmp_path / "out"
+    ds.run_layer(cfg(cache, seeds=(0,)), 1, out, log=lambda m: None)
+    (out / "rows" / "L01_seed0.scores.npz").unlink()                   # like the rows from before this change
+    msgs = []
+    ds.aggregate(out, plot=False, bootstrap=20, log=msgs.append)
+    s = pd.read_csv(out / "summary.csv")
+    assert s.val_roc_auc_ci95_low.isna().all() and list(s.bootstrap_resamples) == [0]
+    assert any("no bootstrap CI for layers [1]" in m for m in msgs)
+
+
+def test_overwrite_moves_the_saved_scores_aside_with_the_row(cache, tmp_path):
+    out = tmp_path / "out"
+    ds.run_layer(cfg(cache, seeds=(0,)), 1, out, log=lambda m: None)
+    ds.run_layer(cfg(cache, seeds=(0,)), 1, out, overwrite=True, log=lambda m: None)
+    names = sorted(p.name for p in (out / "rows" / "_discarded").iterdir())
+    assert len(names) == 2 and names[0].endswith(".json") and names[1].endswith(".scores.npz")
+    assert names[0].removesuffix(".json") == names[1].removesuffix(".scores.npz")      # same time stamp
+    assert (out / "rows" / "L01_seed0.scores.npz").exists()
+
+
+def test_npz_temp_files_count_as_leftovers():
+    assert ds._TEMP_NAME.match(".L01_seed0.scores.npz.ab12cd34")
+    assert ds._TEMP_NAME.match(".config.json.3g3gs9sb") and ds._TEMP_NAME.match(".fhnuqgyg")
+    assert not ds._TEMP_NAME.match("L01_seed0.scores.npz") and not ds._TEMP_NAME.match(".gitkeep")
+
+
+def _summary_34(ci=True):
+    names = ["emb"] + [f"block{i:02d}" for i in range(1, 32)] + ["block32_postnorm", "block32_prenorm"]
+    m = np.linspace(0.6, 0.8, 34)
+    d = {"layer": range(34), "layer_name": names, "val_roc_auc_mean": m, "val_roc_auc_std": np.full(34, 0.01)}
+    if ci:
+        d.update(val_roc_auc_ci95_low=m - 0.03, val_roc_auc_ci95_high=m + 0.03)
+    return pd.DataFrame(d)
+
+
+def test_prenorm_layer_sits_next_to_its_postnorm_partner():
+    main, side = ds.plot_positions(_summary_34())
+    assert main == list(range(33)) and side == {33: 32 + ds.PRENORM_OFFSET}
+    legacy = _summary_34().iloc[:33]                                  # 33-layer caches have no pre-norm layer
+    assert ds.plot_positions(legacy) == (list(range(33)), {})
+
+
+def test_figure_has_ci_bars_reference_lines_and_the_prenorm_marker():
+    pytest.importorskip("matplotlib")
+    import matplotlib.pyplot as plt
+    first = pd.Series({"pool": "mean", "normalize": False, "probe": "p", "evaluator": "e"})
+    refs = {"SAFE final layer (reproduction)": 0.81, "All-layer average": 0.79}
+    fig, ax = ds.build_figure(_summary_34(), first, "val_roc_auc", False, refs, "val_roc_auc_ci95", 0.95, 1000)
+    lines = {l.get_label(): l for l in ax.get_lines()}
+    assert max(lines["mean over seeds"].get_xdata()) == 32                # index 33 is not on the curve
+    assert list(lines["block32_prenorm (index 33): block before the final norm"].get_xdata()) == [32 + ds.PRENORM_OFFSET]
+    assert lines["SAFE final layer (reproduction): 0.810"].get_ydata()[0] == 0.81
+    assert "All-layer average: 0.790" in lines
+    legend = [t.get_text() for t in ax.get_legend().get_texts()]
+    assert "95% bootstrap CI over seen_val episodes (1000 resamples)" in legend and "± std over seeds" in legend
+    plt.close(fig)
+    fig, ax = ds.build_figure(_summary_34(ci=False), first, "val_roc_auc", True, None, "val_roc_auc_ci95")
+    assert not any("bootstrap" in t.get_text() for t in ax.get_legend().get_texts())  # no CI columns: no CI bars
+    assert ax.get_title().startswith("TEMPORARY")
+    plt.close(fig)
+
+
+def test_references_are_parsed_and_kept_for_later_aggregations(cache, tmp_path):
+    assert ds.parse_refs("SAFE final layer (reproduction)=0.81; All-layer average=0.79") == {
+        "SAFE final layer (reproduction)": 0.81, "All-layer average": 0.79}
+    assert ds.parse_refs(["a=b=0.5"]) == {"a=b": 0.5}
+    with pytest.raises(ValueError):
+        ds.parse_refs(["no value"])
+    out = tmp_path / "out"
+    ds.run_layer(cfg(cache, seeds=(0,)), 1, out, log=lambda m: None)
+    ds.aggregate(out, plot=False, bootstrap=0, refs={"SAFE final layer (reproduction)": 0.81}, log=lambda m: None)
+    msgs = []
+    ds.aggregate(out, plot=False, bootstrap=0, log=msgs.append)          # no --ref this time: still there
+    assert any("SAFE final layer (reproduction) = 0.810" in m for m in msgs)
+    assert json.loads((out / "references.json").read_text()) == {"roc_auc": {"SAFE final layer (reproduction)": 0.81}}
+
+
+def test_cli_aggregate_takes_refs_bootstrap_and_env(cache, tmp_path):
+    out = tmp_path / "out"
+    ds.run_layer(cfg(cache, seeds=(0,)), 1, out, log=lambda m: None)
+    r = _cli("aggregate", "--out", str(out), "--no-plot", "--bootstrap", "20", "--ref", "SAFE final layer=0.8",
+             env={"SWEEP_REFS": "All-layer average=0.7"})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "SAFE final layer = 0.800" in r.stdout and "All-layer average = 0.700" in r.stdout
+    assert pd.read_csv(out / "summary.csv").val_roc_auc_ci95_low.notna().all()
