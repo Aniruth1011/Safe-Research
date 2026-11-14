@@ -10,7 +10,7 @@ Branch: `adarsh/safe-baselines`. The brief is the handoff doc "Adarsh's workstre
 |---|---|---|
 | C1 SAFE final-layer MLP | 1 | **Done** on seen_val, including the score dump and TPR@5%FPR |
 | C2 SAFE final-layer LSTM | 2 | Running (SLURM 14240601, 36 tasks) |
-| C3 cosine k-NN | 3 | **Done: fitted and selected on seen_val.** TPR@5%FPR is pending the checkpointed winner re-run (SLURM 14243438). |
+| C3 cosine k-NN | 3 | **Done** on seen_val, including the score dump and TPR@5%FPR |
 | C4 evaluator cross-check | — | Blocked on B4 (Rhea). The score dump (`scripts/dump_safe_scores.py`, CSV + per-step `.npz`) is ready. |
 | C5 end-to-end gate | — | Blocked on B1–B4 |
 | K1 / K2 / K3 / K4 | 4+26 / 27 / 34 / 35 | Blocked on the winning fusion (F1–F5). K1 also needs B7; K2 also needs R2. |
@@ -107,7 +107,13 @@ Provenance:
 - **seen_val falert_early ROC-AUC:** 0.6765 ± 0.0000. **PR-AUC:** 0.6948 ± 0.0000.
   - The std is 0 because SAFE's k-NN is deterministic. Seeds 0/1/2 give identical values, which was checked.
 - **seen_val ROC-AUC at tq1.0** (the score exactly at `task_min_step`): 0.7271.
-- **TPR @ 5% FPR:** pending the score dump from the checkpointed winner re-run (SLURM 14243438).
+- **TPR @ 5% FPR:** 0.3099 ± 0.0000. **TPR @ 10% FPR:** 0.3662 ± 0.0000.
+  - Both use the per-episode score `max(s[:task_min_step])`, which is SAFE's falert_early score.
+  - Scored at `task_min_step` instead, they are 0.2958 and 0.3944.
+  - At a strict 5% false-alarm rate, k-NN catches more failures than the SAFE MLP (0.31 vs 0.17), even though its ROC-AUC is lower.
+- **Reproducibility check:**
+  - The winner re-run (SLURM 14243438) logged the same ROC-AUC as the selection runs: 0.676465, and 0.727087 at tq1.0.
+  - `dump_safe_scores.py` refits k-NN and reproduces both values. The scores of the 3 seeds are identical.
 - **Trainable parameters:** 0. The model is non-parametric: the bank is the 86,823 train timestep features (4096-d), split into success and failure.
 - **Latency:** not measured.
 
@@ -132,10 +138,13 @@ Stored files:
 - `experiments/results/C3_cosine_knn/runs.csv`: all 18 runs (6 configs × 3 seeds).
 - `selection.csv`.
 - `winner.json`.
+- `scores_seen_val_s{0,1,2}.csv`: per-episode seen_val scores of the winner.
+- `winner_episode_metrics.csv`: ROC-AUC and TPR@5/10%FPR per seed, for both episode scores.
 - `experiments/manifests/C3_cosine_knn.yaml`.
 
 Provenance:
 - Code commit `ea1420d`, SLURM job 14241427.
+- Winner re-run: SLURM 14243438, with `train.eval_save_ckpt=True`.
 - 6 tasks on `main`, 8 CPU / 32 GB each, about 45–60 min per task (3 seeds).
 - Run directory: `/scratch1/$USER/safe_baselines/embed`.
 

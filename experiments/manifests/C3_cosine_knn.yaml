@@ -5,7 +5,8 @@ experiment:
   owner: Adarsh
   model: SAFE EmbedModel (failure_prob/model/embed.py), distance=cosine, unchanged
   status: TRAINED   # fitted + selected on seen_val; unseen_test is evaluated only in N3
-  seen_val_metrics: {falert_early_roc_auc: "0.6765 +- 0.0000", falert_early_prc_auc: "0.6948 +- 0.0000", roc_auc_tq1.0: 0.7271, tpr_at_5_fpr: pending}
+  seen_val_metrics: {falert_early_roc_auc: "0.6765 +- 0.0000", falert_early_prc_auc: "0.6948 +- 0.0000", roc_auc_tq1.0: 0.7271, tpr_at_5_fpr: "0.3099 +- 0.0000", tpr_at_10_fpr: "0.3662 +- 0.0000"}
+  winner_rerun_job: 14243438
   data:
     cache: shared cache v1 (collection/load_cache.py), dataset=openvla_cache
     layer: 32
@@ -27,4 +28,6 @@ experiment:
     - experiments/results/C3_cosine_knn/runs.csv
     - experiments/results/C3_cosine_knn/selection.csv
     - experiments/results/C3_cosine_knn/winner.json
+    - experiments/results/C3_cosine_knn/winner_episode_metrics.csv
+    - experiments/results/C3_cosine_knn/scores_seen_val_s{0,1,2}.csv
   note: single fixed split (SAFE seed-0 unseen tasks); seen_val; selection-optimistic. Not comparable to SAFE's published 3-split numbers.
