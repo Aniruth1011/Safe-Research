@@ -62,7 +62,6 @@ class OpenvlaCacheDatasetConfig(OpenvlaDatasetConfig):
     """SAFE dataset backed by the shared feature cache (collection/load_cache.py).
     Loads only train + seen_val with the cache's frozen split; unseen_test is never read."""
     name: str = "openvla_cache"
-    subset_name: str = "10"
     cache_root: str = MISSING
     layer: int = 32                     # L32 = block 32 after final RMSNorm (SAFE's feature)
     data_path: Any = ""
