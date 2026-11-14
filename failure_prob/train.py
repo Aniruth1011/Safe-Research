@@ -126,7 +126,7 @@ def main(cfg: Config) -> None:
         
         model: BaseModel = get_model(cfg, input_dim)
         print(model)
-        model.to("cuda")
+        model.to("cuda" if torch.cuda.is_available() else "cpu")  # guard 1: CPU fallback
         
         optimizer, lr_scheduler = model.get_optimizer()
 
