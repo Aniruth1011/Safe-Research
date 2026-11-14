@@ -1,0 +1,30 @@
+experiment:
+  id: C3
+  experiments_row: 3
+  name: cosine_knn_baseline
+  owner: Adarsh
+  model: SAFE EmbedModel (failure_prob/model/embed.py), distance=cosine, unchanged
+  status: TRAINED   # fitted + selected on seen_val; unseen_test is evaluated only in N3
+  seen_val_metrics: {falert_early_roc_auc: "0.6765 +- 0.0000", falert_early_prc_auc: "0.6948 +- 0.0000", roc_auc_tq1.0: 0.7271, tpr_at_5_fpr: pending}
+  data:
+    cache: shared cache v1 (collection/load_cache.py), dataset=openvla_cache
+    layer: 32
+    pool: mean
+    splits: train (210 episodes) as the k-NN bank, seen_val (140) for selection; unseen_test never loaded
+  grid: topk {1, 5, 10} x cumsum {False, True}; use_success_only=False; n_epochs=1; seeds 0/1/2 (deterministic)
+  selection: argmax over configs of mean falert_early_roc_auc/model_val_seen (seeds 0/1/2)
+  selected_config: {distance: cosine, topk: 10, cumsum: true, use_success_only: false}
+  trainable_parameters: 0   # non-parametric; stores the 86,823 train timestep features (4096-d) as the bank
+  implementation_files:
+    - failure_prob/data/openvla_cache.py
+    - scripts/carc/safe_baseline.slurm
+    - scripts/collect_safe_runs.py
+  training_command: sbatch --export=ALL,MODEL=embed --job-name=c3-knn --array=0-5 --cpus-per-task=8 --mem=32G --time=02:00:00 scripts/carc/safe_baseline.slurm
+  selection_command: python scripts/collect_safe_runs.py <OUT>/wandb --out <OUT>/selection.csv
+  code_commit: ea1420d
+  slurm_job: 14241427
+  results:
+    - experiments/results/C3_cosine_knn/runs.csv
+    - experiments/results/C3_cosine_knn/selection.csv
+    - experiments/results/C3_cosine_knn/winner.json
+  note: single fixed split (SAFE seed-0 unseen tasks); seen_val; selection-optimistic. Not comparable to SAFE's published 3-split numbers.

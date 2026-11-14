@@ -5,6 +5,8 @@ experiment:
   owner: Adarsh
   model: SAFE IndepModel (failure_prob/model/indep.py), unchanged
   status: TRAINED   # trained + selected on seen_val; unseen_test is evaluated only in N3
+  seen_val_metrics: {falert_early_roc_auc: "0.7552 +- 0.0030", falert_early_prc_auc: "0.7494 +- 0.0042", tpr_at_5_fpr: "0.1690 +- 0.0000", tpr_at_10_fpr: "0.3756 +- 0.0351"}
+  winner_rerun_job: 14243293
   data:
     cache: shared cache v1 (collection/load_cache.py), dataset=openvla_cache
     layer: 32          # block 32 after final RMSNorm = SAFE's feature
@@ -28,4 +30,6 @@ experiment:
     - experiments/results/C1_safe_mlp/runs.csv
     - experiments/results/C1_safe_mlp/selection.csv
     - experiments/results/C1_safe_mlp/winner.json
+    - experiments/results/C1_safe_mlp/winner_episode_metrics.csv
+    - experiments/results/C1_safe_mlp/scores_seen_val_s{0,1,2}.csv
   note: single fixed split (SAFE seed-0 unseen tasks); seen_val; selection-optimistic. Not comparable to SAFE's published 3-split numbers.

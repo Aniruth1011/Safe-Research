@@ -8,9 +8,9 @@ Branch: `adarsh/safe-baselines`. The brief is the handoff doc "Adarsh's workstre
 
 | Task | Experiments row | Status |
 |---|---|---|
-| C1 SAFE final-layer MLP | 1 | **Done: trained and selected on seen_val.** The winner is being re-run with checkpoints for the score dump (TPR@5%FPR). |
+| C1 SAFE final-layer MLP | 1 | **Done** on seen_val, including the score dump and TPR@5%FPR |
 | C2 SAFE final-layer LSTM | 2 | Running (SLURM 14240601, 36 tasks) |
-| C3 cosine k-NN | 3 | Running (SLURM 14241427, 6 tasks) |
+| C3 cosine k-NN | 3 | **Done: fitted and selected on seen_val.** TPR@5%FPR is pending the checkpointed winner re-run (SLURM 14243438). |
 | C4 evaluator cross-check | — | Blocked on B4 (Rhea). The score dump (`scripts/dump_safe_scores.py`, CSV + per-step `.npz`) is ready. |
 | C5 end-to-end gate | — | Blocked on B1–B4 |
 | K1 / K2 / K3 / K4 | 4+26 / 27 / 34 / 35 | Blocked on the winning fusion (F1–F5). K1 also needs B7; K2 also needs R2. |
@@ -49,18 +49,25 @@ SAFE's own `python -m failure_prob.train` runs unchanged. Its training loop, los
 - **seen_val falert_early ROC-AUC:** 0.7552 ± 0.0030 (mean ± std over seeds 0/1/2).
 - **seen_val falert_early PR-AUC:** 0.7494 ± 0.0042. This is SAFE's trapezoid `auc(recall, precision)`.
 - **seen_val ROC-AUC at tq1.0:** 0.7552. It equals falert_early, as expected: SAFE-MLP scores are a cumsum of a sigmoid, so they are monotone.
-- **TPR @ 5% FPR:** pending the score dump from the checkpointed winner re-run.
+- **TPR @ 5% FPR:** 0.1690 ± 0.0000. **TPR @ 10% FPR:** 0.3756 ± 0.0351.
+  - Computed on the per-episode score `max(s[:task_min_step])`. This is the same score as SAFE's falert_early, with no sigmoid.
+  - TPR@x%FPR = max TPR with FPR ≤ x on sklearn's `roc_curve`, the same definition as `failure_prob/engine/metrics.py`.
+  - The value is identical across seeds for a real reason. In every seed 4 successful episodes score far higher than the rest (about 370–390 vs about 200). At FPR ≤ 5% only 3 false positives are allowed (5% of 69 successes), and exactly 12 of 71 failures score above that cut, with no ties.
+  - Scoring at `task_min_step` (`score_at_tms`) gives the same numbers, because SAFE-MLP scores are monotone.
+- **Reproducibility check:**
+  - The checkpointed winner re-run (SLURM 14243293) logged exactly the same per-seed ROC-AUC as the selection runs.
+  - `dump_safe_scores.py` recomputes the same values from the saved checkpoints.
 - **Trainable parameters:** 1,049,089 (Linear 4096→256, ReLU, Linear 256→1, Sigmoid).
 - **Latency:** not measured. The handoff does not ask for it.
 - The std is the population std (ddof = 0) over the 3 seeds.
 
 Per-seed values for the selected config:
 
-| Seed | ROC-AUC | PR-AUC |
-|---|---|---|
-| 0 | 0.7589 | 0.7533 |
-| 1 | 0.7551 | 0.7514 |
-| 2 | 0.7516 | 0.7435 |
+| Seed | ROC-AUC | PR-AUC | TPR@5%FPR | TPR@10%FPR |
+|---|---|---|---|---|
+| 0 | 0.7589 | 0.7533 | 0.1690 | 0.4225 |
+| 1 | 0.7551 | 0.7514 | 0.1690 | 0.3662 |
+| 2 | 0.7516 | 0.7435 | 0.1690 | 0.3380 |
 
 All 12 configs (SAFE's grid), sorted by the selection metric:
 
@@ -83,12 +90,54 @@ Stored files:
 - `experiments/results/C1_safe_mlp/runs.csv`: all 36 runs.
 - `selection.csv`: the 12 configs.
 - `winner.json`.
+- `scores_seen_val_s{0,1,2}.csv`: per-episode seen_val scores of the winner, one file per seed.
+- `winner_episode_metrics.csv`: ROC-AUC and TPR@5/10%FPR per seed, for both episode scores.
 - `experiments/manifests/C1_safe_mlp.yaml`.
+- Not committed: per-step score arrays (`scores_indep_s*.npz`, for C4) and checkpoints. They are in `/scratch1/$USER/safe_baselines/{scores,winners}/`.
 
 Provenance:
 - Code commit `ea1420d`, SLURM job 14240563.
+- Winner re-run: SLURM 14243293, with `train.eval_save_ckpt=True`.
 - 36 tasks on `main`, 8 CPU / 32 GB each, about 20–25 min per run.
 - Sheet value for "run directory": `/scratch1/$USER/safe_baselines/indep` (Adarsh's CARC user).
+
+## C3 result: cosine k-NN (`model=embed`)
+
+- **Selected config:** distance = cosine, topk = 10, cumsum = True, use_success_only = False, L32 mean.
+- **seen_val falert_early ROC-AUC:** 0.6765 ± 0.0000. **PR-AUC:** 0.6948 ± 0.0000.
+  - The std is 0 because SAFE's k-NN is deterministic. Seeds 0/1/2 give identical values, which was checked.
+- **seen_val ROC-AUC at tq1.0** (the score exactly at `task_min_step`): 0.7271.
+- **TPR @ 5% FPR:** pending the score dump from the checkpointed winner re-run (SLURM 14243438).
+- **Trainable parameters:** 0. The model is non-parametric: the bank is the 86,823 train timestep features (4096-d), split into success and failure.
+- **Latency:** not measured.
+
+All 6 configs, sorted by the selection metric:
+
+| topk | cumsum | falert_early ROC-AUC | falert_early PR-AUC | ROC-AUC at tq1.0 |
+|---|---|---|---|---|
+| 10 | True | 0.6765 | 0.6948 | 0.7271 |
+| 5 | True | 0.6736 | 0.6920 | 0.7118 |
+| 1 | True | 0.6528 | 0.6696 | 0.6889 |
+| 10 | False | 0.6107 | 0.5968 | 0.8481 |
+| 5 | False | 0.5818 | 0.5887 | 0.8494 |
+| 1 | False | 0.5436 | 0.5557 | 0.8373 |
+
+**Finding for B4 (Rhea) and C4: the two episode scores rank the configs very differently.**
+- Under SAFE's max-so-far score (falert_early, the handoff's selection metric), cumsum = True wins: 0.68 vs 0.61.
+- Under the score at `task_min_step` (tq1.0, the B4 spec), cumsum = False is far better: about 0.85 vs 0.73.
+- Both are limited to the `task_min_step` horizon, so neither leaks the label.
+- Selection follows the handoff (falert_early). Which score is official is the open decision in B4, and it changes which k-NN config is best.
+
+Stored files:
+- `experiments/results/C3_cosine_knn/runs.csv`: all 18 runs (6 configs × 3 seeds).
+- `selection.csv`.
+- `winner.json`.
+- `experiments/manifests/C3_cosine_knn.yaml`.
+
+Provenance:
+- Code commit `ea1420d`, SLURM job 14241427.
+- 6 tasks on `main`, 8 CPU / 32 GB each, about 45–60 min per task (3 seeds).
+- Run directory: `/scratch1/$USER/safe_baselines/embed`.
 
 ## Reproduce
 
