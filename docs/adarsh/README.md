@@ -9,7 +9,7 @@ Branch: `adarsh/safe-baselines`. The brief is the handoff doc "Adarsh's workstre
 | Task | Experiments row | Status |
 |---|---|---|
 | C1 SAFE final-layer MLP | 1 | **Done** on seen_val, including the score dump and TPR@5%FPR |
-| C2 SAFE final-layer LSTM | 2 | Running (SLURM 14240601, 36 tasks) |
+| C2 SAFE final-layer LSTM | 2 | **Done** on seen_val, including the score dump and TPR@5%FPR |
 | C3 cosine k-NN | 3 | **Done** on seen_val, including the score dump and TPR@5%FPR |
 | C4 evaluator cross-check | — | Blocked on B4 (Rhea). The score dump (`scripts/dump_safe_scores.py`, CSV + per-step `.npz`) is ready. |
 | C5 end-to-end gate | — | Blocked on B1–B4 |
@@ -101,6 +101,63 @@ Provenance:
 - 36 tasks on `main`, 8 CPU / 32 GB each, about 20–25 min per run.
 - Sheet value for "run directory": `/scratch1/$USER/safe_baselines/indep` (Adarsh's CARC user).
 
+## C2 result: SAFE LSTM (`model=lstm`)
+
+- **Selected config:** lr = 3e-4, lambda_reg = 1.0, batch 64, 1000 epochs, L32 mean. This is the same config as C1.
+- **seen_val falert_early ROC-AUC:** 0.7418 ± 0.0214 (mean ± std over seeds 0/1/2).
+- **seen_val falert_early PR-AUC:** 0.7532 ± 0.0119.
+- **seen_val ROC-AUC at tq1.0** (the score exactly at `task_min_step`): 0.8093 ± 0.0257.
+- **TPR @ 5% FPR:** 0.2723 ± 0.0332. **TPR @ 10% FPR:** 0.4038 ± 0.0239.
+  - Both use the per-episode score `max(s[:task_min_step])`, which is SAFE's falert_early score. The TPR definition is the same as in C1.
+  - Unlike SAFE-MLP, LSTM scores are not monotone in time, so the two episode scores differ for 131–134 of the 140 episodes.
+  - Scored at `task_min_step` instead, they are 0.5211 ± 0.0415 and 0.5681 ± 0.0531.
+  - As with C3, the score at `task_min_step` ranks far better than the max-so-far score. That again bears on the official-score decision in B4.
+- **Reproducibility check:**
+  - The checkpointed winner re-run (SLURM 14251667) logged exactly the same per-seed ROC-AUC, PR-AUC and tq1.0 values as the selection runs.
+  - `dump_safe_scores.py` recomputes the same ROC-AUC values from the saved checkpoints.
+- **Trainable parameters:** 4,458,753 (1-layer LSTM 4096→256, Linear 256→1).
+- **Latency:** not measured.
+
+Per-seed values for the selected config:
+
+| Seed | ROC-AUC | PR-AUC | ROC-AUC tq1.0 | TPR@5%FPR | TPR@10%FPR |
+|---|---|---|---|---|---|
+| 0 | 0.7416 | 0.7475 | 0.8255 | 0.2254 | 0.3944 |
+| 1 | 0.7157 | 0.7424 | 0.7730 | 0.2958 | 0.3803 |
+| 2 | 0.7681 | 0.7697 | 0.8294 | 0.2958 | 0.4366 |
+
+All 12 configs (SAFE's grid), sorted by the selection metric:
+
+| lr | lambda_reg | ROC-AUC (mean ± std) | PR-AUC (mean ± std) | ROC-AUC tq1.0 (mean ± std) |
+|---|---|---|---|---|
+| 0.0003 | 1 | 0.7418 ± 0.0214 | 0.7532 ± 0.0119 | 0.8093 ± 0.0257 |
+| 0.0003 | 0.1 | 0.7150 ± 0.0100 | 0.7249 ± 0.0152 | 0.8041 ± 0.0030 |
+| 0.001 | 1 | 0.7055 ± 0.0354 | 0.7170 ± 0.0134 | 0.7845 ± 0.0148 |
+| 0.0001 | 1 | 0.7052 ± 0.0307 | 0.7003 ± 0.0349 | 0.7637 ± 0.0460 |
+| 0.0003 | 0.001 | 0.7025 ± 0.0084 | 0.7286 ± 0.0088 | 0.7603 ± 0.0228 |
+| 0.0001 | 0.01 | 0.7012 ± 0.0161 | 0.7042 ± 0.0292 | 0.7413 ± 0.0443 |
+| 0.0001 | 0.1 | 0.6962 ± 0.0223 | 0.7032 ± 0.0351 | 0.7683 ± 0.0353 |
+| 0.001 | 0.1 | 0.6936 ± 0.0488 | 0.7084 ± 0.0460 | 0.7782 ± 0.0430 |
+| 0.001 | 0.01 | 0.6878 ± 0.0200 | 0.7187 ± 0.0038 | 0.7355 ± 0.0399 |
+| 0.0003 | 0.01 | 0.6864 ± 0.0245 | 0.6930 ± 0.0312 | 0.7455 ± 0.0145 |
+| 0.0001 | 0.001 | 0.6709 ± 0.0154 | 0.6878 ± 0.0269 | 0.7232 ± 0.0123 |
+| 0.001 | 0.001 | 0.6461 ± 0.0337 | 0.6563 ± 0.0277 | 0.6881 ± 0.0320 |
+
+Stored files:
+- `experiments/results/C2_safe_lstm/runs.csv`: all 36 runs.
+- `selection.csv`: the 12 configs.
+- `winner.json`.
+- `scores_seen_val_s{0,1,2}.csv`: per-episode seen_val scores of the winner.
+- `winner_episode_metrics.csv`: ROC-AUC and TPR@5/10%FPR per seed, for both episode scores.
+- `experiments/manifests/C2_safe_lstm.yaml`.
+- Not committed: per-step score arrays (`scores_lstm_s*.npz`, for C4) and checkpoints.
+
+Provenance:
+- Code commit `ea1420d`, SLURM job 14240601. The branch moved during the array, but `failure_prob/`, `scripts/` and `setup.py` are identical from `ea1420d` to `60ccc29`.
+- Winner re-run: SLURM 14251667, with `train.eval_save_ckpt=True`.
+- 36 tasks on `main`, 8 CPU / 32 GB each, 1 h 55 to 3 h 21 per run (median 2 h 27).
+- Run directory: `/scratch1/$USER/safe_baselines/lstm`.
+
 ## C3 result: cosine k-NN (`model=embed`)
 
 - **Selected config:** distance = cosine, topk = 10, cumsum = True, use_success_only = False, L32 mean.
@@ -169,7 +226,7 @@ python scripts/dump_safe_scores.py --run-dir <logs_save_path of a winner run> --
 | Model | Speed | Run time |
 |---|---|---|
 | SAFE MLP | 2.4 s/epoch on 4 CPU | about 20–25 min per 1000-epoch run on 8 CPU |
-| SAFE LSTM | 19 s/epoch on 4 CPU | about 5.3 h per run on 4 CPU, hence the 8 h limit |
+| SAFE LSTM | 19 s/epoch on 4 CPU | 1 h 55 to 3 h 21 per 1000-epoch run on 8 CPU (median 2 h 27); the 8 h limit leaves headroom |
 | Cosine k-NN | 15.3 min per seed on 4 CPU, about 10 GB RAM | — |
 
 ## Deviations from the handoff, and why
