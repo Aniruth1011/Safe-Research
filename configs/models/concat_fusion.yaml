@@ -1,0 +1,4 @@
+model: concat_fusion
+head: mlp            # mlp | linear; final choice comes from the shared probe spec (B6)
+hidden_dim: 64
+dropout: 0.0

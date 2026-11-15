@@ -1,0 +1,39 @@
+experiment:
+  id: F1_F2_F3_F6
+  name: concatenation_static_weights_and_k_ablation
+  owner: Dhyan
+  status: VALIDATED
+  rows:
+    F1: {sheet_row: 19, what: two-layer concatenation + MLP, layers: selected complementary pair (S2), compare: best single-layer MLP (R1/R2)}
+    F2: {sheet_row: 20, what: three-layer concatenation + MLP, layers: selected early/middle/late (S3), compare: F1}
+    F3: {sheet_row: 21, what: static learned layer weights (per-layer projection to a shared 64-d space, weighted sum, MLP), layers: selected 3 layers, compare: F2 (about the same parameter count)}
+    F6: {sheet_row: 25, what: number-of-layers ablation K=1..4, model: best of F1-F5, layers: ranked selection, compare: K=1}
+  models: [concat_fusion, static_weight_fusion]
+  implementation_files:
+    - failure_prob/models/concat_fusion.py
+    - failure_prob/models/static_weight_fusion.py
+    - failure_prob/models/probe_heads.py
+    - failure_prob/fusion_runner.py
+    - failure_prob/fusion_experiments.py
+    - failure_prob/fusion_compare.py
+    - scripts/run_fusion.py
+    - scripts/fusion_experiments.py
+    - scripts/fusion_compare.py
+    - scripts/carc/fusion.slurm
+  configs:
+    - configs/models/concat_fusion.yaml
+    - configs/models/static_weight_fusion.yaml
+  tests:
+    - python -m pytest -q tests/test_fusion_models.py tests/test_fusion_runner.py tests/test_fusion_experiments.py
+  depends_on: [B6 probe spec, B4 evaluator, R1 depth sweep, S1-S3 layer sets, B7 (F3 overlaps its static-weights model)]
+  protocol: train on train (full horizon, as the R1 sweep); score seen_val per rollout at task_min_step; seeds 0/1/2
+  selection_split: seen_val (layer sets and the compact lr/dropout/weight-decay search)
+  metrics: percent 0-100 (ROC-AUC, PR-AUC, TPR@5%FPR) with 95% stratified bootstrap CIs over seen_val episodes, plus trainable parameters and detector latency (ms per step)
+  significance: scripts/fusion_compare.py (paired bootstrap CI of the difference vs the best single layer or another row)
+  carc: sbatch scripts/carc/fusion.slurm {a9|search|kcurve|run|compare} <args>; --resume after a time-out
+  commands:
+    F1: python scripts/fusion_experiments.py search --model concat_fusion --layers <S2 pair> --cache "$CACHE" --output-dir outputs/fusion/F1 --label "F1 two-layer concat"
+    F2: python scripts/fusion_experiments.py search --model concat_fusion --layers <S3 early middle late> --cache "$CACHE" --output-dir outputs/fusion/F2 --label "F2 three-layer concat"
+    F3: python scripts/fusion_experiments.py search --model static_weight_fusion --proj-dim 64 --layers <selected 3> --cache "$CACHE" --output-dir outputs/fusion/F3 --label "F3 static learned weights"
+    F6: python scripts/fusion_experiments.py kcurve --model <best of F1-F5> --layers <ranked 4> <searched hparams> --cache "$CACHE" --output-dir outputs/fusion/F6 --label "F6 K ablation"
+  note: Validated end to end on a synthetic 34-layer cache built by build_cache.py (and with the depth sweep's TEMPORARY evaluator plugged in by name); not trained or evaluated on the real cache.
