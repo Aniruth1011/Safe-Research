@@ -4,7 +4,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=6G
-#SBATCH --time=00:04:00
+#SBATCH --time=00:10:00
 #SBATCH --array=0-33%6
 #SBATCH --output=logs/depth_sweep-%A_%a.out
 # CPU only. Depth sweep (plan rows R1-R4): one array task per cache layer, each trains the probe for every seed in
@@ -30,7 +30,8 @@
 #
 # Sizing, measured on CARC with the real cache, 4 CPUs: TEMPORARY probe (2026-11-11) 39-50 s per task, peak about
 # 4.1 GB; B6 framework_mlp at layer 32 (2026-11-15, early stopping at epochs 12-16) about 1 min, peak about 3.1 GB.
-# Requests: 6 GB and 4 min.
+# Raw (not normalized) early layers train longer before early stopping: up to 116 epochs, 3 min 49 s at
+# layer 2 (2026-11-15). Requests: 6 GB and 10 min.
 set -euo pipefail
 die() { echo "depth_sweep.slurm: $*" >&2; exit 1; }
 [ -n "${SLURM_JOB_ID:-}" ] || die "submit with sbatch (CPU job); never run this on a login node"

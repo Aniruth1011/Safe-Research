@@ -263,7 +263,8 @@ Measured on CARC on 2026-11-11 with the real cache, 4 CPUs, before the sequentia
 | Score seen_val, per seed | 0.2-1.2 s |
 | Peak memory | about 4.1 GB |
 
-Each array task requests 4 CPUs, 6 GB and 4 min. The sequential reader keeps one layer file (at most 0.7 GB) in
+Each array task requests 4 CPUs, 6 GB and 10 min (4 min until 2026-11-15; with the B6 probe, raw early layers
+train for up to 116 epochs and took up to 3 min 49 s). The sequential reader keeps one layer file (at most 0.7 GB) in
 memory only until that split's rollouts are built, so peak memory should stay about the same. Check MaxRSS on the
 next run.
 

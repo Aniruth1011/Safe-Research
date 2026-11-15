@@ -4,7 +4,7 @@
 #
 #   export SWEEP_PYTHON=<venv>/bin/python SWEEP_POOL=mean SWEEP_NORMALIZE=0     # plus any other SWEEP_* setting
 #   scripts/carc/submit_depth_sweep.sh --account <account> [--layers 0-33,avg] [--max-parallel 6] \
-#       [--exclude <node>,<node>] [--time 00:04:00] [--no-aggregate] [--dry-run]
+#       [--exclude <node>,<node>] [--time 00:10:00] [--no-aggregate] [--dry-run]
 #
 # --layers        layer indices, e.g. 0-33 or 10,16,19-20, plus "avg" for the all-layer average baseline (plan row
 #                 S5; default 0-33,avg; finished rows are reused either way). "avg" reads all 32 member layers
@@ -41,7 +41,7 @@ fi
 [[ $MAXP =~ ^[1-9][0-9]*$ ]] || die "--max-parallel must be a positive integer (got '$MAXP')"
 NODES_RE='^[][A-Za-z0-9,_.-]*$'                              # node names, ranges like b[01-03], commas
 [[ $EXCLUDE =~ $NODES_RE ]] || die "--exclude must be a comma-separated node list without spaces"
-[[ $TIME =~ ^[0-9:-]*$ ]] || die "--time must look like 00:04:00 (got '$TIME')"
+[[ $TIME =~ ^[0-9:-]*$ ]] || die "--time must look like 00:10:00 (got '$TIME')"
 cd "$(dirname "$0")/../.."                                   # sbatch's submit folder = the checkout root
 [ -f scripts/depth_sweep.py ] || die "cannot find the checkout root"
 mkdir -p logs
