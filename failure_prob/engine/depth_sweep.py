@@ -231,7 +231,15 @@ class SeenOnlyCache:
         out = self._cache.records(split, [layer], pool=pool, normalize=normalize, horizon=horizon)
         if isinstance(self._mm, dict):
             self._mm.pop((pool, split, layer), None)  # the records hold their own float32 copies
-        return out
+        return self._with_task_min_steps(out)
+
+    def _with_task_min_steps(self, records: list[dict]) -> list[dict]:
+        """Add `task_min_steps` ([int], as failure_prob.data.cache_splits does), so a probe can score held-out
+        train episodes at B4's horizon min(length, task_min_step)."""
+        min_step = dict(zip(self.episodes.trajectory_id, self.episodes.task_min_step))
+        for r in records:
+            r["task_min_steps"] = [int(min_step[r["trajectory_ids"][0]])]
+        return records
 
     def avg_records(self, split: str, layers: list[int], pool: str, horizon: str, chunk_rows: int = 8192) -> list[dict]:
         """Records of the all-layer average: mean over `layers` of (x - train mean) / train std, per layer.
@@ -268,6 +276,7 @@ class SeenOnlyCache:
                 "labels": torch.tensor([float(ep.failure)]),
                 "task_ids": [int(ep.task_id)],
                 "trajectory_ids": [ep.trajectory_id],
+                "task_min_steps": [int(ep.task_min_step)],
             })
         return out
 
@@ -298,10 +307,27 @@ class SweepConfig:
     probe: str = "temporary_mlp"
     evaluator: str = DEFAULT_EVALUATOR    # "b4" (episode_metrics); "temporary_max" is the old placeholder
     seeds: tuple[int, ...] = field(default=TRAIN_SEEDS)
+    probe_args: tuple[tuple[str, str], ...] = ()   # --probe-arg key=value; the probe's effective settings are recorded
+
+    def make_probe(self):
+        probe = resolve(self.probe, PROBES, **dict(self.probe_args))
+        if self.probe_args and not hasattr(probe, "settings"):
+            raise ValueError(f"probe {self.probe!r} has no settings() to record, so it takes no --probe-arg; "
+                             "use a probe that records its settings (e.g. framework_mlp)")
+        return probe
+
+    def probe_settings(self) -> dict | None:
+        """The probe's effective settings (defaults included), or None for a probe without settings()."""
+        probe = self.make_probe()
+        return probe.settings() if hasattr(probe, "settings") else None
 
     def label(self) -> str:
         safe = lambda s: s.replace(":", "-").replace(".", "_").replace("/", "_")
-        return f"{self.pool}-{'trainnorm' if self.normalize else 'raw'}-train_{self.train_horizon}-{safe(self.probe)}-{safe(self.evaluator)}"
+        probe = safe(self.probe)
+        settings = self.probe_settings()
+        if settings is not None:   # different settings (or new defaults) never share a folder
+            probe += "_" + hashlib.sha256(json.dumps(settings, sort_keys=True).encode()).hexdigest()[:8]
+        return f"{self.pool}-{'trainnorm' if self.normalize else 'raw'}-train_{self.train_horizon}-{probe}-{safe(self.evaluator)}"
 
 
 def _git_commit() -> str:
@@ -469,6 +495,9 @@ def _check_or_write_config(out_dir: Path, cfg: SweepConfig, cache: SeenOnlyCache
                "probe_name": probe.name, "probe_temporary": bool(probe.temporary),
                "evaluator_name": evaluator.name, "evaluator_temporary": bool(evaluator.temporary)}
     cfg_doc.pop("cache_dir")  # a path (may contain a user name); the cache identity above is what matters
+    cfg_doc.pop("probe_args")  # the effective settings below are what matters (and older folders have neither)
+    if hasattr(probe, "settings"):
+        cfg_doc["probe_settings"] = probe.settings()
     path = out_dir / "config.json"
     if path.exists():
         old = json.loads(path.read_text())
@@ -498,7 +527,7 @@ def run_layer(cfg: SweepConfig, layer: int, out_dir: Path, loader: Path = DEFAUL
     if layer != AVG_LAYER and not 0 <= layer < len(names):
         raise ValueError(f"layer {layer} not in this cache (0..{len(names) - 1}, or 'avg')")
     layer_name = AVG_NAME if layer == AVG_LAYER else names[layer]
-    probe, evaluator = resolve(cfg.probe, PROBES), resolve(cfg.evaluator, EVALUATORS)
+    probe, evaluator = cfg.make_probe(), resolve(cfg.evaluator, EVALUATORS)
     _mkdir_shared(out_dir)
     move_aside_stale_temp_files(out_dir, log)
     cfg_doc = _check_or_write_config(out_dir, cfg, cache, probe, evaluator)
@@ -571,6 +600,8 @@ def run_layer(cfg: SweepConfig, layer: int, out_dir: Path, loader: Path = DEFAUL
             "pool": cfg.pool, "normalize": cfg.normalize, "train_horizon": cfg.train_horizon,
             "eval_split": "seen_val", "eval_horizon": "task_min_step",
             "probe": probe.name, "evaluator": evaluator.name, "TEMPORARY": temporary,
+            **({"probe_settings": json.dumps(probe.settings(), sort_keys=True)} if hasattr(probe, "settings") else {}),
+            **({"probe_fit": json.dumps(fitted.fit_info, sort_keys=True)} if getattr(fitted, "fit_info", None) else {}),
             "n_train_rollouts": len(train), "n_train_steps": int(sum(r["features"].shape[1] for r in train)),
             "n_val_rollouts": len(val), "n_val_failures": int(labels.sum()),
             **{METRIC_PREFIX + k: v for k, v in metrics.items()},
@@ -781,7 +812,8 @@ def aggregate(out_dir: Path, metric: str = "roc_auc", plot: bool = True, log=pri
     df = df.drop(columns=[c for c in JOB_FIELDS if c in df.columns])
     if df.eval_split.ne("seen_val").any():
         raise ValueError("rows scored on something other than seen_val")
-    if df[["probe", "evaluator", "pool", "normalize", "train_horizon", "cache_manifest_sha256"]].nunique().max() > 1:
+    same = ["probe", "evaluator", "pool", "normalize", "train_horizon", "cache_manifest_sha256"]
+    if df[same + [c for c in ("probe_settings",) if c in df.columns]].nunique().max() > 1:
         raise ValueError("rows from different configurations in one folder")
     df.to_csv(out_dir / "results.csv", index=False)
     metric_cols = [c for c in df.columns if c.startswith(METRIC_PREFIX)]

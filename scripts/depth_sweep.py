@@ -124,13 +124,27 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # run from a check
 log("importing failure_prob (numpy, the cache loader)")
 from failure_prob.engine.depth_sweep import (ReadStalled, SweepConfig, aggregate, missing_rows, parse_layer,  # noqa: E402
                                              parse_layers, row_stem, run_layer)
-from failure_prob.engine.sweep_plugins import DEFAULT_EVALUATOR, EVALUATORS  # noqa: E402
+from failure_prob.engine.sweep_plugins import DEFAULT_EVALUATOR, EVALUATORS, PROBES  # noqa: E402
 from failure_prob.protocol import TRAIN_SEEDS  # noqa: E402
 log(f"imports done ({time.time() - T_START:.1f} s since start)")
 
 USER = os.environ.get("USER", "user")
 DEFAULT_CACHE = os.environ.get("CACHE_DIR", f"/scratch1/{USER}/safe_cache/v1")
 DEFAULT_OUT_ROOT = os.environ.get("SWEEP_OUT_ROOT", f"/scratch1/{USER}/depth_sweep")
+
+
+def parse_probe_args(items, ap) -> tuple[tuple[str, str], ...]:
+    """['hidden_dim=128', 'lr=3e-4'] -> (('hidden_dim', '128'), ('lr', '3e-4')), sorted; a key may appear once."""
+    out = {}
+    for item in items:
+        key, sep, value = item.partition("=")
+        key = key.strip()
+        if not sep or not key or not value.strip():
+            ap.error(f"--probe-arg {item!r}: expected KEY=VALUE")
+        if key in out:
+            ap.error(f"--probe-arg {key} given twice")
+        out[key] = value.strip()
+    return tuple(sorted(out.items()))
 
 
 def main(argv=None):
@@ -144,7 +158,11 @@ def main(argv=None):
     r.add_argument("--pool", default="mean", choices=["mean", "first", "last"])
     r.add_argument("--normalize", action="store_true", help="z-score with the cache's TRAIN-split statistics")
     r.add_argument("--train-horizon", default="full", choices=["full", "task_min_step"])
-    r.add_argument("--probe", default="temporary_mlp", help="registered name or 'package.module:factory'")
+    r.add_argument("--probe", default="temporary_mlp",
+                   help=f"registered name ({', '.join(PROBES)}) or 'package.module:factory' (default %(default)s)")
+    r.add_argument("--probe-arg", action="append", default=[], metavar="KEY=VALUE",
+                   help="a probe setting, repeatable, e.g. --probe framework_mlp --probe-arg hidden_dim=128 "
+                        "--probe-arg lr=3e-4 (framework_mlp settings: see failure_prob/engine/sweep_plugins.py)")
     r.add_argument("--evaluator", default=DEFAULT_EVALUATOR,
                    help=f"registered name ({', '.join(EVALUATORS)}) or 'package.module:factory' (default {DEFAULT_EVALUATOR})")
     r.add_argument("--seeds", type=int, nargs="+", default=list(TRAIN_SEEDS))
@@ -158,6 +176,7 @@ def main(argv=None):
     a.add_argument("--normalize", action="store_true")
     a.add_argument("--train-horizon", default="full", choices=["full", "task_min_step"])
     a.add_argument("--probe", default="temporary_mlp")
+    a.add_argument("--probe-arg", action="append", default=[], metavar="KEY=VALUE")
     a.add_argument("--evaluator", default=DEFAULT_EVALUATOR)
     a.add_argument("--metric", default="roc_auc", help="metric drawn in the plot (any key the evaluator returns)")
     a.add_argument("--no-plot", action="store_true")
@@ -175,7 +194,8 @@ def main(argv=None):
 
     def config(cache=DEFAULT_CACHE, seeds=TRAIN_SEEDS):
         return SweepConfig(cache_dir=cache, pool=args.pool, normalize=args.normalize, train_horizon=args.train_horizon,
-                           probe=args.probe, evaluator=args.evaluator, seeds=tuple(seeds))
+                           probe=args.probe, evaluator=args.evaluator, seeds=tuple(seeds),
+                           probe_args=parse_probe_args(args.probe_arg, ap))
 
     if args.cmd == "run":
         log("importing torch")

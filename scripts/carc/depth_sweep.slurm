@@ -16,7 +16,8 @@
 # command-line --array replaces the default above.
 #
 # Optional settings (export them and submit with --export=ALL): SWEEP_POOL, SWEEP_NORMALIZE, SWEEP_TRAIN_HORIZON,
-# SWEEP_PROBE, SWEEP_EVALUATOR, SWEEP_OUT, SWEEP_OUT_ROOT, CACHE_DIR (default /scratch1/$USER/safe_cache/v1),
+# SWEEP_PROBE, SWEEP_PROBE_ARGS ("key=value key=value"), SWEEP_EVALUATOR, SWEEP_OUT, SWEEP_OUT_ROOT,
+# CACHE_DIR (default /scratch1/$USER/safe_cache/v1),
 # SWEEP_PYTHON (default /scratch1/$USER/safe_cache_work/venv310/bin/python),
 # SWEEP_LAYER (run this layer, e.g. avg, instead of the array index),
 # SWEEP_LOAD_TIMEOUT (default 120 s without progress during start-up and loading, then the task exits with code 75),
@@ -85,6 +86,9 @@ ARGS=(run --layers "$LAYER" --pool "${SWEEP_POOL:-mean}" --train-horizon "${SWEE
       --probe "${SWEEP_PROBE:-temporary_mlp}" --evaluator "${SWEEP_EVALUATOR:-b4}"
       --threads "${SLURM_CPUS_PER_TASK:-4}")
 [ "${SWEEP_NORMALIZE:-0}" = 1 ] && ARGS+=(--normalize)
+# Probe settings, e.g. SWEEP_PROBE_ARGS="hidden_dim=128 lr=3e-4" (spaces or commas between them)
+PROBE_ARGS="${SWEEP_PROBE_ARGS:-}"
+for kv in ${PROBE_ARGS//,/ }; do ARGS+=(--probe-arg "$kv"); done
 [ -n "${SWEEP_OUT:-}" ] && ARGS+=(--out "$SWEEP_OUT")
 
 echo "[$(ts)] layer $LAYER, commit $(git rev-parse --short HEAD 2>/dev/null || echo unknown), python $PY"

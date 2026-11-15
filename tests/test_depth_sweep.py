@@ -835,3 +835,190 @@ def test_cli_and_slurm_default_to_the_b4_evaluator():
     for name in ("depth_sweep.slurm", "depth_sweep_aggregate.slurm"):
         text = (SLURM_DIR / name).read_text()
         assert '--evaluator "${SWEEP_EVALUATOR:-b4}"' in text and "temporary_max" not in text
+
+
+# ------------------------------------------------------------------------- framework_mlp probe (B6, settings pending)
+def _toy_records(n=24, t=6, d=4, seed=0, tasks=(1, 2)):
+    import torch
+    rng = np.random.default_rng(seed)
+    out = []
+    for i in range(n):
+        y = i % 2
+        x = rng.standard_normal((1, t, 1, d)).astype(np.float32) + 0.8 * y
+        out.append({"features": torch.from_numpy(x), "mask": torch.ones(1, t, dtype=torch.bool),
+                    "labels": torch.tensor([float(y)]), "task_ids": [tasks[(i // 2) % len(tasks)]],
+                    "trajectory_ids": [f"task{tasks[(i // 2) % len(tasks)]}--ep{i}"], "task_min_steps": [t - 1]})
+    return out
+
+
+def test_framework_mlp_every_setting_is_an_argument_and_it_stays_temporary():
+    from failure_prob.engine.sweep_plugins import FrameworkMLPProbe, PROBES, resolve
+    p = resolve("framework_mlp", PROBES, hidden_dim="32", dropout="0.1", lr="0.01", epochs="3", batch_size="4",
+                early_stopping_patience="2", es_holdout_fraction="0.25", es_monitor="roc_auc", es_min_delta="0.001")
+    assert isinstance(p, FrameworkMLPProbe)
+    assert p.settings() == {"hidden_dim": 32, "dropout": 0.1, "lr": 0.01, "epochs": 3, "batch_size": 4,
+                            "early_stopping_patience": 2, "es_holdout_fraction": 0.25, "es_monitor": "roc_auc",
+                            "es_min_delta": 0.001}
+    assert p.temporary is True and p.name.startswith("TEMPORARY")      # placeholders until Aniruth's settings
+    assert set(resolve("framework_mlp", PROBES).settings()) == set(p.settings())
+    with pytest.raises(ValueError, match="unknown setting"):
+        resolve("framework_mlp", PROBES, hidden=8)
+    with pytest.raises(ValueError, match="unknown setting"):
+        resolve("framework_mlp", PROBES, temporary="false")             # cannot switch the label off by argument
+    for bad in ({"epochs": "0"}, {"dropout": "1.0"}, {"es_monitor": "auc"}, {"lr": "-1"}, {"hidden_dim": "1.5"}):
+        with pytest.raises(ValueError):
+            resolve("framework_mlp", PROBES, **bad)
+    with pytest.raises(TypeError, match="does not take the settings"):
+        resolve("my_missing_kw_probe", {"my_missing_kw_probe": lambda: None}, hidden_dim="8")
+    with pytest.raises(ValueError, match="takes no --probe-arg"):   # its settings would not be recorded
+        ds.SweepConfig(cache_dir="x", probe="temporary_mlp", probe_args=(("hidden_dim", "8"),)).make_probe()
+
+
+def test_framework_mlp_trains_like_scripts_train_py(monkeypatch):
+    """Same procedure as scripts/train.py for the fusion models: seed, get_model, trainer.train_model, scoring."""
+    import torch
+    from failure_prob.engine import trainer
+    from failure_prob.engine.sweep_plugins import make_framework_mlp
+    from failure_prob.models import get_model
+    from failure_prob.models.single_layer_mlp import SingleLayerMLP
+    recs = _toy_records()
+    calls = []
+    real = trainer.train_model
+    monkeypatch.setattr(trainer, "train_model", lambda model, records, **kw: calls.append((model, len(records), kw))
+                        or real(model, records, **kw))
+    probe = make_framework_mlp(hidden_dim=16, dropout=0.2, lr=0.01, epochs=3, batch_size=4)
+    fitted = probe.fit(recs, seed=1)
+    model, n, kw = calls[0]
+    assert isinstance(model, SingleLayerMLP) and model.hidden_dim == 16 and model.head.net[2].p == 0.2
+    assert n == len(recs) and kw["epochs"] == 3 and kw["batch_size"] == 4 and kw["lr"] == 0.01 and kw["seed"] == 1
+    assert kw["on_epoch_end"] is None                                    # early stopping off by default
+    got = fitted.step_scores(recs)
+    torch.manual_seed(1)                                                 # the same steps by hand
+    ref = get_model("single_layer_mlp", input_dim=4, num_layers=1, hidden_dim=16, dropout=0.2, layer_index=0)
+    real(ref, recs, epochs=3, batch_size=4, lr=0.01, seed=1)
+    ref.eval()
+    with torch.no_grad():                                                # one record at a time, no padding
+        want = [ref(trainer.collate_records([r])).failure_logits[0].double().numpy() for r in recs]
+    assert all(np.allclose(a, b, rtol=0, atol=1e-6) for a, b in zip(got, want))
+    assert [len(s) for s in got] == [r["features"].shape[1] for r in recs]   # every step of every rollout
+    again = make_framework_mlp(hidden_dim=16, dropout=0.2, lr=0.01, epochs=3, batch_size=4).fit(recs, 1)
+    assert all(np.array_equal(a, b) for a, b in zip(got, again.step_scores(recs)))       # reproducible
+    other = make_framework_mlp(hidden_dim=16, dropout=0.2, lr=0.01, epochs=3, batch_size=4).fit(recs, 2)
+    assert not all(np.array_equal(a, b) for a, b in zip(got, other.step_scores(recs)))   # seeded
+
+
+def test_framework_mlp_early_stopping_holds_out_train_episodes_only():
+    from failure_prob.engine import trainer
+    from failure_prob.engine.sweep_plugins import _holdout_split, make_framework_mlp
+    recs = _toy_records(n=40)
+    fit, held = _holdout_split(recs, 0.3, seed=0)
+    assert len(fit) + len(held) == 40 and len(held) == 12               # 3 of each (task, outcome) group of 10
+    assert not {id(r) for r in fit} & {id(r) for r in held}
+    assert {(r["task_ids"][0], int(r["labels"][0])) for r in held} == {(1, 0), (1, 1), (2, 0), (2, 1)}
+    assert [r["trajectory_ids"] for r in _holdout_split(recs, 0.3, 0)[1]] == [r["trajectory_ids"] for r in held]
+    # stops `patience` epochs after the last improvement and restores the best epoch
+    p = make_framework_mlp(epochs=6, batch_size=4, early_stopping_patience=2, es_holdout_fraction=0.3,
+                           es_min_delta=1e9)                             # nothing counts as an improvement
+    info = p.fit(recs, seed=0).fit_info
+    assert info["epochs_run"] == 3 and info["best_epoch"] == 1 and len(info["holdout_loss"]) == 3
+    assert info["n_fit_rollouts"] == 28 and info["n_holdout_rollouts"] == 12
+    # checking the holdout does not change the training order: same losses as training on `fit` without it
+    for monitor in ("loss", "roc_auc"):
+        p = make_framework_mlp(epochs=4, batch_size=4, early_stopping_patience=10, es_holdout_fraction=0.3,
+                               es_monitor=monitor)
+        info = p.fit(recs, seed=0).fit_info
+        import torch
+        from failure_prob.models import get_model
+        torch.manual_seed(0)
+        ref = get_model("single_layer_mlp", input_dim=4, num_layers=1, hidden_dim=64, dropout=0.0, layer_index=0)
+        hist = trainer.train_model(ref, fit, epochs=4, batch_size=4, lr=1e-3, seed=0)
+        assert info["train_loss"] == [round(x, 6) for x in hist] and len(info[f"holdout_{monitor}"]) == 4
+    best = make_framework_mlp(epochs=4, batch_size=4, early_stopping_patience=10, es_monitor="roc_auc").fit(recs, 0)
+    curve = best.fit_info["holdout_roc_auc"]
+    assert best.fit_info["best_epoch"] == 1 + int(np.argmax(curve))      # first epoch with the best holdout ROC-AUC
+
+
+def test_framework_mlp_in_the_sweep_records_settings_and_separates_folders(cache, tmp_path):
+    c = cfg(cache, seeds=(0,), probe="framework_mlp", probe_args=(("epochs", "2"), ("hidden_dim", "8")))
+    rows = ds.run_layer(c, 2, tmp_path / "a", log=lambda m: None)
+    row = rows[0]
+    assert row["probe"] == "TEMPORARY_framework_mlp" and row["TEMPORARY"] is True
+    assert row["evaluator"] == "episode_max_at_task_min_step_v1"         # B4 by default
+    assert json.loads(row["probe_settings"])["hidden_dim"] == 8 and json.loads(row["probe_fit"])["epochs_run"] == 2
+    doc = json.loads((tmp_path / "a" / "config.json").read_text())
+    assert doc["probe_settings"]["epochs"] == 2 and "probe_args" not in doc
+    # the label carries a digest of the effective settings: other settings, other folder
+    other = cfg(cache, probe="framework_mlp", probe_args=(("epochs", "3"), ("hidden_dim", "8")))
+    default = cfg(cache, probe="framework_mlp")
+    assert len({c.label(), other.label(), default.label()}) == 3 and "framework_mlp_" in c.label()
+    assert cfg(cache, probe="framework_mlp", probe_args=(("epochs", "5"),)).label() == default.label()  # 5 = default
+    with pytest.raises(ValueError, match="different configuration"):
+        ds.run_layer(other, 2, tmp_path / "a", log=lambda m: None)
+    summary = pd.read_csv(ds.aggregate(tmp_path / "a", plot=False, bootstrap=10)["summary"])
+    assert summary.TEMPORARY.all()
+    # the placeholder probe's folders are unchanged (no settings, no digest)
+    assert cfg(cache).label() == "mean-raw-train_full-temporary_mlp-b4"
+
+
+def test_records_carry_task_min_steps(cache):
+    c = ds.SeenOnlyCache(cache, ds.DEFAULT_LOADER)
+    ep = c.episodes.set_index("trajectory_id")
+    for recs in (c.records("train", 1, "mean", False, "full"), c.avg_records("train", [1, 3], "mean", "full")):
+        assert all(r["task_min_steps"] == [int(ep.at[r["trajectory_ids"][0], "task_min_step"])] for r in recs)
+
+
+def test_cli_and_slurm_pass_probe_settings(cache, tmp_path):
+    import importlib.util, os, subprocess, sys
+    from pathlib import Path
+    spec = importlib.util.spec_from_file_location("depth_sweep_cli", Path(ds.REPO_ROOT) / "scripts" / "depth_sweep.py")
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+    out_root = tmp_path / "sweeps"
+    env = {**os.environ, "SLURM_JOB_ID": "1", "SLURM_ARRAY_JOB_ID": "8", "SLURM_ARRAY_TASK_ID": "2",
+           "SLURM_SUBMIT_DIR": str(ds.REPO_ROOT), "SLURM_CPUS_PER_TASK": "1", "SWEEP_PYTHON": sys.executable,
+           "CACHE_DIR": str(cache), "SWEEP_OUT_ROOT": str(out_root), "SWEEP_PROBE": "framework_mlp",
+           "SWEEP_PROBE_ARGS": "epochs=1,hidden_dim=8 batch_size=4", "SWEEP_EXPECT_LAYERS": "2"}
+    r = subprocess.run([_bash(), str(SLURM_DIR / "depth_sweep.slurm")], env=env, capture_output=True, text=True,
+                       timeout=600)
+    assert r.returncode == 0, r.stdout + r.stderr
+    label = cfg(cache, probe="framework_mlp",
+                probe_args=(("batch_size", "4"), ("epochs", "1"), ("hidden_dim", "8"))).label()
+    assert (out_root / label / "rows" / "L02_seed2.json").exists()
+    r = subprocess.run([_bash(), str(SLURM_DIR / "depth_sweep_aggregate.slurm")], env=env, capture_output=True,
+                       text=True, timeout=600)
+    assert r.returncode in (0, 3), r.stdout + r.stderr
+    assert (out_root / label / "summary.csv").exists()
+    with pytest.raises(SystemExit):
+        cli.main(["run", "--layers", "2", "--probe", "framework_mlp", "--probe-arg", "epochs"])
+    with pytest.raises(SystemExit):
+        cli.main(["run", "--layers", "2", "--probe-arg", "epochs=1", "--probe-arg", "epochs=2"])
+
+
+def test_framework_scoring_matches_the_framework_scoring_module():
+    """The plugin scores like failure_prob.engine.scoring.step_scores (that module needs omegaconf via
+    failure_prob.data, which the sweep's CARC environment may lack, so the plugin does not import it)."""
+    pytest.importorskip("omegaconf")
+    import torch
+    from failure_prob.engine.scoring import step_scores
+    from failure_prob.engine.sweep_plugins import _framework_step_scores
+    from failure_prob.models import get_model
+    recs = _toy_records(n=10)
+    recs[3] = {**recs[3], "features": recs[3]["features"][:, :4], "mask": recs[3]["mask"][:, :4]}   # a shorter one
+    torch.manual_seed(0)
+    model = get_model("single_layer_mlp", input_dim=4, num_layers=1, hidden_dim=8, layer_index=0)
+    for a, b in zip(_framework_step_scores(model, recs, 4), step_scores(model, recs, 4)):
+        assert np.array_equal(a, b.astype(np.float64))
+
+
+def test_framework_mlp_does_not_need_hydra_or_omegaconf():
+    import subprocess, sys
+    code = ("import sys; sys.modules['omegaconf'] = None; sys.modules['hydra'] = None\n"
+            "sys.path.insert(0, 'tests')\n"
+            "from test_depth_sweep import _toy_records\n"
+            "from failure_prob.engine.sweep_plugins import make_framework_mlp\n"
+            "recs = _toy_records()\n"
+            "p = make_framework_mlp(epochs=2, batch_size=4, early_stopping_patience=1, es_monitor='roc_auc')\n"
+            "print(len(p.fit(recs, 0).step_scores(recs)))\n")
+    r = subprocess.run([sys.executable, "-c", code], cwd=ds.REPO_ROOT, capture_output=True, text=True, timeout=300,
+                       env={**__import__("os").environ, "PYTHONPATH": str(ds.REPO_ROOT)})
+    assert r.returncode == 0 and r.stdout.strip() == "24", r.stderr

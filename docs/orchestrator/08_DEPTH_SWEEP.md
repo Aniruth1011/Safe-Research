@@ -37,6 +37,17 @@ row, `summary.csv` and the plot title say TEMPORARY.
 - **`temporary_mlp` (the default).** The registered `single_layer_mlp` (D → 64 → 1, per timestep), trained with
   `failure_prob/engine/trainer.py`: Adam at lr 1e-3, 5 epochs, 8 rollouts per batch, BCE on the rollout label at
   every step. No early stopping and no selection on seen_val.
+- **`framework_mlp` (the B6 probe; settings pending).** Aniruth's framework model `single_layer_mlp`, trained with
+  `failure_prob/engine/trainer.py` the way `scripts/train.py` trains the fusion models (seed, `get_model`,
+  `train_model`, per-step logits from `failure_prob/engine/scoring.py`). Every setting is an argument:
+  `--probe-arg key=value` (repeatable), or `SWEEP_PROBE_ARGS="key=value key=value"` for the Slurm jobs. The settings
+  are `hidden_dim`, `dropout`, `lr`, `epochs`, `batch_size`, and for early stopping `early_stopping_patience`
+  (0 = off), `es_holdout_fraction`, `es_monitor` (`loss` or `roc_auc`) and `es_min_delta`. The defaults
+  (64, 0.0, 1e-3, 5, 8, off) are placeholders, so its outputs say TEMPORARY until Aniruth's locked values are in.
+  Early stopping holds out part of **train** (stratified by task and outcome, picked with the seed) and never looks at
+  seen_val. The effective settings are written to `config.json` and every row (`probe_settings`), and a digest of them
+  is part of the folder name, so different settings never share a folder. Rows also get `probe_fit` (epochs run,
+  best epoch, loss curves).
 
 **Swapping them changes no other code.** Put a factory in any module and pass it by name:
 `--probe pkg.module:make_probe` (or `SWEEP_PROBE=...`). The same works for `--evaluator`. The contracts are in
