@@ -36,34 +36,48 @@ def sha256(path: Path, chunk: int = 1 << 24) -> str:
     return h.hexdigest()
 
 
+def _is_unseen(rel: str) -> bool:
+    return "/unseen_test/" in rel.replace("\\", "/")
+
+
 def verify(cache: Path, quick: bool) -> int:
+    """unseen_test files that are absent or unreadable (PermissionError: the folder or file is locked for this user,
+    as it is for teammates) count as withheld, not as errors. Any other unreadable file fails the check."""
     manifest = json.loads((cache / "manifest.json").read_text())
     files = manifest.get("files", {})
     if not files:
         print("manifest has no checksums (built with --skip-checksums)")
         return 1
-    ok, bad, absent = 0, [], []
+    ok, bad, absent, locked, unreadable = 0, [], [], [], []
     for rel, info in files.items():
         p = cache / rel
-        if not p.exists():
-            absent.append(rel)
+        try:
+            if not p.exists():   # Python < 3.12: raises PermissionError when a parent folder is not searchable
+                absent.append(rel)
+                continue
+            if p.stat().st_size != info["bytes"] or (not quick and sha256(p) != info["sha256"]):
+                bad.append(rel)
+                continue
+            if p.suffix == ".npy":
+                np.load(p, mmap_mode="r")  # header/shape sanity
+        except PermissionError:
+            (locked if _is_unseen(rel) else unreadable).append(rel)
             continue
-        if p.stat().st_size != info["bytes"] or (not quick and sha256(p) != info["sha256"]):
-            bad.append(rel)
-            continue
-        if p.suffix == ".npy":
-            np.load(p, mmap_mode="r")  # header/shape sanity
         ok += 1
-    withheld = [r for r in absent if "/unseen_test/" in r.replace("\\", "/")]
-    other_absent = [r for r in absent if r not in withheld]
+    withheld = [r for r in absent if _is_unseen(r)] + locked
+    other_absent = [r for r in absent if not _is_unseen(r)]
     print(f"verified {ok} files; {len(bad)} corrupted; {len(other_absent)} not downloaded; "
-          f"{len(withheld)} unseen-test files withheld")
+          f"{len(withheld)} unseen-test files withheld"
+          + (f" ({len(locked)} present but not readable by this user)" if locked else "")
+          + (f"; {len(unreadable)} unreadable" if unreadable else ""))
     for r in bad:
         print(f"  CORRUPTED: {r}")
+    for r in unreadable:
+        print(f"  UNREADABLE (permission denied): {r}")
     if other_absent:
         print("  not downloaded (fine if you only need some layers):", ", ".join(other_absent[:8]),
               "..." if len(other_absent) > 8 else "")
-    return 1 if bad else 0
+    return 1 if bad or unreadable else 0
 
 
 def index(d: Path) -> dict[tuple[int, int], Path]:
