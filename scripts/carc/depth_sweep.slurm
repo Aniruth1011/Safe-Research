@@ -84,7 +84,7 @@ export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}" MKL_NUM_THREADS="${SLURM_CPUS
 # The layer is the array index, or SWEEP_LAYER (e.g. "avg", the all-layer average baseline, plan row S5)
 LAYER="${SWEEP_LAYER:-${SLURM_ARRAY_TASK_ID:?submit as an array job (see scripts/carc/submit_depth_sweep.sh)}}"
 ARGS=(run --layers "$LAYER" --pool "${SWEEP_POOL:-mean}" --train-horizon "${SWEEP_TRAIN_HORIZON:-full}"
-      --probe "${SWEEP_PROBE:-temporary_mlp}" --evaluator "${SWEEP_EVALUATOR:-b4}"
+      --probe "${SWEEP_PROBE:-framework_mlp}" --evaluator "${SWEEP_EVALUATOR:-b4}"
       --threads "${SLURM_CPUS_PER_TASK:-4}")
 [ "${SWEEP_NORMALIZE:-0}" = 1 ] && ARGS+=(--normalize)
 # Probe settings, e.g. SWEEP_PROBE_ARGS="hidden_dim=128 lr=3e-4" (spaces or commas between them)

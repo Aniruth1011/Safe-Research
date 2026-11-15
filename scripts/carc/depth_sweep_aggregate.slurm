@@ -34,7 +34,7 @@ PY="${SWEEP_PYTHON:-/scratch1/${USER:-$(id -un)}/safe_cache_work/venv310/bin/pyt
 export CUDA_VISIBLE_DEVICES="" OMP_NUM_THREADS=1 MKL_NUM_THREADS=1   # parallel over processes
 
 ARGS=(aggregate --pool "${SWEEP_POOL:-mean}" --train-horizon "${SWEEP_TRAIN_HORIZON:-full}"
-      --probe "${SWEEP_PROBE:-temporary_mlp}" --evaluator "${SWEEP_EVALUATOR:-b4}")
+      --probe "${SWEEP_PROBE:-framework_mlp}" --evaluator "${SWEEP_EVALUATOR:-b4}")
 [ "${SWEEP_NORMALIZE:-0}" = 1 ] && ARGS+=(--normalize)
 # Probe settings, e.g. SWEEP_PROBE_ARGS="hidden_dim=128 lr=3e-4" (spaces or commas between them)
 PROBE_ARGS="${SWEEP_PROBE_ARGS:-}"

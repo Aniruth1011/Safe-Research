@@ -45,7 +45,7 @@ from pathlib import Path
 
 import numpy as np
 
-from failure_prob.engine.sweep_plugins import DEFAULT_EVALUATOR, EVALUATORS, PROBES, EvalInput, resolve
+from failure_prob.engine.sweep_plugins import DEFAULT_EVALUATOR, DEFAULT_PROBE, EVALUATORS, PROBES, EvalInput, resolve
 from failure_prob.protocol import TRAIN_SEEDS, UNSEEN_TASKS
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -304,7 +304,7 @@ class SweepConfig:
     pool: str = "mean"
     normalize: bool = False
     train_horizon: str = "full"          # "full" or "task_min_step"; seen_val is always scored at task_min_step
-    probe: str = "temporary_mlp"
+    probe: str = DEFAULT_PROBE           # "framework_mlp" (B6 with its defaults); "temporary_mlp" is the old placeholder
     evaluator: str = DEFAULT_EVALUATOR    # "b4" (episode_metrics); "temporary_max" is the old placeholder
     seeds: tuple[int, ...] = field(default=TRAIN_SEEDS)
     probe_args: tuple[tuple[str, str], ...] = ()   # --probe-arg key=value; the probe's effective settings are recorded

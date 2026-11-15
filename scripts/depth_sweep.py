@@ -3,14 +3,15 @@
 
     # one or more layers (a CARC array task runs one layer: --layers $SLURM_ARRAY_TASK_ID)
     python scripts/depth_sweep.py run --layers 0 1 [--pool mean|first|last] [--normalize] \
-        [--cache /scratch1/<user>/safe_cache/v1] [--out <folder>] [--probe temporary_mlp] [--evaluator b4]
+        [--cache /scratch1/<user>/safe_cache/v1] [--out <folder>] [--probe framework_mlp] [--evaluator b4]
     # after all layers: results.csv, summary.csv, depth_curve.png
     python scripts/depth_sweep.py aggregate --out <folder> [--metric roc_auc]
 
 R1 = all layers, R3 = --pool first/last at the best layer, R4 = --normalize (train-split statistics) vs raw.
 unseen_test is never read. The default evaluator is B4's (`b4`, failure_prob/engine/episode_metrics.py); the old
-placeholder stays selectable as `--evaluator temporary_max`. The default probe is still a TEMPORARY placeholder until
-B6's settings land (see failure_prob/engine/sweep_plugins.py); swap either with 'package.module:factory'.
+placeholder stays selectable as `--evaluator temporary_max`. The default probe is B6's (`framework_mlp` with its
+defaults, failure_prob/engine/sweep_plugins.py); the old placeholder stays selectable as `--probe temporary_mlp`.
+Swap either with 'package.module:factory'.
 """
 from __future__ import annotations
 
@@ -124,7 +125,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # run from a check
 log("importing failure_prob (numpy, the cache loader)")
 from failure_prob.engine.depth_sweep import (ReadStalled, SweepConfig, aggregate, missing_rows, parse_layer,  # noqa: E402
                                              parse_layers, row_stem, run_layer)
-from failure_prob.engine.sweep_plugins import DEFAULT_EVALUATOR, EVALUATORS, PROBES  # noqa: E402
+from failure_prob.engine.sweep_plugins import DEFAULT_EVALUATOR, DEFAULT_PROBE, EVALUATORS, PROBES  # noqa: E402
 from failure_prob.protocol import TRAIN_SEEDS  # noqa: E402
 log(f"imports done ({time.time() - T_START:.1f} s since start)")
 
@@ -158,7 +159,7 @@ def main(argv=None):
     r.add_argument("--pool", default="mean", choices=["mean", "first", "last"])
     r.add_argument("--normalize", action="store_true", help="z-score with the cache's TRAIN-split statistics")
     r.add_argument("--train-horizon", default="full", choices=["full", "task_min_step"])
-    r.add_argument("--probe", default="temporary_mlp",
+    r.add_argument("--probe", default=DEFAULT_PROBE,
                    help=f"registered name ({', '.join(PROBES)}) or 'package.module:factory' (default %(default)s)")
     r.add_argument("--probe-arg", action="append", default=[], metavar="KEY=VALUE",
                    help="a probe setting, repeatable, e.g. --probe framework_mlp --probe-arg hidden_dim=128 "
@@ -175,7 +176,7 @@ def main(argv=None):
     a.add_argument("--pool", default="mean", choices=["mean", "first", "last"])
     a.add_argument("--normalize", action="store_true")
     a.add_argument("--train-horizon", default="full", choices=["full", "task_min_step"])
-    a.add_argument("--probe", default="temporary_mlp")
+    a.add_argument("--probe", default=DEFAULT_PROBE)
     a.add_argument("--probe-arg", action="append", default=[], metavar="KEY=VALUE")
     a.add_argument("--evaluator", default=DEFAULT_EVALUATOR)
     a.add_argument("--metric", default="roc_auc", help="metric drawn in the plot (any key the evaluator returns)")

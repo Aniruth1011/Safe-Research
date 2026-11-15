@@ -325,6 +325,7 @@ def _b4_evaluator() -> Evaluator:
 
 
 DEFAULT_EVALUATOR = "b4"
+DEFAULT_PROBE = "framework_mlp"   # with its defaults = the locked B6 probe; "temporary_mlp" is the old placeholder
 PROBES: dict[str, Callable[..., Probe]] = {"temporary_mlp": TemporaryMLPProbe, "framework_mlp": make_framework_mlp}
 EVALUATORS: dict[str, Callable[[], Evaluator]] = {"b4": _b4_evaluator, "temporary_max": TemporaryMaxScoreEvaluator}
 

@@ -17,7 +17,8 @@ def cache(tmp_path_factory):
 
 
 def cfg(cache, **kw):
-    return ds.SweepConfig(cache_dir=str(cache), **{"seeds": (0, 1), **kw})
+    """Sweep mechanics are tested with the cheap placeholder probe; the default (B6) has its own tests."""
+    return ds.SweepConfig(cache_dir=str(cache), **{"seeds": (0, 1), "probe": "temporary_mlp", **kw})
 
 
 def test_sweep_peaks_at_the_planted_layer_and_aggregates(cache, tmp_path):
@@ -263,8 +264,14 @@ def test_cli_run_and_aggregate(cache, tmp_path, capsys):
     out = tmp_path / "out"
     cli.main(["run", "--cache", str(cache), "--out", str(out), "--layers", "0", "2", "--seeds", "0", "--threads", "1"])
     cli.main(["aggregate", "--out", str(out), "--no-plot"])
-    assert len(pd.read_csv(out / "summary.csv")) == 2
-    assert "TEMPORARY" in capsys.readouterr().out
+    summary = pd.read_csv(out / "summary.csv")
+    assert len(summary) == 2 and not summary.TEMPORARY.any()          # default probe: the locked B6 framework_mlp
+    assert "TEMPORARY" not in capsys.readouterr().out
+    old = tmp_path / "old"                                             # the placeholder is still selectable, and says so
+    cli.main(["run", "--cache", str(cache), "--out", str(old), "--layers", "0", "--seeds", "0", "--threads", "1",
+              "--probe", "temporary_mlp"])
+    cli.main(["aggregate", "--out", str(old), "--no-plot", "--expect-layers", "0"])
+    assert pd.read_csv(old / "summary.csv").TEMPORARY.all() and "TEMPORARY" in capsys.readouterr().out
 
 
 # ------------------------------------------------------------------------------------------------ CARC job scripts
@@ -837,6 +844,24 @@ def test_cli_and_slurm_default_to_the_b4_evaluator():
         assert '--evaluator "${SWEEP_EVALUATOR:-b4}"' in text and "temporary_max" not in text
 
 
+def test_framework_mlp_b6_is_the_default_probe_everywhere():
+    """Nobody gets the placeholder probe by accident: library, CLI and Slurm jobs all default to framework_mlp."""
+    import importlib.util
+    from pathlib import Path
+    from failure_prob.engine.sweep_plugins import DEFAULT_PROBE
+    assert DEFAULT_PROBE == "framework_mlp" and ds.SweepConfig(cache_dir="x").probe == "framework_mlp"
+    assert ds.SweepConfig(cache_dir="x").label() == "mean-raw-train_full-framework_mlp_b6-b4"
+    spec = importlib.util.spec_from_file_location("depth_sweep_cli", Path(ds.REPO_ROOT) / "scripts" / "depth_sweep.py")
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+    assert cli.DEFAULT_PROBE == "framework_mlp"
+    src = (Path(ds.REPO_ROOT) / "scripts" / "depth_sweep.py").read_text()
+    assert src.count('add_argument("--probe", default=DEFAULT_PROBE') == 2       # run and aggregate
+    for name in ("depth_sweep.slurm", "depth_sweep_aggregate.slurm"):
+        text = (SLURM_DIR / name).read_text()
+        assert '--probe "${SWEEP_PROBE:-framework_mlp}"' in text and "SWEEP_PROBE:-temporary_mlp" not in text
+
+
 # ------------------------------------------------------------------------- framework_mlp probe (B6, locked 2026-11-15)
 def _toy_records(n=24, t=6, d=4, seed=0, tasks=(1, 2)):
     import torch
@@ -974,7 +999,7 @@ def test_framework_mlp_in_the_sweep_records_settings_and_separates_folders(cache
     summary = pd.read_csv(ds.aggregate(tmp_path / "a", plot=False, bootstrap=10)["summary"])
     assert summary.TEMPORARY.all()
     # the placeholder probe's folders are unchanged (no settings, no digest)
-    assert cfg(cache).label() == "mean-raw-train_full-temporary_mlp-b4"
+    assert cfg(cache, probe="temporary_mlp").label() == "mean-raw-train_full-temporary_mlp-b4"
 
 
 def test_locked_b6_probe_in_the_sweep_is_not_temporary(cache, tmp_path):

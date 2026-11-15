@@ -34,10 +34,10 @@ it, and aggregating their folders still uses it, because aggregation takes the e
 **Probe: still TEMPORARY until B6's settings land**, so anything the sweep produces is **not a result** yet. Every
 row, `summary.csv` and the plot title say TEMPORARY.
 
-- **`temporary_mlp` (the old placeholder; still the CLI default `--probe`).** The registered `single_layer_mlp` (D → 64 → 1, per timestep), trained with
+- **`temporary_mlp` (the old placeholder; select it with `--probe temporary_mlp`).** The registered `single_layer_mlp` (D → 64 → 1, per timestep), trained with
   `failure_prob/engine/trainer.py`: Adam at lr 1e-3, 5 epochs, 8 rollouts per batch, BCE on the rollout label at
   every step. No early stopping and no selection on seen_val.
-- **`framework_mlp` (the B6 probe; settings locked 2026-11-15).** Aniruth's framework model `single_layer_mlp`,
+- **`framework_mlp` (the default since 2026-11-15; the B6 probe, settings locked 2026-11-15).** Aniruth's framework model `single_layer_mlp`,
   trained with `failure_prob/engine/trainer.py` the way `scripts/train.py` trains the fusion models (seed,
   `get_model`, `train_model`, per-step logits scored like `failure_prob/engine/scoring.py`).
   - **Defaults = the locked B6 settings** (`B6_SETTINGS` in `sweep_plugins.py`): hidden_dim 64, dropout 0.1,
