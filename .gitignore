@@ -158,7 +158,8 @@ slurm_logs
 /outputs
 /multirun
 /results
-/logs
+/logs/*
+!/logs/.gitkeep
 # Slurm logs of the collection kit (carc/*.slurm write to collection/logs/): they contain job IDs and node names
 collection/logs/
 /artifacts
