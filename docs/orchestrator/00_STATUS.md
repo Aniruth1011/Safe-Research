@@ -129,9 +129,12 @@ Spend: `friend` ~$13.9 (function time + start-up), upper bound $14.34 (watchdog)
 2. Depth sweep R1–R4: [`08_DEPTH_SWEEP.md`](08_DEPTH_SWEEP.md). A TEMPORARY R1 run (placeholder probe and
    metric, not a result) completed on CARC on 2026-11-11: 34 layers × 3 seeds. The sweep now also has bootstrap CIs,
    a per-task breakdown and the S5 all-layer average (`--layers avg`; definition for Rhea's review in
-   [`09_S5_ALL_LAYER_AVERAGE.md`](09_S5_ALL_LAYER_AVERAGE.md)). Waiting for B6 (probe spec) and B4 (evaluator).
-   No CARC runs until Akash says. SAFE reference line: only from C4 (Adarsh's SAFE model re-scored by our evaluator).
-3. After PR #3 merges: delete the fork's `backup/extraction-pre-rebase-2026-11-10`.
+   [`09_S5_ALL_LAYER_AVERAGE.md`](09_S5_ALL_LAYER_AVERAGE.md)). B4's evaluator (`episode_metrics`, on main) is
+   the sweep default since 2026-11-15 (`temporary_max` stays selectable). The probe waits for B6: the shared probe
+   is the framework `single_layer_mlp` trained with `failure_prob/engine/trainer.py`; Aniruth sends the settings.
+   Until then every sweep output is TEMPORARY. No CARC runs until Akash says. SAFE reference line: only from C4
+   (Adarsh's SAFE model re-scored by our evaluator).
+3. Done 2026-11-12: the fork's `backup/extraction-pre-rebase-2026-11-10` was deleted after PR #3 merged.
 
 ## Budget
 

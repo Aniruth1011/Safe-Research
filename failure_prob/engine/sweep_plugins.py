@@ -3,8 +3,8 @@
 The sweep (failure_prob/engine/depth_sweep.py) only talks to the two small interfaces below. To plug in the real
 pieces, write a module with a factory and pass it by name, e.g.
 
-    python scripts/depth_sweep.py run ... --probe failure_prob.probes.b6:make_probe \
-                                          --evaluator failure_prob.eval.b4:make_evaluator
+    python scripts/depth_sweep.py run ... --probe some.module:make_probe \
+                                          --evaluator failure_prob.engine.episode_metrics:make_evaluator
 
 or register a short name in PROBES / EVALUATORS at the bottom of this file. Nothing else changes.
 
@@ -60,7 +60,8 @@ class Evaluator(Protocol):
 
 
 # ---------------------------------------------------------------------------------------------------------------
-# TEMPORARY placeholders. Replace with Aniruth's probe spec (plan row B6) and Rhea's evaluator (plan row B4).
+# TEMPORARY placeholders. The probe waits for Aniruth's settings (plan row B6). The evaluator placeholder is kept
+# selectable as `temporary_max` (the TEMPORARY R1 run used it); the default is B4's evaluator, `b4`, below.
 # ---------------------------------------------------------------------------------------------------------------
 @dataclass
 class _TorchFittedProbe:
@@ -124,8 +125,16 @@ class TemporaryMaxScoreEvaluator:
                 "tpr_at_5_fpr": float(np.max(tpr[fpr <= 0.05], initial=0.0))}
 
 
+def _b4_evaluator() -> Evaluator:
+    """The shared evaluator (plan row B4, failure_prob/engine/episode_metrics.py): SAFE's episode score (max step
+    score before min(length, task_min_step)), ROC-AUC, SAFE-style PR-AUC, TPR at 5% FPR, task-mean ROC-AUC."""
+    from failure_prob.engine.episode_metrics import make_evaluator
+    return make_evaluator()
+
+
+DEFAULT_EVALUATOR = "b4"
 PROBES: dict[str, Callable[[], Probe]] = {"temporary_mlp": TemporaryMLPProbe}
-EVALUATORS: dict[str, Callable[[], Evaluator]] = {"temporary_max": TemporaryMaxScoreEvaluator}
+EVALUATORS: dict[str, Callable[[], Evaluator]] = {"b4": _b4_evaluator, "temporary_max": TemporaryMaxScoreEvaluator}
 
 
 def resolve(spec: str, registry: dict[str, Callable]):

@@ -799,3 +799,39 @@ def test_slurm_job_runs_the_avg_layer_from_sweep_layer(cache5, tmp_path):
     assert r.returncode == 0, r.stdout + r.stderr
     assert "layer avg: averaging z-scored layers [1, 2, 4]" in r.stdout
     assert sorted(p.name for p in (tmp_path / "out" / "rows").glob("*.json")) == [f"Lavg_seed{s}.json" for s in (0, 1, 2)]
+
+
+# ------------------------------------------------------------------------------------- B4 evaluator is the default
+def test_b4_evaluator_is_the_default_and_temporary_max_stays_selectable(cache, tmp_path, plugin_module):
+    from failure_prob.engine.episode_metrics import EpisodeEvaluator
+    from failure_prob.engine.sweep_plugins import EVALUATORS, resolve
+    assert ds.SweepConfig(cache_dir="x").evaluator == "b4"
+    assert isinstance(resolve("b4", EVALUATORS), EpisodeEvaluator) and not resolve("b4", EVALUATORS).temporary
+    old = resolve("temporary_max", EVALUATORS)
+    assert isinstance(old, TemporaryMaxScoreEvaluator) and old.temporary
+    # B4 with a non-temporary probe: the row is not TEMPORARY and carries B4's metrics, CIs included
+    out = tmp_path / "b4"
+    for layer in (0, 2):
+        ds.run_layer(cfg(cache, probe="my_plugins:make_probe"), layer, out, log=lambda m: None)
+    row = json.loads((out / "rows" / "L02_seed0.json").read_text())
+    assert row["evaluator"] == "episode_max_at_task_min_step_v1" and row["TEMPORARY"] is False
+    assert {"val_roc_auc", "val_pr_auc", "val_tpr_at_5_fpr", "val_roc_auc_taskmean"} <= set(row)
+    summary = pd.read_csv(ds.aggregate(out, plot=False, bootstrap=20)["summary"]).set_index("layer")
+    assert not summary.TEMPORARY.any() and summary.val_roc_auc_mean[2] > summary.val_roc_auc_mean[0]
+    assert summary.val_roc_auc_ci95_low.notna().all()
+    # the placeholder still works by name, and lands in a different folder
+    assert cfg(cache, evaluator="temporary_max").label() != cfg(cache).label()
+    rows = ds.run_layer(cfg(cache, seeds=(0,), evaluator="temporary_max"), 2, tmp_path / "old", log=lambda m: None)
+    assert rows[0]["evaluator"] == "TEMPORARY_max_at_task_min_step" and rows[0]["TEMPORARY"] is True
+
+
+def test_cli_and_slurm_default_to_the_b4_evaluator():
+    import importlib.util
+    from pathlib import Path
+    spec = importlib.util.spec_from_file_location("depth_sweep_cli", Path(ds.REPO_ROOT) / "scripts" / "depth_sweep.py")
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+    assert cli.DEFAULT_EVALUATOR == "b4"
+    for name in ("depth_sweep.slurm", "depth_sweep_aggregate.slurm"):
+        text = (SLURM_DIR / name).read_text()
+        assert '--evaluator "${SWEEP_EVALUATOR:-b4}"' in text and "temporary_max" not in text

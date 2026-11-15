@@ -3,13 +3,14 @@
 
     # one or more layers (a CARC array task runs one layer: --layers $SLURM_ARRAY_TASK_ID)
     python scripts/depth_sweep.py run --layers 0 1 [--pool mean|first|last] [--normalize] \
-        [--cache /scratch1/<user>/safe_cache/v1] [--out <folder>] [--probe temporary_mlp] [--evaluator temporary_max]
+        [--cache /scratch1/<user>/safe_cache/v1] [--out <folder>] [--probe temporary_mlp] [--evaluator b4]
     # after all layers: results.csv, summary.csv, depth_curve.png
     python scripts/depth_sweep.py aggregate --out <folder> [--metric roc_auc]
 
 R1 = all layers, R3 = --pool first/last at the best layer, R4 = --normalize (train-split statistics) vs raw.
-unseen_test is never read. The default probe and evaluator are TEMPORARY placeholders (see
-failure_prob/engine/sweep_plugins.py); swap them with --probe/--evaluator 'package.module:factory'.
+unseen_test is never read. The default evaluator is B4's (`b4`, failure_prob/engine/episode_metrics.py); the old
+placeholder stays selectable as `--evaluator temporary_max`. The default probe is still a TEMPORARY placeholder until
+B6's settings land (see failure_prob/engine/sweep_plugins.py); swap either with 'package.module:factory'.
 """
 from __future__ import annotations
 
@@ -123,6 +124,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # run from a check
 log("importing failure_prob (numpy, the cache loader)")
 from failure_prob.engine.depth_sweep import (ReadStalled, SweepConfig, aggregate, missing_rows, parse_layer,  # noqa: E402
                                              parse_layers, row_stem, run_layer)
+from failure_prob.engine.sweep_plugins import DEFAULT_EVALUATOR, EVALUATORS  # noqa: E402
 from failure_prob.protocol import TRAIN_SEEDS  # noqa: E402
 log(f"imports done ({time.time() - T_START:.1f} s since start)")
 
@@ -143,7 +145,8 @@ def main(argv=None):
     r.add_argument("--normalize", action="store_true", help="z-score with the cache's TRAIN-split statistics")
     r.add_argument("--train-horizon", default="full", choices=["full", "task_min_step"])
     r.add_argument("--probe", default="temporary_mlp", help="registered name or 'package.module:factory'")
-    r.add_argument("--evaluator", default="temporary_max", help="registered name or 'package.module:factory'")
+    r.add_argument("--evaluator", default=DEFAULT_EVALUATOR,
+                   help=f"registered name ({', '.join(EVALUATORS)}) or 'package.module:factory' (default {DEFAULT_EVALUATOR})")
     r.add_argument("--seeds", type=int, nargs="+", default=list(TRAIN_SEEDS))
     r.add_argument("--threads", type=int, default=int(os.environ.get("SLURM_CPUS_PER_TASK", "0")) or None)
     r.add_argument("--loader", type=Path, default=None, help="path to collection/load_cache.py (default: this repo's)")
@@ -155,7 +158,7 @@ def main(argv=None):
     a.add_argument("--normalize", action="store_true")
     a.add_argument("--train-horizon", default="full", choices=["full", "task_min_step"])
     a.add_argument("--probe", default="temporary_mlp")
-    a.add_argument("--evaluator", default="temporary_max")
+    a.add_argument("--evaluator", default=DEFAULT_EVALUATOR)
     a.add_argument("--metric", default="roc_auc", help="metric drawn in the plot (any key the evaluator returns)")
     a.add_argument("--no-plot", action="store_true")
     a.add_argument("--bootstrap", type=int, default=int(os.environ.get("SWEEP_BOOTSTRAP", "1000")),

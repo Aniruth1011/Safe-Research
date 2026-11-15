@@ -22,16 +22,21 @@ before any file opens, and the tests check that no unseen file is ever opened.
 | R4 raw vs standardized | `SWEEP_NORMALIZE=1` (z-score with the cache's train-split statistics) vs `0` |
 | R2 fine sweep | needs replay or stored neighbours (plan note); not covered here |
 
-## TEMPORARY pieces
+## Probe and evaluator
 
-Both default plugins are placeholders, and anything they produce is **not a result**. Every row, `summary.csv`
-and the plot title say TEMPORARY.
+**Evaluator: `b4` (the default).** B4's shared evaluator, `failure_prob/engine/episode_metrics.py`: the episode score
+is the maximum per-step score before `min(length, task_min_step)` (as in SAFE), then ROC-AUC, PR-AUC computed as SAFE
+does, TPR at 5% FPR, and the task-mean ROC-AUC (`roc_auc_taskmean`). It is not temporary. The old placeholder
+stays selectable as `--evaluator temporary_max` (PR-AUC as average precision, no task-mean); the TEMPORARY R1 run (2026-11-11) used
+it, and aggregating their folders still uses it, because aggregation takes the evaluator from the folder's
+`config.json`.
 
-- **Probe (until B6, Aniruth's probe spec): `temporary_mlp`.** The registered `single_layer_mlp`
-  (D → 64 → 1, per timestep), trained with `failure_prob/engine/trainer.py`: Adam at lr 1e-3, 5 epochs, 8 rollouts per
-  batch, BCE on the rollout label at every step. No early stopping and no selection on seen_val.
-- **Evaluator (until B4, Rhea's evaluator): `temporary_max`.** The rollout score is the maximum per-step score
-  before the horizon. It reports ROC-AUC, PR-AUC and TPR at 5% FPR. This is not SAFE's exact protocol.
+**Probe: still TEMPORARY until B6's settings land**, so anything the sweep produces is **not a result** yet. Every
+row, `summary.csv` and the plot title say TEMPORARY.
+
+- **`temporary_mlp` (the default).** The registered `single_layer_mlp` (D → 64 → 1, per timestep), trained with
+  `failure_prob/engine/trainer.py`: Adam at lr 1e-3, 5 epochs, 8 rollouts per batch, BCE on the rollout label at
+  every step. No early stopping and no selection on seen_val.
 
 **Swapping them changes no other code.** Put a factory in any module and pass it by name:
 `--probe pkg.module:make_probe` (or `SWEEP_PROBE=...`). The same works for `--evaluator`. The contracts are in
@@ -168,8 +173,9 @@ for each layer:
 before scores were saved, like the TEMPORARY R1 run, get empty CI columns, and the log says which layers.
 Settings: `--bootstrap N` (0 = none) or `SWEEP_BOOTSTRAP`, and `--ci 0.95`.
 
-The aggregate job runs the resampling on 4 CPUs (4 GB, 30 min). With the TEMPORARY evaluator the full sweep is
-about 7 CPU-minutes. A slower B4 evaluator scales that linearly; lower `SWEEP_BOOTSTRAP` or raise `--time` if needed.
+The aggregate job runs the resampling on 4 CPUs (4 GB, 30 min). B4's evaluator takes about 4.5 ms per call on 140
+episodes (laptop), about 4 times the old placeholder, so the full sweep (35 layers × 3 seeds × 1,000) is about
+8 CPU-minutes, about 2–3 minutes on 4 CPUs. Lower `SWEEP_BOOTSTRAP` or raise `--time` if needed.
 
 **All-layer average (plan row S5).** This is a Hide-and-Seek-style baseline: a probe trained on averaged
 features, not the mean of the curve. The pseudo-layer `avg` builds the features as follows:
