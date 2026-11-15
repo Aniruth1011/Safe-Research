@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from dataclasses import asdict
 from pathlib import Path
 
@@ -25,6 +26,7 @@ import pandas as pd
 import torch
 
 SPLITS = ("train", "seen_val", "unseen_test")
+HORIZONS = ("full", "task_min_step")
 
 
 class SharedCache:
@@ -39,15 +41,25 @@ class SharedCache:
         key = (pool, split, layer)
         if key not in self._mm:
             path = self.root / "features" / pool / split / f"L{layer:02d}.npy"
-            if not path.exists():
-                hint = " (unseen features are withheld until the locked final benchmark)" if split == "unseen_test" else ""
+            hint = " (unseen features are withheld until the locked final benchmark)" if split == "unseen_test" else ""
+            try:  # on the shared CARC cache unseen_test/ is drwx------: even exists() is a PermissionError there
+                present = path.exists()
+                if present:
+                    self._mm[key] = np.load(path, mmap_mode="r")
+            except PermissionError:
+                raise PermissionError(f"{path}: permission denied{hint or ' (ask the cache owner for read access)'}") \
+                    from None
+            if not present:
                 raise FileNotFoundError(f"{path} not present in this copy of the cache{hint}")
-            self._mm[key] = np.load(path, mmap_mode="r")
         return self._mm[key]
 
     def norm_stats(self, pool: str, layers: list[int]) -> tuple[np.ndarray, np.ndarray]:
         z = np.load(self.root / "norm_stats" / f"{pool}.npz")
         pos = {int(l): i for i, l in enumerate(z["layers"])}
+        missing = [l for l in layers if l not in pos]
+        if missing:
+            raise ValueError(f"norm_stats/{pool}.npz has no statistics for layers {missing} "
+                             f"(it covers {sorted(pos)}); was the cache built with a --layers subset?")
         idx = [pos[l] for l in layers]
         return z["mean"][idx], np.maximum(z["std"][idx], 1e-6)
 
@@ -57,11 +69,19 @@ class SharedCache:
         unseen_test is locked unless allow_unseen=True (only for the final locked benchmark, Exp 37)."""
         if split not in SPLITS:
             raise ValueError(f"split must be one of {SPLITS}")
+        if horizon not in HORIZONS:  # A9-2: anything but "full" used to be treated as task_min_step
+            raise ValueError(f"horizon must be one of {HORIZONS}, got {horizon!r}")
+        pools = self.manifest.get("pools_exported")
+        if pools is not None and pool not in pools:  # same error on case-insensitive (macOS) and Linux file systems
+            raise ValueError(f"pool {pool!r} not in this cache (pools_exported: {list(pools)})")
         if split == "unseen_test" and not allow_unseen:
             raise PermissionError("unseen_test is locked until the final benchmark (Exp 37); pass allow_unseen=True only then")
         bad = [l for l in layers if not 0 <= l < len(self.layer_names)]
         if bad:
             raise ValueError(f"layers {bad} not in this cache (indices 0..{len(self.layer_names) - 1}: {self.layer_names[-1]})")
+        dup = sorted({l for l in layers if list(layers).count(l) > 1})
+        if dup:  # A9-3: a duplicated key silently duplicated that layer in the features
+            raise ValueError(f"duplicate layers {dup}: each layer may appear once")
         arrays = [self._array(pool, split, l) for l in layers]
         mean = std = None
         if normalize:
@@ -93,7 +113,14 @@ def manifest_layer_names(manifest: dict) -> list[str]:
 
 
 def export(cache_root: Path, out: Path, layers: list[int], pool: str, splits: list[str], normalize: bool,
-           allow_unseen: bool = False):
+           allow_unseen: bool = False, horizon: str = "task_min_step"):
+    """horizon defaults to task_min_step (A9-1): full-length episodes reveal the label through their length.
+    The horizon is recorded in the metadata's `pooling` string (e.g. "mean+trainnorm+h=task_min_step")."""
+    if horizon not in HORIZONS:
+        raise ValueError(f"horizon must be one of {HORIZONS}, got {horizon!r}")
+    if horizon == "full":
+        print("WARNING: horizon=full keeps whole rollouts; failures run to the step limit, so length reveals the "
+              "label. Do not score or report on this export.", file=sys.stderr)
     try:
         from failure_prob.data.feature_store import FeatureMetadata, FeatureStore
     except ImportError as e:
@@ -101,16 +128,16 @@ def export(cache_root: Path, out: Path, layers: list[int], pool: str, splits: li
     cache = SharedCache(cache_root)
     m = cache.manifest
     for split in splits:
-        recs = cache.records(split, layers, pool, normalize=normalize, allow_unseen=allow_unseen)
+        recs = cache.records(split, layers, pool, normalize=normalize, horizon=horizon, allow_unseen=allow_unseen)
         meta = FeatureMetadata(
             backbone=m["backbone"], checkpoint=m["checkpoint"], dataset=m["dataset"],
             split_version=f"{m['cache_version']}:{split}", layers=tuple(layers),
-            pooling=pool + ("+trainnorm" if normalize else ""), dtype="float32",
+            pooling=pool + ("+trainnorm" if normalize else "") + f"+h={horizon}", dtype="float32",
             layer_indexing="hf_hidden_states(0=embeddings,32=final)" + (",33=block32_prenorm" if len(cache.layer_names) == 34 else ""),
             num_layers=len(cache.layer_names),
         )
         FeatureStore(out / split).save(recs, meta)
-        print(f"{split}: {len(recs)} trajectories -> {out / split}")
+        print(f"{split}: {len(recs)} trajectories (horizon {horizon}) -> {out / split}")
 
 
 def main():
@@ -123,9 +150,15 @@ def main():
     e.add_argument("--pool", default="mean")
     e.add_argument("--splits", nargs="+", default=["train", "seen_val"])
     e.add_argument("--normalize", action="store_true", help="z-score with TRAIN-split statistics")
+    e.add_argument("--horizon", default="task_min_step", choices=HORIZONS,
+                   help="task_min_step (default; SAFE's per-task horizon) or full (whole rollouts, label leaks via length)")
     e.add_argument("--allow-unseen", action="store_true", help="only for the final locked benchmark (Exp 37)")
     args = ap.parse_args()
-    export(args.cache, args.out, args.layers, args.pool, args.splits, args.normalize, args.allow_unseen)
+    try:
+        export(args.cache, args.out, args.layers, args.pool, args.splits, args.normalize, args.allow_unseen,
+               args.horizon)
+    except (ValueError, PermissionError, FileNotFoundError) as e:
+        raise SystemExit(f"error: {e}") from None
 
 
 if __name__ == "__main__":
