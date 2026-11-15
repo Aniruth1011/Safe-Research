@@ -130,9 +130,11 @@ Spend: `friend` ~$13.9 (function time + start-up), upper bound $14.34 (watchdog)
    metric, not a result) completed on CARC on 2026-11-11: 34 layers × 3 seeds. The sweep now also has bootstrap CIs,
    a per-task breakdown and the S5 all-layer average (`--layers avg`; definition for Rhea's review in
    [`09_S5_ALL_LAYER_AVERAGE.md`](09_S5_ALL_LAYER_AVERAGE.md)). B4's evaluator (`episode_metrics`, on main) is
-   the sweep default since 2026-11-15 (`temporary_max` stays selectable). The probe waits for B6: the shared probe
-   is the framework `single_layer_mlp` trained with `failure_prob/engine/trainer.py`; Aniruth sends the settings.
-   Until then every sweep output is TEMPORARY. No CARC runs until Akash says. SAFE reference line: only from C4
+   the sweep default since 2026-11-15 (`temporary_max` stays selectable). B6 is locked (2026-11-15): the shared
+   probe is `--probe framework_mlp` with its defaults (framework `single_layer_mlp` via `trainer.py`; lr 3e-4,
+   hidden 64, dropout 0.1, batch 8, up to 150 epochs, early stopping on 15% of train, patience 10). Only those
+   exact settings are not TEMPORARY; their folders end in `framework_mlp_b6-b4`. The real R1 (normalized) and R4
+   (raw) runs, 34 layers + avg × 3 seeds, are submitted on CARC (2026-11-15). SAFE reference line: only from C4
    (Adarsh's SAFE model re-scored by our evaluator).
 3. Done 2026-11-12: the fork's `backup/extraction-pre-rebase-2026-11-10` was deleted after PR #3 merged.
 

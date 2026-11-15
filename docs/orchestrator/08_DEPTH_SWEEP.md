@@ -34,20 +34,29 @@ it, and aggregating their folders still uses it, because aggregation takes the e
 **Probe: still TEMPORARY until B6's settings land**, so anything the sweep produces is **not a result** yet. Every
 row, `summary.csv` and the plot title say TEMPORARY.
 
-- **`temporary_mlp` (the default).** The registered `single_layer_mlp` (D → 64 → 1, per timestep), trained with
+- **`temporary_mlp` (the old placeholder; still the CLI default `--probe`).** The registered `single_layer_mlp` (D → 64 → 1, per timestep), trained with
   `failure_prob/engine/trainer.py`: Adam at lr 1e-3, 5 epochs, 8 rollouts per batch, BCE on the rollout label at
   every step. No early stopping and no selection on seen_val.
-- **`framework_mlp` (the B6 probe; settings pending).** Aniruth's framework model `single_layer_mlp`, trained with
-  `failure_prob/engine/trainer.py` the way `scripts/train.py` trains the fusion models (seed, `get_model`,
-  `train_model`, per-step logits from `failure_prob/engine/scoring.py`). Every setting is an argument:
-  `--probe-arg key=value` (repeatable), or `SWEEP_PROBE_ARGS="key=value key=value"` for the Slurm jobs. The settings
-  are `hidden_dim`, `dropout`, `lr`, `epochs`, `batch_size`, and for early stopping `early_stopping_patience`
-  (0 = off), `es_holdout_fraction`, `es_monitor` (`loss` or `roc_auc`) and `es_min_delta`. The defaults
-  (64, 0.0, 1e-3, 5, 8, off) are placeholders, so its outputs say TEMPORARY until Aniruth's locked values are in.
-  Early stopping holds out part of **train** (stratified by task and outcome, picked with the seed) and never looks at
-  seen_val. The effective settings are written to `config.json` and every row (`probe_settings`), and a digest of them
-  is part of the folder name, so different settings never share a folder. Rows also get `probe_fit` (epochs run,
-  best epoch, loss curves).
+- **`framework_mlp` (the B6 probe; settings locked 2026-11-15).** Aniruth's framework model `single_layer_mlp`,
+  trained with `failure_prob/engine/trainer.py` the way `scripts/train.py` trains the fusion models (seed,
+  `get_model`, `train_model`, per-step logits scored like `failure_prob/engine/scoring.py`).
+  - **Defaults = the locked B6 settings** (`B6_SETTINGS` in `sweep_plugins.py`): hidden_dim 64, dropout 0.1,
+    lr 3e-4, batch_size 8, at most 150 epochs, early stopping with patience 10 on the loss of a 15% holdout of
+    **train** (stratified by task and outcome, picked with the seed; `es_monitor` loss, `es_min_delta` 0). The model
+    is trained on the other 85% of train and the best epoch's weights are kept; seen_val is never used for this.
+  - **Only these exact settings are the real probe:** rows say `probe = framework_mlp`, `TEMPORARY = False`, and the
+    folder is `<pool>-<norm>-train_<horizon>-framework_mlp_b6-b4`.
+  - **Any other setting is exploratory:** `--probe-arg key=value` (repeatable) or `SWEEP_PROBE_ARGS="key=value ..."`
+    for the Slurm jobs. The settings are `hidden_dim`, `dropout`, `lr`, `epochs`, `batch_size`,
+    `early_stopping_patience` (0 = off), `es_holdout_fraction`, `es_monitor` (`loss` or `roc_auc`) and
+    `es_min_delta`. Such runs are named `TEMPORARY_framework_mlp`, say TEMPORARY everywhere, and their folder carries
+    an 8-character digest of the settings, so different settings never share a folder.
+  - The effective settings are written to `config.json` and every row (`probe_settings`). Rows also get `probe_fit`
+    (epochs run, best epoch, loss curves).
+  - **B6 calibration (2026-11-15, layer 32, normalized, seeds 0-2):** lr {3e-4, 1e-3} x hidden {64, 256} with the
+    other settings above. Pooled / task-mean ROC-AUC: 0.754 / 0.674 (3e-4, 64), 0.756 / 0.688 (3e-4, 256),
+    0.726 / 0.637 (1e-3, 64), 0.743 / 0.671 (1e-3, 256); 95% CIs about +-0.07. The best epoch was 1-6 in every run.
+    Those runs are TEMPORARY (they predate the lock); the lr 3e-4 / 64 run used the same settings as B6.
 
 **Swapping them changes no other code.** Put a factory in any module and pass it by name:
 `--probe pkg.module:make_probe` (or `SWEEP_PROBE=...`). The same works for `--evaluator`. The contracts are in

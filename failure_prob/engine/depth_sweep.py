@@ -324,9 +324,11 @@ class SweepConfig:
     def label(self) -> str:
         safe = lambda s: s.replace(":", "-").replace(".", "_").replace("/", "_")
         probe = safe(self.probe)
-        settings = self.probe_settings()
-        if settings is not None:   # different settings (or new defaults) never share a folder
-            probe += "_" + hashlib.sha256(json.dumps(settings, sort_keys=True).encode()).hexdigest()[:8]
+        obj = self.make_probe()
+        settings = obj.settings() if hasattr(obj, "settings") else None
+        if settings is not None:   # different settings never share a folder: a fixed tag for a probe's locked
+            tag = getattr(obj, "folder_tag", None)  # settings (framework_mlp: "b6"), otherwise a digest of them
+            probe += "_" + (tag or hashlib.sha256(json.dumps(settings, sort_keys=True).encode()).hexdigest()[:8])
         return f"{self.pool}-{'trainnorm' if self.normalize else 'raw'}-train_{self.train_horizon}-{probe}-{safe(self.evaluator)}"
 
 

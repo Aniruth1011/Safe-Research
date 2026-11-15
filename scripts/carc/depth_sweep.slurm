@@ -28,8 +28,9 @@
 # leave the log empty. A process stuck in uninterruptible I/O (state D) ignores every signal, even SIGKILL, so its
 # own stack cannot be printed; the start-up watchdog prints it from a second thread instead.
 #
-# Sizing (TEMPORARY probe), measured on CARC 2026-11-11 with the real cache, 4 CPUs: 39-50 s per task, peak about
-# 4.1 GB. Requests: 6 GB and 4 min. Re-measure with a 2-layer run when the real probe (plan row B6) lands.
+# Sizing, measured on CARC with the real cache, 4 CPUs: TEMPORARY probe (2026-11-11) 39-50 s per task, peak about
+# 4.1 GB; B6 framework_mlp at layer 32 (2026-11-15, early stopping at epochs 12-16) about 1 min, peak about 3.1 GB.
+# Requests: 6 GB and 4 min.
 set -euo pipefail
 die() { echo "depth_sweep.slurm: $*" >&2; exit 1; }
 [ -n "${SLURM_JOB_ID:-}" ] || die "submit with sbatch (CPU job); never run this on a login node"

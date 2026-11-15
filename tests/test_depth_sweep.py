@@ -837,7 +837,7 @@ def test_cli_and_slurm_default_to_the_b4_evaluator():
         assert '--evaluator "${SWEEP_EVALUATOR:-b4}"' in text and "temporary_max" not in text
 
 
-# ------------------------------------------------------------------------- framework_mlp probe (B6, settings pending)
+# ------------------------------------------------------------------------- framework_mlp probe (B6, locked 2026-11-15)
 def _toy_records(n=24, t=6, d=4, seed=0, tasks=(1, 2)):
     import torch
     rng = np.random.default_rng(seed)
@@ -851,15 +851,28 @@ def _toy_records(n=24, t=6, d=4, seed=0, tasks=(1, 2)):
     return out
 
 
-def test_framework_mlp_every_setting_is_an_argument_and_it_stays_temporary():
-    from failure_prob.engine.sweep_plugins import FrameworkMLPProbe, PROBES, resolve
+def test_framework_mlp_every_setting_is_an_argument_and_only_b6_is_not_temporary():
+    from failure_prob.engine.sweep_plugins import B6_SETTINGS, FrameworkMLPProbe, PROBES, resolve
     p = resolve("framework_mlp", PROBES, hidden_dim="32", dropout="0.1", lr="0.01", epochs="3", batch_size="4",
                 early_stopping_patience="2", es_holdout_fraction="0.25", es_monitor="roc_auc", es_min_delta="0.001")
     assert isinstance(p, FrameworkMLPProbe)
     assert p.settings() == {"hidden_dim": 32, "dropout": 0.1, "lr": 0.01, "epochs": 3, "batch_size": 4,
                             "early_stopping_patience": 2, "es_holdout_fraction": 0.25, "es_monitor": "roc_auc",
                             "es_min_delta": 0.001}
-    assert p.temporary is True and p.name.startswith("TEMPORARY")      # placeholders until Aniruth's settings
+    assert p.temporary is True and p.name == "TEMPORARY_framework_mlp" and p.folder_tag is None   # exploratory
+    # the defaults are exactly the locked B6 settings, and only those are the real probe
+    assert B6_SETTINGS == {"hidden_dim": 64, "dropout": 0.1, "lr": 3e-4, "epochs": 150, "batch_size": 8,
+                           "early_stopping_patience": 10, "es_holdout_fraction": 0.15, "es_monitor": "loss",
+                           "es_min_delta": 0.0}
+    b6 = resolve("framework_mlp", PROBES)
+    assert b6.settings() == B6_SETTINGS and b6.temporary is False and b6.name == "framework_mlp"
+    assert b6.folder_tag == "b6"
+    same = resolve("framework_mlp", PROBES, lr="0.0003", hidden_dim="64", dropout="0.1", epochs="150")
+    assert same.temporary is False                                   # the same values, spelled out
+    for k, v in {"lr": "1e-3", "hidden_dim": "256", "dropout": "0", "epochs": "149", "es_monitor": "roc_auc",
+                 "early_stopping_patience": "0", "es_holdout_fraction": "0.2"}.items():
+        changed = resolve("framework_mlp", PROBES, **{k: v})
+        assert changed.temporary is True and changed.name.startswith("TEMPORARY") and changed.folder_tag is None, k
     assert set(resolve("framework_mlp", PROBES).settings()) == set(p.settings())
     with pytest.raises(ValueError, match="unknown setting"):
         resolve("framework_mlp", PROBES, hidden=8)
@@ -886,12 +899,12 @@ def test_framework_mlp_trains_like_scripts_train_py(monkeypatch):
     real = trainer.train_model
     monkeypatch.setattr(trainer, "train_model", lambda model, records, **kw: calls.append((model, len(records), kw))
                         or real(model, records, **kw))
-    probe = make_framework_mlp(hidden_dim=16, dropout=0.2, lr=0.01, epochs=3, batch_size=4)
+    probe = make_framework_mlp(hidden_dim=16, dropout=0.2, lr=0.01, epochs=3, batch_size=4, early_stopping_patience=0)
     fitted = probe.fit(recs, seed=1)
     model, n, kw = calls[0]
     assert isinstance(model, SingleLayerMLP) and model.hidden_dim == 16 and model.head.net[2].p == 0.2
     assert n == len(recs) and kw["epochs"] == 3 and kw["batch_size"] == 4 and kw["lr"] == 0.01 and kw["seed"] == 1
-    assert kw["on_epoch_end"] is None                                    # early stopping off by default
+    assert kw["on_epoch_end"] is None                                    # early stopping off (patience 0)
     got = fitted.step_scores(recs)
     torch.manual_seed(1)                                                 # the same steps by hand
     ref = get_model("single_layer_mlp", input_dim=4, num_layers=1, hidden_dim=16, dropout=0.2, layer_index=0)
@@ -901,9 +914,11 @@ def test_framework_mlp_trains_like_scripts_train_py(monkeypatch):
         want = [ref(trainer.collate_records([r])).failure_logits[0].double().numpy() for r in recs]
     assert all(np.allclose(a, b, rtol=0, atol=1e-6) for a, b in zip(got, want))
     assert [len(s) for s in got] == [r["features"].shape[1] for r in recs]   # every step of every rollout
-    again = make_framework_mlp(hidden_dim=16, dropout=0.2, lr=0.01, epochs=3, batch_size=4).fit(recs, 1)
+    again = make_framework_mlp(hidden_dim=16, dropout=0.2, lr=0.01, epochs=3, batch_size=4,
+                               early_stopping_patience=0).fit(recs, 1)
     assert all(np.array_equal(a, b) for a, b in zip(got, again.step_scores(recs)))       # reproducible
-    other = make_framework_mlp(hidden_dim=16, dropout=0.2, lr=0.01, epochs=3, batch_size=4).fit(recs, 2)
+    other = make_framework_mlp(hidden_dim=16, dropout=0.2, lr=0.01, epochs=3, batch_size=4,
+                               early_stopping_patience=0).fit(recs, 2)
     assert not all(np.array_equal(a, b) for a, b in zip(got, other.step_scores(recs)))   # seeded
 
 
@@ -925,7 +940,7 @@ def test_framework_mlp_early_stopping_holds_out_train_episodes_only():
     # checking the holdout does not change the training order: same losses as training on `fit` without it
     for monitor in ("loss", "roc_auc"):
         p = make_framework_mlp(epochs=4, batch_size=4, early_stopping_patience=10, es_holdout_fraction=0.3,
-                               es_monitor=monitor)
+                               es_monitor=monitor, dropout=0.0, lr=1e-3)
         info = p.fit(recs, seed=0).fit_info
         import torch
         from failure_prob.models import get_model
@@ -951,13 +966,29 @@ def test_framework_mlp_in_the_sweep_records_settings_and_separates_folders(cache
     other = cfg(cache, probe="framework_mlp", probe_args=(("epochs", "3"), ("hidden_dim", "8")))
     default = cfg(cache, probe="framework_mlp")
     assert len({c.label(), other.label(), default.label()}) == 3 and "framework_mlp_" in c.label()
-    assert cfg(cache, probe="framework_mlp", probe_args=(("epochs", "5"),)).label() == default.label()  # 5 = default
+    assert cfg(cache, probe="framework_mlp", probe_args=(("epochs", "150"),)).label() == default.label()  # = B6
+    assert default.label() == "mean-raw-train_full-framework_mlp_b6-b4"   # locked B6 settings: fixed tag, no digest
+    assert "framework_mlp_b6" not in c.label() and "framework_mlp_b6" not in other.label()
     with pytest.raises(ValueError, match="different configuration"):
         ds.run_layer(other, 2, tmp_path / "a", log=lambda m: None)
     summary = pd.read_csv(ds.aggregate(tmp_path / "a", plot=False, bootstrap=10)["summary"])
     assert summary.TEMPORARY.all()
     # the placeholder probe's folders are unchanged (no settings, no digest)
     assert cfg(cache).label() == "mean-raw-train_full-temporary_mlp-b4"
+
+
+def test_locked_b6_probe_in_the_sweep_is_not_temporary(cache, tmp_path):
+    c = cfg(cache, seeds=(0,), probe="framework_mlp")
+    out = tmp_path / c.label()
+    row = ds.run_layer(c, 2, out, log=lambda m: None)[0]
+    assert row["probe"] == "framework_mlp" and row["TEMPORARY"] is False
+    from failure_prob.engine.sweep_plugins import B6_SETTINGS
+    assert json.loads(row["probe_settings"]) == B6_SETTINGS
+    fit = json.loads(row["probe_fit"])
+    assert fit["n_holdout_rollouts"] > 0 and fit["epochs_run"] <= 150 and 1 <= fit["best_epoch"] <= fit["epochs_run"]
+    assert json.loads((out / "config.json").read_text())["probe_settings"] == B6_SETTINGS
+    summary = pd.read_csv(ds.aggregate(out, plot=False, bootstrap=10)["summary"])
+    assert not summary.TEMPORARY.any()
 
 
 def test_records_carry_task_min_steps(cache):

@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import importlib
 from dataclasses import dataclass, fields
-from typing import Callable, ClassVar, Protocol, Sequence
+from typing import Callable, Protocol, Sequence
 
 import numpy as np
 
@@ -178,6 +178,12 @@ def _holdout_split(records, fraction: float, seed: int):
     return fit, held
 
 
+# Plan row B6, locked by Aniruth on 2026-11-15: the shared probe's settings (framework_mlp's defaults). Early
+# stopping watches the loss on 15% of TRAIN (es_monitor "loss", es_min_delta 0); seen_val is never used for it.
+B6_SETTINGS = {"hidden_dim": 64, "dropout": 0.1, "lr": 3e-4, "epochs": 150, "batch_size": 8,
+               "early_stopping_patience": 10, "es_holdout_fraction": 0.15, "es_monitor": "loss", "es_min_delta": 0.0}
+
+
 @dataclass
 class FrameworkMLPProbe:
     """The shared depth-sweep probe (plan row B6): Aniruth's framework model `single_layer_mlp`
@@ -185,9 +191,10 @@ class FrameworkMLPProbe:
     scripts/train.py trains the fusion models: torch.manual_seed(seed), get_model(...), train_model(...) (Adam,
     BCE on the rollout label at every valid step), then per-step logits scored like failure_prob/engine/scoring.py.
 
-    Every setting is an argument (`--probe-arg key=value`, or SWEEP_PROBE_ARGS in the Slurm jobs). The DEFAULTS ARE
-    PLACEHOLDERS until Aniruth sends the locked B6 settings, so this probe is TEMPORARY and every output says so.
-    When the settings arrive, put them in as defaults and set `temporary = False` and `name = "framework_mlp"`.
+    Every setting is an argument (`--probe-arg key=value`, or SWEEP_PROBE_ARGS in the Slurm jobs). The defaults are
+    the locked B6 settings (B6_SETTINGS, from Aniruth, 2026-11-15). Only those exact settings are the real probe
+    (name "framework_mlp", not temporary, folder tag "b6"); any other setting is exploratory, so it is named
+    "TEMPORARY_framework_mlp", every output says TEMPORARY, and its folder carries a digest of the settings.
 
     Early stopping is off when early_stopping_patience == 0. When on, it holds out es_holdout_fraction of the TRAIN
     episodes (stratified by task and outcome, chosen with the seed), trains on the rest, checks es_monitor on the
@@ -195,17 +202,33 @@ class FrameworkMLPProbe:
     ROC-AUC at min(length, task_min_step), higher is better), stops after `patience` epochs without an improvement
     larger than es_min_delta, and restores the best epoch's weights. seen_val is never used for any of this.
     """
-    hidden_dim: int = 64
-    dropout: float = 0.0
-    lr: float = 1e-3
-    epochs: int = 5
-    batch_size: int = 8
-    early_stopping_patience: int = 0
-    es_holdout_fraction: float = 0.2
-    es_monitor: str = "loss"
-    es_min_delta: float = 0.0
-    name: ClassVar[str] = "TEMPORARY_framework_mlp"
-    temporary: ClassVar[bool] = True
+    hidden_dim: int = B6_SETTINGS["hidden_dim"]
+    dropout: float = B6_SETTINGS["dropout"]
+    lr: float = B6_SETTINGS["lr"]
+    epochs: int = B6_SETTINGS["epochs"]
+    batch_size: int = B6_SETTINGS["batch_size"]
+    early_stopping_patience: int = B6_SETTINGS["early_stopping_patience"]
+    es_holdout_fraction: float = B6_SETTINGS["es_holdout_fraction"]
+    es_monitor: str = B6_SETTINGS["es_monitor"]
+    es_min_delta: float = B6_SETTINGS["es_min_delta"]
+
+    @property
+    def locked(self) -> bool:
+        """True only for exactly the locked B6 settings."""
+        return self.settings() == B6_SETTINGS
+
+    @property
+    def name(self) -> str:
+        return "framework_mlp" if self.locked else "TEMPORARY_framework_mlp"
+
+    @property
+    def temporary(self) -> bool:
+        return not self.locked
+
+    @property
+    def folder_tag(self) -> str | None:
+        """Short folder tag for the locked settings; None means the sweep tags the folder with a settings digest."""
+        return "b6" if self.locked else None
 
     def __post_init__(self):
         checks = {"hidden_dim": self.hidden_dim >= 1, "dropout": 0.0 <= self.dropout < 1.0, "lr": self.lr > 0,
