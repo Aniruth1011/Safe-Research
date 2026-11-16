@@ -26,7 +26,8 @@ from pathlib import Path
 from failure_prob import fusion_runner as FR
 
 EXPERIMENT_MARKER = "fusion_experiments_output"
-DEFAULT_GRID = {"lr": [1e-3, 3e-4], "dropout": [0.0, 0.2], "weight_decay": [0.0, 1e-4]}
+# Compact search around the locked B6 probe (lr 3e-4, dropout 0.1, weight decay 0); the B6 point is one of the 8.
+DEFAULT_GRID = {"lr": [3e-4, 1e-3], "dropout": [0.1, 0.3], "weight_decay": [0.0, 1e-4]}
 
 
 def load_once(cfg: FR.RunConfig) -> tuple[dict, dict]:

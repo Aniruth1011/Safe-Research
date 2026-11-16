@@ -18,7 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from failure_prob.fusion_runner import AGGREGATIONS, HORIZONS, RunConfig, run  # noqa: E402
+from failure_prob.fusion_runner import AGGREGATIONS, B4_EVALUATOR, HORIZONS, RunConfig, run  # noqa: E402
 from failure_prob.models import list_models  # noqa: E402
 from failure_prob.models.probe_heads import HEADS  # noqa: E402
 from failure_prob.protocol import TRAIN_SEEDS  # noqa: E402
@@ -43,16 +43,22 @@ def common_parser() -> argparse.ArgumentParser:
     p.add_argument("--seeds", type=int, nargs="+", default=list(TRAIN_SEEDS))
     p.add_argument("--head", default="mlp", choices=HEADS)
     p.add_argument("--hidden-dim", type=int, default=64)
-    p.add_argument("--dropout", type=float, default=0.0)
-    p.add_argument("--epochs", type=int, default=5)
+    p.add_argument("--dropout", type=float, default=0.1)
+    p.add_argument("--epochs", type=int, default=150, help="at most (early stopping)")
     p.add_argument("--batch-size", type=int, default=8)
-    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--grad-clip", type=float, default=0.0)
-    p.add_argument("--select-best-epoch", action="store_true", help="keep the epoch with the best seen_val ROC-AUC")
+    p.add_argument("--select-best-epoch", action="store_true",
+                   help="keep the epoch with the best seen_val ROC-AUC (needs --early-stopping-patience 0)")
+    p.add_argument("--early-stopping-patience", type=int, default=10,
+                   help="B6: stop after this many epochs without a lower TRAIN-holdout loss (0 = off)")
+    p.add_argument("--es-holdout-fraction", type=float, default=0.15, help="B6: share of train held out")
+    p.add_argument("--es-min-delta", type=float, default=0.0)
     p.add_argument("--aggregation", default="max", choices=AGGREGATIONS, help="episode score from step logits")
-    p.add_argument("--evaluator", default=None, help="shared evaluator (B4): a depth-sweep registered name or "
-                   "'package.module:factory'; default: the built-in provisional scorer")
+    p.add_argument("--evaluator", default=B4_EVALUATOR,
+                   help="episode scorer: default B4 (the team's SAFE-equivalent evaluator); 'builtin' for the "
+                   "fusion_runner scorer, or a depth-sweep registered name / 'package.module:factory'")
     p.add_argument("--allow-duplicate-layers", action="store_true",
                    help="allow a layer more than once, e.g. --layers 33 33 33 (duplicate-strongest-layer control)")
     p.add_argument("--fixed-weights", dest="learn_weights", action="store_false",

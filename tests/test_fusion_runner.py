@@ -27,7 +27,8 @@ def cache(tmp_path_factory):
 
 
 def cfg(out, **kw):
-    base = dict(model="static_weight_fusion", layers=[16, 33], output_dir=str(out), epochs=2, batch_size=4)
+    base = dict(model="static_weight_fusion", layers=[16, 33], output_dir=str(out), epochs=2, batch_size=4,
+                early_stopping_patience=0)  # the tiny test cache has 1 episode per task x outcome: no B6 holdout
     return FR.RunConfig(**(base | kw))
 
 
@@ -46,7 +47,9 @@ def test_cache_run_end_to_end_and_never_reads_unseen(cache, tmp_path, monkeypatc
     assert len(summary["metrics"]["layer_weights"]["mean"]) == 2
     conf = json.loads((out / "config.json").read_text())
     assert conf["provenance"]["layer_names"] == ["block16", "block32_prenorm"]
-    assert "B4" in conf["provisional"]["episode_scorer"] and "B6" in conf["provisional"]["probe"]
+    # default scorer is B4 (not provisional); the test config differs from B6 (2 epochs, no early stopping)
+    assert "episode_scorer" not in conf["provisional"] and "B6" in conf["provisional"]["probe"]
+    assert "epochs" in conf["provisional"]["probe"] and "early_stopping_patience" in conf["provisional"]["probe"]
 
     eps = pd.read_csv(cache / "episodes.csv")
     val = eps[eps.split == "seen_val"].set_index("trajectory_id")
@@ -97,7 +100,8 @@ def test_full_horizon_is_longer_and_warned(cache, tmp_path, capsys):
 def test_cli_on_cache(cache, tmp_path):
     r = subprocess.run([sys.executable, str(REPO / "scripts" / "run_fusion.py"), "--model", "concat_fusion",
                         "--layers", "4", "33", "--cache", str(cache), "--output-dir", str(tmp_path / "cli"),
-                        "--epochs", "1", "--seeds", "2", "--pool", "last", "--no-normalize"],
+                        "--epochs", "1", "--seeds", "2", "--pool", "last", "--no-normalize",
+                        "--early-stopping-patience", "0"],
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     conf = json.loads((tmp_path / "cli" / "config.json").read_text())["config"]
@@ -560,3 +564,52 @@ def test_duplicate_layers_only_with_the_flag_and_copied_from_one_read(cache, tmp
     assert prov["duplicate_layers"] and len(prov["layer_names"]) == 3
     s = FR.run(c)
     assert s["layers"] == [33, 33, 16]
+
+
+# --------------------------------------------------------------------------- B6 probe settings + early stopping
+
+def test_defaults_are_the_locked_b6_probe_and_the_b4_scorer():
+    c = FR.RunConfig(model="concat_fusion", layers=[31], output_dir="x", synthetic=True)
+    assert FR.b6_settings_of(c) == FR.B6_SETTINGS
+    assert c.evaluator == FR.B4_EVALUATOR
+    assert FR.provisional_flags(FR.resolve_evaluator(c.evaluator), c) == {}  # nothing provisional at B6 + B4
+    flags = FR.provisional_flags(None, FR.RunConfig(model="concat_fusion", layers=[31], output_dir="x", lr=1e-3))
+    assert "lr" in flags["probe"] and "episode_scorer" in flags
+
+
+def _es_records(n=40, seed=0):
+    recs = make_synthetic_records(n=n, t=6, k=2, d=8, seed=seed)
+    for i, r in enumerate(recs):
+        r["task_ids"] = [i % 4]
+    return recs
+
+
+def test_holdout_split_is_stratified_seeded_and_disjoint():
+    recs = _es_records()
+    fit, held = FR.holdout_split(recs, 0.15, seed=1)
+    ids = lambda rs: [r["trajectory_ids"][0] for r in rs]  # noqa: E731
+    assert not set(ids(fit)) & set(ids(held)) and len(fit) + len(held) == len(recs)
+    groups = {(r["task_ids"][0], int(r["labels"].item())) for r in recs}
+    assert {(r["task_ids"][0], int(r["labels"].item())) for r in held} == groups  # every task x outcome held out
+    assert ids(FR.holdout_split(recs, 0.15, seed=1)[1]) == ids(held)               # same seed, same holdout
+    assert ids(FR.holdout_split(recs, 0.15, seed=2)[1]) != ids(held)
+    with pytest.raises(ValueError, match="both outcomes"):
+        FR.holdout_split([r for r in recs if r["labels"].item() == 1], 0.15, seed=0)
+
+
+def test_early_stopping_restores_the_best_holdout_epoch_and_never_uses_seen_val():
+    recs = _es_records(seed=3)
+    val = _es_records(n=12, seed=9)
+    c = FR.RunConfig(model="concat_fusion", layers=[0, 1], output_dir="x", synthetic=True, epochs=60,
+                     early_stopping_patience=3, lr=3e-2)
+    m = FR.get_model("concat_fusion", **FR.model_kwargs(c, 8))
+    out = FR.train_one(m, recs, val, c, seed=0)
+    losses = [h["holdout_loss"] for h in out["history"]]
+    best = int(np.argmin(losses)) + 1
+    assert out["chosen_epoch"] == best and out["epochs_run"] == min(60, best + 3)
+    assert out["n_fit_rollouts"] + out["n_holdout_rollouts"] == len(recs) and out["n_holdout_rollouts"] > 0
+    _, held = FR.holdout_split(recs, 0.15, 0)
+    assert FR.holdout_loss(m, held, 8) == pytest.approx(losses[best - 1], rel=1e-5)  # best weights restored
+    with pytest.raises(ValueError, match="choose one"):
+        FR.validate_config(FR.RunConfig(model="concat_fusion", layers=[0], output_dir="x", synthetic=True,
+                                        select_best_epoch=True))

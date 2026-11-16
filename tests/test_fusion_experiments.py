@@ -109,7 +109,7 @@ def test_cli_search_and_kcurve(cache, tmp_path):  # noqa: F811
     script = REPO / "scripts" / "fusion_experiments.py"
     r = subprocess.run([sys.executable, str(script), "search", "--model", "concat_fusion", "--layers", "16", "33",
                         "--cache", str(cache), "--output-dir", str(tmp_path / "s"), "--epochs", "1", "--seeds", "0",
-                        "--lrs", "1e-3", "--dropouts", "0", "--weight-decays", "0", "--no-checkpoints"],
+                        "--early-stopping-patience", "0", "--lrs", "1e-3", "--dropouts", "0", "--weight-decays", "0", "--no-checkpoints"],
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     assert (tmp_path / "s" / "best.json").exists()
