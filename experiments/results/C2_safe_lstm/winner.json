@@ -1,0 +1,31 @@
+{
+  "model": "lstm",
+  "selection_metric": "falert_early_roc_auc/model_val_seen",
+  "config": {
+    "dataset.name": "openvla_cache",
+    "dataset.layer": "32",
+    "dataset.token_idx_rel": "mean",
+    "model.lr": "0.0003",
+    "model.lambda_reg": "1.0",
+    "model.batch_size": "64",
+    "model.n_epochs": "1000"
+  },
+  "falert_early_roc_auc/model_val_seen": {
+    "mean": 0.7417840375586855,
+    "std": 0.021417063358701714
+  },
+  "falert_early_prc_auc/model_val_seen": {
+    "mean": 0.7532019400645938,
+    "std": 0.011871732500158562
+  },
+  "roc_auc/model_val_seen_tq1.0": {
+    "mean": 0.8092808056065864,
+    "std": 0.025692700167724104
+  },
+  "seeds": [
+    0,
+    1,
+    2
+  ],
+  "note": "single fixed split (SAFE seed-0 unseen tasks); seen_val; selection-optimistic"
+}
