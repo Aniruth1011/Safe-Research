@@ -78,12 +78,12 @@ Until S1–S3 pick the layers, any layers run, but the numbers are development n
 - Train on `train` at the full horizon (`--train-horizon`).
 - Score every `seen_val` rollout at `task_min_step` (`--horizon`; the only reportable horizon).
 - Seeds 0/1/2.
-- Probe: mlp 64, 5 epochs, batch 8, lr 1e-3, the sweep's TEMPORARY probe budget.
+- **Probe = the locked B6 settings (default):** mlp hidden 64, dropout 0.1, lr 3e-4, batch 8, at most 150 epochs, early stopping with patience 10 on the loss of a 15% holdout of **train** (stratified by task and outcome, chosen with the seed: the same episodes as the depth sweep's B6 probe), best epoch restored. seen_val is never used for stopping. `--early-stopping-patience 0` turns it off.
 - Train-only z-scoring is on by default (`--no-normalize` is the raw-feature check). The sweep's single-layer reference should therefore also be run with `--normalize`.
 - Episode score: the max step logit (`--aggregation max|mean|last`).
 
 **Compact hyper-parameter search** (`search`, as the protocol asks within each leading experiment):
-- The grid is lr {1e-3, 3e-4} × dropout {0, 0.2} × weight decay {0, 1e-4}. Change it with `--lrs --dropouts --weight-decays`.
+- The grid is lr {3e-4, 1e-3} × dropout {0.1, 0.3} × weight decay {0, 1e-4}, centred on B6 (the B6 point is one of the 8). Change it with `--lrs --dropouts --weight-decays`.
 - Every point runs all three seeds. The winner has the best mean seen_val ROC-AUC.
 - The cache is read once for the whole grid (and once for the whole K curve).
 - Selection and reporting both use seen_val, so the winner's numbers are optimistic. `search.csv` keeps every grid point, and the sheet row says so in Notes.
@@ -100,7 +100,7 @@ Until S1–S3 pick the layers, any layers run, but the numbers are development n
 
 **Latency:** `--latency-device cuda` measures on a GPU when one is visible. The Slurm job is CPU-only.
 
-**Shared evaluator (B4, merged on main as PR #5):** use `--evaluator failure_prob.engine.episode_metrics:make_evaluator` for every reportable run (SAFE-equivalent; PR-AUC is computed as SAFE does, so it can differ slightly from the built-in scorer; adds `roc_auc_taskmean`). In general: pass `--evaluator package.module:factory`, or a name registered in the depth sweep's `sweep_plugins.EVALUATORS` (PR #4, e.g. `temporary_max`). The contract is the sweep's: `Evaluator(EvalInput) -> dict`. The evaluator gets per-step scores (logits) of every seen_val episode, already cut to `task_min_step`. Once a non-TEMPORARY evaluator is used, the `episode_scorer` provisional flag disappears from every output.
+**Shared evaluator (B4, merged on main as PR #5): the default.** Runs use `failure_prob.engine.episode_metrics:make_evaluator` unless `--evaluator builtin` asks for the old scorer (SAFE-equivalent; PR-AUC is computed as SAFE does, so it can differ slightly from the built-in scorer; adds `roc_auc_taskmean`). In general: pass `--evaluator package.module:factory`, or a name registered in the depth sweep's `sweep_plugins.EVALUATORS` (PR #4, e.g. `temporary_max`). The contract is the sweep's: `Evaluator(EvalInput) -> dict`. The evaluator gets per-step scores (logits) of every seen_val episode, already cut to `task_min_step`. Once a non-TEMPORARY evaluator is used, the `episode_scorer` provisional flag disappears from every output.
 
 **Duplicate-strongest-layer control (row 35, K4):** `--allow-duplicate-layers --layers 33 33 33` feeds one layer K times into the same fusion model. The layer file is read once per split.
 
@@ -135,5 +135,5 @@ The runners refuse to overwrite a non-empty folder unless you pass `--overwrite`
 - **No unseen data.** Only `train` and `seen_val` are ever requested. Records that overlap between splits, have the wrong shape, are non-finite or repeat an ID are refused. The tests check that no `unseen_test` file is opened, including for `search` and `kcurve`.
 - **Horizons are enforced.** Unknown horizons and duplicate or out-of-range layers are refused. Every episode is checked to have exactly the expected number of steps for its split.
 - **Padding never reaches a score.**
-- **Provisional until B4 and B6 land.** Every output file says so in its `provisional` field. These are development numbers on a single fixed split (SAFE seed-0 unseen tasks), not results.
+- **Provisional flags.** Every output's `provisional` field is empty only for the B4 scorer with exactly the B6 probe settings; otherwise it lists what differs (the search's non-B6 grid points keep it on purpose). All numbers are on a single fixed split (SAFE seed-0 unseen tasks).
 - **B7 overlap.** B7 (Aniruth) lists "static weights, uniform average". `static_weight_fusion` already covers both (`--fixed-weights` is the uniform average), so agree with Aniruth on one model before F3's real run.

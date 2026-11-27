@@ -48,8 +48,16 @@ AGGREGATIONS = ("max", "mean", "last")
 DEV_SPLITS = ("train", "seen_val")
 PROVISIONAL = {
     "episode_scorer": "provisional fusion_runner scorer, pending the shared evaluator (B4)",
-    "probe": "provisional head/hyper-parameters, pending the shared probe spec (B6)",
+    "probe": "probe settings differ from the locked B6 spec",
 }
+
+# Plan row B6, locked by Aniruth on 2026-11-15 (failure_prob/engine/sweep_plugins.py B6_SETTINGS in the depth sweep):
+# hidden 64, dropout 0.1, lr 3e-4, batch 8, at most 150 epochs, early stopping with patience 10 on the loss of a 15%
+# holdout of TRAIN (stratified by task and outcome, chosen with the seed), best epoch restored. seen_val is never used.
+B6_SETTINGS = {"hidden_dim": 64, "dropout": 0.1, "lr": 3e-4, "epochs": 150, "batch_size": 8,
+               "early_stopping_patience": 10, "es_holdout_fraction": 0.15, "es_min_delta": 0.0,
+               "weight_decay": 0.0, "grad_clip": 0.0, "head": "mlp", "select_best_epoch": False}
+B4_EVALUATOR = "failure_prob.engine.episode_metrics:make_evaluator"
 
 
 @dataclass(frozen=True)
@@ -70,7 +78,7 @@ def resolve_evaluator(spec: str | None):
     """None -> the built-in provisional scorer. Otherwise a name registered in the depth sweep's
     ``sweep_plugins.EVALUATORS`` (when that module exists) or 'package.module:factory' (called with no arguments).
     The object must be callable and carry ``name`` and ``temporary``."""
-    if spec is None:
+    if spec is None or spec == "builtin":
         return None
     import importlib
     registry = {}
@@ -96,8 +104,20 @@ def resolve_evaluator(spec: str | None):
     return obj
 
 
-def provisional_flags(evaluator) -> dict:
+def b6_settings_of(cfg) -> dict:
+    return {k: getattr(cfg, k) for k in B6_SETTINGS}
+
+
+def provisional_flags(evaluator, cfg=None) -> dict:
+    """What is still provisional. The probe flag goes away only for exactly the B6 settings; the hyper-parameter
+    search changes lr / dropout / weight decay on purpose, so its grid points keep the flag with their settings."""
     flags = dict(PROVISIONAL)
+    if cfg is not None:
+        diff = {k: v for k, v in b6_settings_of(cfg).items() if v != B6_SETTINGS[k]}
+        if diff:
+            flags["probe"] = f"probe settings differ from the locked B6 spec: {diff}"
+        else:
+            del flags["probe"]
     if evaluator is not None:
         if getattr(evaluator, "temporary", True):
             flags["episode_scorer"] = f"TEMPORARY evaluator {evaluator.name!r}, pending the shared evaluator (B4)"
@@ -119,16 +139,19 @@ class RunConfig:
     train_horizon: str = "full"         # train episodes; "full" as in the depth sweep (no seen_val data involved)
     seeds: list[int] = field(default_factory=lambda: list(TRAIN_SEEDS))
     head: str = "mlp"
-    hidden_dim: int = 64
-    dropout: float = 0.0
-    epochs: int = 5                     # the depth sweep's TEMPORARY probe budget (until B6)
+    hidden_dim: int = 64                # defaults = the locked B6 probe settings (B6_SETTINGS)
+    dropout: float = 0.1
+    epochs: int = 150                   # at most; early stopping usually ends training within ~20 epochs
     batch_size: int = 8
-    lr: float = 1e-3
+    lr: float = 3e-4
+    early_stopping_patience: int = 10   # 0 = off (train all epochs, keep the last)
+    es_holdout_fraction: float = 0.15   # share of TRAIN episodes held out for early stopping (per task x outcome)
+    es_min_delta: float = 0.0
     weight_decay: float = 0.0
     grad_clip: float = 0.0              # 0 disables clipping
     select_best_epoch: bool = False     # pick the epoch with the best seen_val ROC-AUC (selection on seen_val only)
     aggregation: str = "max"
-    evaluator: str | None = None        # None = built-in scorer; else a sweep_plugins name or 'pkg.module:factory'
+    evaluator: str | None = B4_EVALUATOR  # B4 (team scorer); None = built-in scorer; or 'pkg.module:factory'
     learn_weights: bool = True          # static_weight_fusion only
     init_weights: list[float] | None = None  # static_weight_fusion only
     proj_dim: int | None = None         # static_weight_fusion only: per-layer projection to a shared dimension
@@ -171,6 +194,13 @@ def validate_config(cfg: RunConfig, need_source: bool = True) -> None:
             raise ValueError(f"{name} must be >= 1")
     if cfg.lr <= 0 or cfg.weight_decay < 0 or cfg.grad_clip < 0 or not 0 <= cfg.dropout < 1:
         raise ValueError("need lr > 0, weight_decay >= 0, grad_clip >= 0 and 0 <= dropout < 1")
+    if isinstance(cfg.early_stopping_patience, bool) or int(cfg.early_stopping_patience) != cfg.early_stopping_patience \
+            or cfg.early_stopping_patience < 0:
+        raise ValueError(f"early_stopping_patience must be an integer >= 0, got {cfg.early_stopping_patience!r}")
+    if not 0 < cfg.es_holdout_fraction < 1 or cfg.es_min_delta < 0:
+        raise ValueError("need 0 < es_holdout_fraction < 1 and es_min_delta >= 0")
+    if cfg.early_stopping_patience and cfg.select_best_epoch:
+        raise ValueError("choose one: early stopping on a train holdout, or --select-best-epoch on seen_val")
     if cfg.std_floor is not None and (not cfg.normalize or not cfg.std_floor > 0):
         raise ValueError("std_floor needs normalize=True and a value > 0")
     if cfg.bootstrap < 0 or not 0 < cfg.ci < 1:
@@ -473,7 +503,42 @@ def per_task_metrics(rows: list[dict], evaluator=None) -> dict:
 
 # ----------------------------------------------------------------------------------------------- training
 
+def holdout_split(records, fraction: float, seed: int) -> tuple[list, list]:
+    """(fit, holdout) of TRAIN records: `fraction` of each (task, outcome) group, picked with `seed`. Same rule and
+    random draw as the depth sweep's B6 probe (sweep_plugins._holdout_split), so seed s holds out the same episodes."""
+    groups: dict[tuple, list[int]] = {}
+    for i, r in enumerate(records):
+        groups.setdefault((int(r["task_ids"][0]), int(r["labels"].reshape(-1)[0])), []).append(i)
+    rng = np.random.default_rng(seed)
+    hold = set()
+    for key in sorted(groups):
+        idx = groups[key]
+        k = int(round(fraction * len(idx)))
+        k = min(max(k, 1), len(idx) - 1) if len(idx) >= 2 else 0  # keep one episode of the group on each side
+        hold.update(rng.permutation(idx)[:k].tolist())
+    fit = [r for i, r in enumerate(records) if i not in hold]
+    held = [r for i, r in enumerate(records) if i in hold]
+    if len({int(r["labels"].reshape(-1)[0]) for r in held}) < 2:
+        raise ValueError("early-stopping holdout needs both outcomes; raise es_holdout_fraction")
+    return fit, held
+
+
+@torch.no_grad()
+def holdout_loss(model, records, batch_size: int) -> float:
+    """Training loss on held-out TRAIN episodes, averaged over valid steps (the B6 early-stopping monitor)."""
+    model.eval()
+    total, steps = 0.0, 0
+    for batch in DataLoader(RecordDataset(records), batch_size=batch_size, collate_fn=collate_records):
+        n = int(batch["mask"].sum())
+        total += float(model.loss(batch)) * n
+        steps += n
+    return total / max(steps, 1)
+
+
 def train_one(model, train_recs, val_recs, cfg: RunConfig, seed: int, evaluator=None) -> dict:
+    holdout = []
+    if cfg.early_stopping_patience:
+        train_recs, holdout = holdout_split(list(train_recs), cfg.es_holdout_fraction, seed)
     gen = torch.Generator().manual_seed(seed)
     loader = DataLoader(RecordDataset(train_recs), batch_size=cfg.batch_size, shuffle=True,
                         collate_fn=collate_records, generator=gen)
@@ -482,6 +547,7 @@ def train_one(model, train_recs, val_recs, cfg: RunConfig, seed: int, evaluator=
         raise ValueError(f"{cfg.model} has no trainable parameters")
     opt = torch.optim.AdamW(params, lr=cfg.lr, weight_decay=cfg.weight_decay)
     history, best = [], {"epoch": None, "roc_auc": -math.inf, "state": None}
+    es = {"best": math.inf, "epoch": 0, "state": None}
     for epoch in range(1, cfg.epochs + 1):
         model.train()
         losses = []
@@ -498,16 +564,27 @@ def train_one(model, train_recs, val_recs, cfg: RunConfig, seed: int, evaluator=
         val = evaluate(episode_scores(model, val_recs, cfg.batch_size, cfg.aggregation), evaluator)
         if "roc_auc" not in val:
             raise ValueError("the evaluator returns no 'roc_auc'; the learning curve and --select-best-epoch need it")
-        history.append({"epoch": epoch, "train_loss": float(np.mean(losses)), "seen_val_roc_auc": val["roc_auc"]})
+        row = {"epoch": epoch, "train_loss": float(np.mean(losses)), "seen_val_roc_auc": val["roc_auc"]}
+        if holdout:
+            row["holdout_loss"] = holdout_loss(model, holdout, cfg.batch_size)
+        history.append(row)
         if cfg.select_best_epoch and not math.isnan(val["roc_auc"]) and val["roc_auc"] > best["roc_auc"]:
             best = {"epoch": epoch, "roc_auc": val["roc_auc"], "state": copy.deepcopy(model.state_dict())}
-    if cfg.select_best_epoch and best["state"] is not None:
+        if holdout:
+            if row["holdout_loss"] < es["best"] - cfg.es_min_delta:
+                es = {"best": row["holdout_loss"], "epoch": epoch, "state": copy.deepcopy(model.state_dict())}
+            if epoch - es["epoch"] >= cfg.early_stopping_patience:
+                break
+    if holdout:
+        model.load_state_dict(es["state"])
+        chosen, selection = es["epoch"], "early stopping on the TRAIN holdout loss (B6)"
+    elif cfg.select_best_epoch and best["state"] is not None:
         model.load_state_dict(best["state"])
-        chosen = best["epoch"]
+        chosen, selection = best["epoch"], "best seen_val ROC-AUC"
     else:  # no selection, or seen_val AUC undefined at every epoch -> keep the last epoch
-        chosen = cfg.epochs
-    return {"history": history, "chosen_epoch": chosen,
-            "selection": "best seen_val ROC-AUC" if cfg.select_best_epoch else "last epoch"}
+        chosen, selection = len(history), "last epoch"
+    return {"history": history, "chosen_epoch": chosen, "epochs_run": len(history), "selection": selection,
+            "n_fit_rollouts": len(train_recs), "n_holdout_rollouts": len(holdout)}
 
 
 def _labels_scores(rows):
@@ -843,7 +920,7 @@ def run(cfg: RunConfig, splits: dict[str, list[dict]] | None = None, provenance:
     `splits` overrides data loading (tests / callers that already hold records, e.g. fusion_experiments)."""
     validate_config(cfg, need_source=splits is None)
     evaluator = resolve_evaluator(cfg.evaluator)  # fail before any data is read
-    provisional = provisional_flags(evaluator)
+    provisional = provisional_flags(evaluator, cfg)
     out = Path(cfg.output_dir)
     resuming = _prepare_output(out, cfg.overwrite, cfg)
     done = {s for s in cfg.seeds if resuming and (out / f"seed{s}" / "metrics.json").is_file()
