@@ -20,12 +20,18 @@ def collate_records(records):
     return {"features": x, "mask": mask, "labels": labels, "task_ids": task_ids, "trajectory_ids": trajectory_ids}
 
 
-def train_model(model, records, epochs=2, batch_size=4, lr=1e-3, seed=0):
+def train_model(model, records, epochs=2, batch_size=4, lr=1e-3, seed=0, on_epoch_end=None):
+    """Adam on model.loss for `epochs` epochs; returns the mean training loss of each epoch.
+
+    on_epoch_end(epoch, model, history) -> bool, optional: called after every epoch (epoch counts from 1); returning
+    True stops training (early stopping). Without it, training is exactly as before."""
     torch.manual_seed(seed); loader = DataLoader(RecordDataset(records), batch_size=batch_size, shuffle=True, collate_fn=collate_records)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr); history = []
-    for _ in range(epochs):
+    for epoch in range(1, epochs + 1):
         model.train(); losses = []
         for batch in loader:
             loss = model.loss(batch); optimizer.zero_grad(); loss.backward(); optimizer.step(); losses.append(loss.item())
         history.append(sum(losses) / len(losses))
+        if on_epoch_end is not None and on_epoch_end(epoch, model, history):
+            break
     return history
