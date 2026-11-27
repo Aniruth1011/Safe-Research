@@ -2,8 +2,9 @@
 
 Owner: Rhea · Reviewer: Dhyan · Status: draft for review
 
-Every number below for our own work is **seen_val PR-AUC on our single fixed
-split**. It is not comparable with SAFE's published 73.47 / 72.47 / 69.45,
+Every number below for our own work is **seen_val episode-level ROC-AUC (the
+B4 primary metric, which `scripts/select_layers.py` ranks by) on our single
+fixed split**. It is not comparable with SAFE's published 73.47 / 72.47 / 69.45,
 which are averages over 3 splits. Our bootstrap 95% CIs are about ±7 points,
 so the late layers are statistically tied.
 
@@ -19,7 +20,7 @@ Plan note: the Task Plan says "SAE paper". (a) is the one that does failure
 prediction on OpenVLA + LIBERO-10, so it is the one we compare against; (b) is
 cited for context. **Dhyan, please confirm which one was meant.**
 
-## 2. What our own results say so far (seen_val, PR-AUC ×100)
+## 2. What our own results say so far (seen_val, ROC-AUC ×100)
 
 | Detector | Pooled | Per-task mean |
 |---|---|---|
@@ -29,7 +30,10 @@ cited for context. **Dhyan, please confirm which one was meant.**
 | Score-level selection S1 / S2 / S3 | 77.4 / 77.0 / 77.7 | — |
 | Feature fusion F1 / F2 / F3 (PR #11, not merged) | 74.99 / 74.49 / 75.59 | — |
 | F6 top-K, K = 1…4 (PR #11, not merged) | 77.38 / 76.94 / 75.78 / 75.64 | — |
-| SAFE repro MLP / LSTM / kNN (PR #7, not merged) | 75.52 / 74.18 / 67.65 | — |
+| SAFE repro MLP / LSTM / kNN (PR #7, not merged) | 75.52 / 74.18 / 67.65 | 63.4 / 68.4 / 51.9 |
+
+SAFE repro PR-AUC (same runs, for reference): 74.94 / 75.32 / 69.48. All SAFE
+repro numbers are 3-seed means, recomputed with our evaluator in C4.
 
 Reading: no selected or fused detector is clearly better than the best single
 late layer; all differences are inside the ±7 CI. The all-layer average is
