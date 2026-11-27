@@ -89,21 +89,23 @@ def eval_metrics_and_log(
         to_be_logged.update(metrics_logs)
         
         #### Evaluate the classification performance using different thresholding methods ####
-        # Split Conformal Prediction: val_seen for calibration, val_unseen for testing
-        # Here we only use val_seen for calibration, to make it comparable to learned methods
-        split_cp_logs = eval_split_conformal(
-            rollouts_by_split_name, scores_by_split_name, metric_name,
-            calib_split_names=["val_seen"], test_split_names=["val_unseen"]
-        )
-        split_cp_logs = pd.DataFrame(split_cp_logs)
-        to_be_logged[f"classify_cp_maxsofar/{metric_name}"] = wandb.Table(dataframe=split_cp_logs)
-        
-        # Functional Conformal Prediction
-        df, cp_bands_by_alpha = eval_functional_conformal(
-            rollouts_by_split_name, scores_by_split_name, metric_name,
-            calib_split_names=["val_seen"], test_split_names=["val_unseen"]
-        )
-        to_be_logged[f"classify_cp_functional/{metric_name}"] = wandb.Table(dataframe=df)
+        # Guard 2: the CP blocks need val_unseen; skip them when it is not loaded (e.g. openvla_cache)
+        if "val_unseen" in rollouts_by_split_name:
+            # Split Conformal Prediction: val_seen for calibration, val_unseen for testing
+            # Here we only use val_seen for calibration, to make it comparable to learned methods
+            split_cp_logs = eval_split_conformal(
+                rollouts_by_split_name, scores_by_split_name, metric_name,
+                calib_split_names=["val_seen"], test_split_names=["val_unseen"]
+            )
+            split_cp_logs = pd.DataFrame(split_cp_logs)
+            to_be_logged[f"classify_cp_maxsofar/{metric_name}"] = wandb.Table(dataframe=split_cp_logs)
+
+            # Functional Conformal Prediction
+            df, cp_bands_by_alpha = eval_functional_conformal(
+                rollouts_by_split_name, scores_by_split_name, metric_name,
+                calib_split_names=["val_seen"], test_split_names=["val_unseen"]
+            )
+            to_be_logged[f"classify_cp_functional/{metric_name}"] = wandb.Table(dataframe=df)
         
         # Compute the classification metrics vs. detection time
         df, logs = eval_perf_det_time_curves(
@@ -165,20 +167,22 @@ def eval_model_and_log(
         )
         to_be_logged[f"classify_fixed_thresh/{method_name}"] = wandb.Table(dataframe=df)
 
-        # Split Conformal Prediction: val_seen for calibration, val_unseen for testing
-        split_cp_logs = eval_split_conformal(
-            rollouts_by_split_name, scores_by_split_name, method_name,
-            calib_split_names=["val_seen"], test_split_names=["val_unseen"]
-        )
-        split_cp_logs = pd.DataFrame(split_cp_logs)
-        to_be_logged[f"classify_cp_maxsofar/{method_name}"] = wandb.Table(dataframe=split_cp_logs)
-        
-        # Functional Conformal Prediction
-        df, cp_bands_by_alpha = eval_functional_conformal(
-            rollouts_by_split_name, scores_by_split_name, method_name,
-            calib_split_names=["val_seen"], test_split_names=["val_unseen"]
-        )
-        to_be_logged[f"classify_cp_functional/{method_name}"] = wandb.Table(dataframe=df)
+        # Guard 2: the CP blocks need val_unseen; skip them when it is not loaded (e.g. openvla_cache)
+        if "val_unseen" in rollouts_by_split_name:
+            # Split Conformal Prediction: val_seen for calibration, val_unseen for testing
+            split_cp_logs = eval_split_conformal(
+                rollouts_by_split_name, scores_by_split_name, method_name,
+                calib_split_names=["val_seen"], test_split_names=["val_unseen"]
+            )
+            split_cp_logs = pd.DataFrame(split_cp_logs)
+            to_be_logged[f"classify_cp_maxsofar/{method_name}"] = wandb.Table(dataframe=split_cp_logs)
+
+            # Functional Conformal Prediction
+            df, cp_bands_by_alpha = eval_functional_conformal(
+                rollouts_by_split_name, scores_by_split_name, method_name,
+                calib_split_names=["val_seen"], test_split_names=["val_unseen"]
+            )
+            to_be_logged[f"classify_cp_functional/{method_name}"] = wandb.Table(dataframe=df)
         
         # Compute the classification metrics vs. detection time, by varying thresholds
         df, logs = eval_perf_det_time_curves(

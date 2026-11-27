@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 from omegaconf import MISSING, OmegaConf
 import hydra
@@ -56,6 +56,20 @@ class OpenvlaDatasetConfig(DatasetConfig):
     token_idx_rel: float | str = 1.0
     
     
+
+@dataclass
+class OpenvlaCacheDatasetConfig(OpenvlaDatasetConfig):
+    """SAFE dataset backed by the shared feature cache (collection/load_cache.py).
+    Loads only train + seen_val with the cache's frozen split; unseen_test is never read."""
+    name: str = "openvla_cache"
+    cache_root: str = MISSING
+    layer: int = 32                     # L32 = block 32 after final RMSNorm (SAFE's feature)
+    data_path: Any = ""
+    load_to_cuda: bool = False
+    token_idx_rel: float | str = "mean"  # mean / 0.0 (first) / 1.0 (last) -> cache pool
+    # (train, val_seen) episode counts of the real LIBERO-10 cache; set to null for a test cache
+    expected_split_sizes: Optional[list[int]] = field(default_factory=lambda: [210, 140])
+
 
 @dataclass
 class OpenPizeroDatasetConfig(DatasetConfig):
@@ -292,6 +306,7 @@ cs.store(name="base_config", node=Config)
 
 # Register dataset variants into the "dataset" config group.
 cs.store(group="dataset", name="base_openvla", node=OpenvlaDatasetConfig)
+cs.store(group="dataset", name="base_openvla_cache", node=OpenvlaCacheDatasetConfig)
 cs.store(group="dataset", name="base_open_pizero", node=OpenPizeroDatasetConfig)
 cs.store(group="dataset", name="base_pizero_fast", node=PizeroFastDatasetConfig)
 cs.store(group="dataset", name="base_pizero", node=PizeroDatasetConfig)

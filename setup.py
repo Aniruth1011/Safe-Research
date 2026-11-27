@@ -20,7 +20,7 @@ setup(
         'scikit-learn',
         'opencv_python',
         'einops',
-        'wandb',
+        'wandb<0.29',  # 0.29 removed wandb.finish(quiet=...), which failure_prob/train.py calls
         'plotly',
         'matplotlib',
         'natsort',

@@ -1,0 +1,7 @@
+dataset.name,dataset.layer,dataset.token_idx_rel,model.distance,model.topk,model.cumsum,model.use_success_only,n_seeds,falert_early_roc_auc/model_val_seen__mean,falert_early_roc_auc/model_val_seen__std,falert_early_prc_auc/model_val_seen__mean,falert_early_prc_auc/model_val_seen__std,roc_auc/model_val_seen_tq1.0__mean,roc_auc/model_val_seen_tq1.0__std
+openvla_cache,32,mean,cosine,10,True,False,3,0.676464584609104,0.0,0.6947860405660072,0.0,0.7270871606450294,0.0
+openvla_cache,32,mean,cosine,5,True,False,3,0.6736068585425596,0.0,0.6919879711172047,0.0,0.7117779138599715,0.0
+openvla_cache,32,mean,cosine,1,True,False,3,0.6527862829148806,0.0,0.6696161423356721,0.0,0.6889161053276179,0.0
+openvla_cache,32,mean,cosine,10,False,False,3,0.6107368850785875,0.0,0.5968312142346089,0.0,0.848132271892223,0.0
+openvla_cache,32,mean,cosine,5,False,False,3,0.5817513778322106,0.0,0.5887177050704859,0.0,0.8493570116350275,0.0
+openvla_cache,32,mean,cosine,1,False,False,3,0.5435803225147989,0.0,0.5556926681192333,0.0,0.8373137374974484,0.0
