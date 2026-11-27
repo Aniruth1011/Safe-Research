@@ -163,6 +163,33 @@ def test_withheld_unseen_and_corruption(built):
     assert r.returncode == 1 and "CORRUPTED" in r.stdout
 
 
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root ignores file permissions")
+@pytest.mark.parametrize("quick", [False, True])
+def test_verify_counts_unreadable_unseen_files_as_withheld(built, quick):
+    """Teammates may have the cache with unseen_test locked (no read/search permission): verify must not crash."""
+    tmp, raw, cache = built
+    flag = ["--quick"] if quick else []
+    unseen_dir = cache / "features" / "mean" / "unseen_test"
+    unseen_file = cache / "features" / "first" / "unseen_test" / "L04.npy"
+    train_file = cache / "features" / "first" / "train" / "L04.npy"
+    n_unseen = len(list(unseen_dir.iterdir())) + 1
+    try:
+        unseen_dir.chmod(0o000)            # folder not searchable: exists()/stat() raise PermissionError
+        unseen_file.chmod(0o000)           # file not readable: open()/np.load raise PermissionError
+        r = run(KIT / "check_cache.py", "verify", "--cache", cache, *flag)
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "Traceback" not in r.stderr
+        assert f"{n_unseen} unseen-test files withheld ({n_unseen} present but not readable" in r.stdout
+        assert "0 corrupted" in r.stdout and "unreadable" not in r.stdout.replace("not readable", "")
+        train_file.chmod(0o000)            # a locked train file is still an error
+        r = run(KIT / "check_cache.py", "verify", "--cache", cache, *flag)
+        assert r.returncode == 1 and "UNREADABLE (permission denied): features/first/train/L04.npy" in r.stdout
+        assert "Traceback" not in r.stderr
+    finally:
+        for f in (unseen_dir, unseen_file, train_file):
+            f.chmod(0o755 if f.is_dir() else 0o644)
+
+
 def test_rebuild_with_same_split_file_is_identical(built):
     tmp, raw, cache = built
     r = run(KIT / "build_cache.py", "--rollout-dir", raw, "--cache-root", tmp / "cache", "--version", "v1b",
